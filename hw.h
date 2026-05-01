@@ -82,7 +82,8 @@
 #define MORSE_REG_MTIME_UPPER(mors)	((mors)->cfg->regs->mtime_upper)
 #define MORSE_REG_MTIME_LOWER(mors)	((mors)->cfg->regs->mtime_lower)
 
-/** Bit 15 for MORSE_PAGER_BYPASS_TX_STATUS_IRQ_NUM (Chip to host) */
+#define MORSE_PAGER_BYPASS_TX_STATUS_IRQ_NUM		(15)
+#define MORSE_PAGER_IRQ_BYPASS_TX_STATUS_AVAILABLE	BIT(MORSE_PAGER_BYPASS_TX_STATUS_IRQ_NUM)
 
 /** Bit 17 to 24 reserved for the beacon VIF 0 to 7 interrupts */
 #define MORSE_INT_BEACON_VIF_MASK_ALL		(GENMASK(24, 17))
@@ -97,10 +98,16 @@
 #define MORSE_INT_HW_STOP_NOTIFICATION		BIT(MORSE_INT_HW_STOP_NOTIFICATION_NUM)
 
 /** Bit 28 Chip to Host attach done notify */
-#define MORSE_HW_ATTACH_DONE_NUM	(28)
-#define MORSE_HW_ATTACH_DONE		BIT(MORSE_HW_ATTACH_DONE_NUM)
+#define MORSE_HW_HEADLESS_DONE_NUM	(28)
+#define MORSE_HW_HEADLESS_DONE		BIT(MORSE_HW_HEADLESS_DONE_NUM)
 
-/** Bit 29 for MORSE_PAGER_BYPASS_CMD_RESP_IRQ_NUM (Chip to host) */
+#define MORSE_PAGER_BYPASS_CMD_RESP_IRQ_NUM		(29)
+#define MORSE_PAGER_IRQ_BYPASS_CMD_RESP_AVAILABLE	BIT(MORSE_PAGER_BYPASS_CMD_RESP_IRQ_NUM)
+
+/** Bits 0-13 and bypass bits are all observed by the chip interface */
+#define MORSE_CHIP_IF_IRQ_MASK_ALL (GENMASK(13, 0) | \
+				    MORSE_PAGER_IRQ_BYPASS_TX_STATUS_AVAILABLE | \
+				    MORSE_PAGER_IRQ_BYPASS_CMD_RESP_AVAILABLE)
 
 #ifdef CONFIG_MORSE_ENABLE_TEST_MODES
 /** Bit 30 for bus irq self test ('Chip' to host, in reality it is host to host) */
@@ -179,6 +186,19 @@ enum host_table_firmware_flags {
 	MORSE_FW_FLAGS_TOGGLES_BUSY_PIN_ON_WAKE_PIN = BIT(8),
 	/** Supports HW reattach */
 	MORSE_FW_FLAGS_SUPPORT_HW_REATTACH = BIT(9),
+	/** Firmware can report TX status for any frame (fullmac only) */
+	MORSE_FW_FLAGS_SUPPORT_FULLMAC_REPORT = BIT(10),
+};
+
+enum morse_hw_state {
+	/** HW is off, or firmware is not loaded. */
+	MORSE_HW_STATE_OFF = 0,
+	/** HW is on, firmware is loaded and HW is running. */
+	MORSE_HW_STATE_ON,
+	/** HW has stopped, supress all host interaction with HW. */
+	MORSE_HW_STATE_STOPPED,
+	/** HW is being restarted after a stop event. */
+	MORSE_HW_STATE_RESTARTING,
 };
 
 struct host_table {
@@ -261,11 +281,18 @@ struct morse_hw_cfg {
 	const char *(*get_hw_version)(u32 chip_id);
 
 	/**
-	 * Get PS Wakeup delay depending on chip id
+	 * Get warm boot time depending on chip id
 	 *
 	 * @chip_id: Registered chip ID when loading the driver
 	 */
-	 u8 (*get_ps_wakeup_delay_ms)(u32 chip_id);
+	 u8 (*get_warm_boot_time_ms)(u32 chip_id);
+
+	/**
+	 * Get cold  boot time depending on chip id
+	 *
+	 * @chip_id: Registered chip ID when loading the driver
+	 */
+	 u32 (*get_cold_boot_time_ms)(u32 chip_id);
 
 	/**
 	 * Get FW path depending on chip id
@@ -519,48 +546,48 @@ int morse_hw_clock_now(const struct morse *mors, u64 *now);
 /**
  * morse_hw_is_already_loaded - Check if the hardware is already loaded
  *
- * @mors: mors struct
+ * @mors: morse struct
  *
  * @return true if hardware is already loaded else false
  */
 bool morse_hw_is_already_loaded(struct morse *mors);
 
 /**
- * morse_hw_attach_done_irq_enable - Enable or disable 'HW attach done' interrupt
+ * morse_hw_headless_done_irq_enable - Enable or disable 'HW headless done' interrupt
  *
- * @mors: mors struct
+ * @mors: morse struct
  * @enable: enable or disable the interrupt
  *
  * @return 0 on success, else an error code
  */
-int morse_hw_attach_done_irq_enable(struct morse *mors, bool enable);
+int morse_hw_headless_done_irq_enable(struct morse *mors, bool enable);
+
+/**
+ * morse_hw_headless_reset - Reset software tracking of headless mode (i.e. due to HW reset)
+ *
+ * @mors: morse struct
+ */
+void morse_hw_headless_reset(struct morse *mors);
 
 /**
  * morse_hw_attach - Attach to running hardware
  *
- * @mors: mors struct
+ * @mors: morse struct
+ * @cfg: headless configuration (see morse_cmd_headless_cfg_option)
  *
  * @return 0 on success, else an error code
  */
-int morse_hw_attach(struct morse *mors);
+int morse_hw_attach(struct morse *mors, int cfg);
 
 /**
  * morse_hw_detach - Detach from hardware
  *
- * @mors: mors struct
+ * @mors: morse struct
+ * @cfg: headless configuration (see morse_cmd_headless_cfg_option)
  *
  * @return 0 on success, else an error code
  */
-int morse_hw_detach(struct morse *mors);
-
-/**
- * morse_hw_is_stopped - Check if the hardware is stopped
- *
- * @morse: morse struct
- *
- * @return true if hardware is stopped else false
- */
-bool morse_hw_is_stopped(struct morse *mors);
+int morse_hw_detach(struct morse *mors, int cfg);
 
 /**
  * morse_hw_should_reattach - Check if reattaching to hardware
@@ -568,5 +595,87 @@ bool morse_hw_is_stopped(struct morse *mors);
  * @return true if reattaching to hardware else false
  */
 bool morse_hw_should_reattach(void);
+
+/**
+ * morse_hw_headless_init - Initialise headless data structure in mors struct
+ *
+ * @mors: morse struct
+ */
+void morse_hw_headless_init(struct morse *mors);
+
+/**
+ * morse_hw_trigger_detach - Send detach interrupt to hardware
+ *
+ * @mors: morse struct
+ *
+ * @return 0 on success, else an error code
+ */
+int morse_hw_trigger_detach(struct morse *mors);
+
+/**
+ * morse_hw_headless_work - Work function to handle headless ON/OFF requests
+ *
+ * @work: work struct
+ */
+void morse_hw_headless_work(struct work_struct *work);
+
+/**
+ * morse_hw_headless_is_off - Is headless mode off
+ *
+ * @mors: morse struct
+ *
+ * @return true when headless is off
+ */
+bool morse_hw_headless_is_off(struct morse *mors);
+
+/**
+ * morse_hw_set_state - Set HW state
+ *
+ * @mors: morse struct
+ * @next: state to set
+ */
+void morse_hw_set_state(struct morse *mors, enum morse_hw_state next);
+
+/**
+ * morse_hw_is_restarting - Is morse HW being restarted
+ *
+ * @mors: morse struct
+ *
+ * @return true if restarting
+ */
+bool morse_hw_is_restarting(const struct morse *mors);
+
+/**
+ * morse_hw_restart() - Request a HW restart.
+ * @mors: morse struct
+ */
+void morse_hw_restart(struct morse *mors);
+
+/**
+ * morse_hw_is_stopped - Is morse HW stopped
+ *
+ * @morse: morse struct
+ *
+ * @return true if stopped
+ */
+bool morse_hw_is_stopped(const struct morse *mors);
+
+/**
+ * morse_hw_is_stopped_notification_set - Check if the hardware stop notification is set
+ *
+ * @morse: morse struct
+ *
+ * @return true if hardware indicates stop
+ */
+bool morse_hw_is_stopped_notification_set(struct morse *mors);
+
+/**
+ * morse_hw_is_on - Is morse HW on and running
+ *
+ * @morse: morse struct
+ *
+ * @return true if on
+ */
+bool morse_hw_is_on(const struct morse *mors);
 
 #endif /* !_MORSE_HW_H_ */

@@ -49,6 +49,17 @@ struct cac_threshold_change_rules {
 	struct cac_threshold_change_rule rule[CAC_CFG_CHANGE_RULE_MAX];
 };
 
+struct morse_cac_config {
+	/**
+	 * CAC enabled
+	 */
+	bool enabled;
+	/**
+	 * Threshold change rules
+	 */
+	struct cac_threshold_change_rules rules;
+};
+
 /**
  * CAC configuration and counters (AP only).
  */
@@ -59,15 +70,8 @@ struct morse_cac {
 	struct timer_list timer;
 	int cac_period_used;
 
-	/**
-	 * CAC enabled
-	 */
-	bool enabled;
-
-	/**
-	 * Threshold change rules
-	 */
-	struct cac_threshold_change_rules rules;
+	/* CAC configuration and rules */
+	struct morse_cac_config *conf;
 
 	/**
 	 * Threshold value for restricting authentications and associations, between 0 and
@@ -154,11 +158,20 @@ int morse_cac_deinit(struct morse_vif *mors_vif);
 /**
  * morse_cac_init() - Initialise CAC on an interface
  *
- * @mors	The global Morse structure
- * @mors_vif	Virtual interface
+ * @mors The global Morse structure
+ * @mors_vif Morse VIF
+ * @in_reconfig The HW state is restarting and reconfig is in progress
  *
  * Return: 0 if the command succeeded, else an error code
  */
-int morse_cac_init(struct morse *mors, struct morse_vif *mors_vif);
+int morse_cac_init(struct morse *mors, struct morse_vif *mors_vif, bool in_reconfig);
+
+/**
+ * morse_cac_reconfig() - Restore the CAC config
+ *
+ * @mors The global Morse structure
+ * @mors_vif Morse VIF
+ */
+void morse_cac_reconfig(struct morse *mors, struct morse_vif *mors_vif);
 
 #endif /* !_CAC_H_ */

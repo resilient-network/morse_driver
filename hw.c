@@ -10,14 +10,25 @@
 #include "morse.h"
 #include "debug.h"
 #include "hw.h"
-#include "pager_if.h"
 #include "bus.h"
 #include "firmware.h"
+#include "ps.h"
+#include "trace.h"
 
 #define MORSE_HWCLOCK_DBG(_m, _f, _a...)	morse_dbg(FEATURE_ID_HWCLOCK, _m, _f, ##_a)
 #define MORSE_HWCLOCK_INFO(_m, _f, _a...)	morse_info(FEATURE_ID_HWCLOCK, _m, _f, ##_a)
 #define MORSE_HWCLOCK_WARN(_m, _f, _a...)	morse_warn(FEATURE_ID_HWCLOCK, _m, _f, ##_a)
 #define MORSE_HWCLOCK_ERR(_m, _f, _a...)	morse_err(FEATURE_ID_HWCLOCK, _m, _f, ##_a)
+
+#define MORSE_HEADLESS_DBG(_m, _f, _a...)	morse_dbg(FEATURE_ID_HEADLESS, _m, _f, ##_a)
+#define MORSE_HEADLESS_INFO(_m, _f, _a...)	morse_info(FEATURE_ID_HEADLESS, _m, _f, ##_a)
+#define MORSE_HEADLESS_WARN(_m, _f, _a...)	morse_warn(FEATURE_ID_HEADLESS, _m, _f, ##_a)
+#define MORSE_HEADLESS_ERR(_m, _f, _a...)	morse_err(FEATURE_ID_HEADLESS, _m, _f, ##_a)
+
+/* Current FW takes about 1350 ms to boot in the worst case. Attach/Detach time is a
+ * fraction of that, so use this value as the baseline for timeout.
+ */
+#define HEADLESS_TIMEOUT_MS 1350
 
 static int hw_reload_after_stop __read_mostly = 5;
 module_param(hw_reload_after_stop, int, 0644);
@@ -30,13 +41,12 @@ module_param(reattach_hw, bool, 0644);
 MODULE_PARM_DESC(reattach_hw,
 	"Do not reset hardware state during module exit, attempt to reattach during module init");
 
-int morse_hw_irq_enable(struct morse *mors, u32 irq, bool enable)
+static int hw_enable_irq(struct morse *mors, u32 irq, bool enable)
 {
 	u32 irq_en, irq_en_addr = irq < 32 ? MORSE_REG_INT1_EN(mors) : MORSE_REG_INT2_EN(mors);
 	u32 irq_clr_addr = irq < 32 ? MORSE_REG_INT1_CLR(mors) : MORSE_REG_INT2_CLR(mors);
 	u32 mask = irq < 32 ? (1 << irq) : (1 << (irq - 32));
 
-	morse_claim_bus(mors);
 	morse_reg32_read(mors, irq_en_addr, &irq_en);
 	if (enable)
 		irq_en |= (mask);
@@ -44,6 +54,14 @@ int morse_hw_irq_enable(struct morse *mors, u32 irq, bool enable)
 		irq_en &= ~(mask);
 	morse_reg32_write(mors, irq_clr_addr, mask);
 	morse_reg32_write(mors, irq_en_addr, irq_en);
+
+	return 0;
+}
+
+int morse_hw_irq_enable(struct morse *mors, u32 irq, bool enable)
+{
+	morse_claim_bus(mors);
+	hw_enable_irq(mors, irq, enable);
 	morse_release_bus(mors);
 
 	return 0;
@@ -51,12 +69,23 @@ int morse_hw_irq_enable(struct morse *mors, u32 irq, bool enable)
 
 void morse_hw_stop_work(struct work_struct *work)
 {
+	bool is_already_stopped;
 	struct morse *mors = container_of(work, struct morse, hw_stop);
 
-	if (!mors->started) {
+	mutex_lock(&mors->lock);
+	is_already_stopped = morse_hw_is_stopped(mors);
+	if (!is_already_stopped)
+		morse_hw_set_state(mors, MORSE_HW_STATE_STOPPED);
+	mutex_unlock(&mors->lock);
+
+	if (is_already_stopped) {
 		dev_err(mors->dev, "HW already stopped\n");
 		return;
 	}
+
+	dev_err(mors->dev, "HW has stopped%s\n", (hw_reload_after_stop < 0) ? " (ignoring)" : "");
+	if (hw_reload_after_stop < 0)
+		return;
 
 	if (hw_reload_after_stop > 0 &&
 	    (ktime_get_seconds() - mors->last_hw_stop) < hw_reload_after_stop) {
@@ -70,8 +99,20 @@ void morse_hw_stop_work(struct work_struct *work)
 	mutex_lock(&mors->lock);
 	if (!morse_coredump_new(mors, MORSE_COREDUMP_REASON_CHIP_INDICATED_STOP))
 		set_bit(MORSE_STATE_FLAG_DO_COREDUMP, &mors->state_flags);
+	mors->last_hw_stop = ktime_get_seconds();
+	mutex_unlock(&mors->lock);
+	schedule_work(&mors->driver_restart);
+}
 
-	set_bit(MORSE_STATE_FLAG_CHIP_UNRESPONSIVE, &mors->state_flags);
+void morse_hw_restart(struct morse *mors)
+{
+	bool is_already_stopped;
+
+	mutex_lock(&mors->lock);
+	is_already_stopped = morse_hw_is_stopped(mors);
+	if (!is_already_stopped)
+		morse_hw_set_state(mors, MORSE_HW_STATE_STOPPED);
+
 	mors->last_hw_stop = ktime_get_seconds();
 	mutex_unlock(&mors->lock);
 	schedule_work(&mors->driver_restart);
@@ -79,21 +120,12 @@ void morse_hw_stop_work(struct work_struct *work)
 
 static void to_host_hw_stop_irq_handle(struct morse *mors)
 {
-	dev_err(mors->dev, "HW has stopped%s\n",
-		(hw_reload_after_stop < 0) ? " (ignoring)" : "");
-
-	if (hw_reload_after_stop < 0)
-		return;
-
 	schedule_work(&mors->hw_stop);
 }
 
-static void morse_hw_attach_done_irq_handle(struct morse *mors)
+static void morse_hw_headless_done_irq_handle(struct morse *mors)
 {
-	struct completion *attach = READ_ONCE(mors->attach_done);
-
-	if (attach)
-		complete(attach);
+	queue_work(mors->chip_wq, &mors->headless.work);
 }
 
 int morse_hw_irq_handle(struct morse *mors)
@@ -104,6 +136,7 @@ int morse_hw_irq_handle(struct morse *mors)
 #endif
 
 	morse_reg32_read(mors, MORSE_REG_INT1_STS(mors), &status1);
+	trace_hw_irq(status1);
 
 	if (status1 & MORSE_CHIP_IF_IRQ_MASK_ALL)
 		mors->cfg->ops->chip_if_handle_irq(mors, status1);
@@ -113,8 +146,8 @@ int morse_hw_irq_handle(struct morse *mors)
 		morse_ndp_probe_req_resp_irq_handle(mors, status1);
 	if (status1 & MORSE_INT_HW_STOP_NOTIFICATION)
 		to_host_hw_stop_irq_handle(mors);
-	if (status1 & MORSE_HW_ATTACH_DONE)
-		morse_hw_attach_done_irq_handle(mors);
+	if (status1 & MORSE_HW_HEADLESS_DONE)
+		morse_hw_headless_done_irq_handle(mors);
 #if defined(CONFIG_MORSE_ENABLE_TEST_MODES)
 	if (status1 & MORSE_INT_BUS_IRQ_SELF_TEST)
 		morse_bus_interrupt_profiler_irq(mors);
@@ -305,7 +338,7 @@ int morse_hw_clock_trigger_update(struct morse *mors, bool wait)
 	}
 
 	/* Derive timeout to wait for clock update */
-	timeout_ms = mors->cfg->get_ps_wakeup_delay_ms(mors->chip_id) + overhead_ms;
+	timeout_ms = mors->cfg->get_warm_boot_time_ms(mors->chip_id) + overhead_ms;
 
 	if (wait) {
 		mutex_lock(&mors->hw_clock.update_wait_lock);
@@ -422,78 +455,297 @@ bool morse_hw_is_already_loaded(struct morse *mors)
 			(morse_firmware_check_compatibility(mors) == 0);
 }
 
-int morse_hw_attach_done_irq_enable(struct morse *mors, bool enable)
+static const u8 *hw_headless_state_to_str(enum headless_state state)
 {
-	return morse_hw_irq_enable(mors, MORSE_HW_ATTACH_DONE_NUM, enable);
-}
-
-int morse_hw_attach(struct morse *mors)
-{
-	int ret = 0;
-	unsigned int rem = 0;
-    /* Current FW takes about 1350 ms to boot in the worst case. Attach time is a fraction of that,
-     * so use this value as the baseline for attach timeout.
-     */
-	const int timeout_ms = 1350;
-	DECLARE_COMPLETION_ONSTACK(attach_done);
-
-	if (!(mors->firmware_flags & MORSE_FW_FLAGS_SUPPORT_HW_REATTACH)) {
-		ret = -ENOTSUPP;
-		goto exit;
+	switch (state) {
+	case HEADLESS_OFF:
+		return "off";
+	case HEADLESS_ON_REQUEST:
+		return "on (requested)";
+	case HEADLESS_ON_PENDING:
+		return "on (pending)";
+	case HEADLESS_ON:
+		return "on";
+	case HEADLESS_OFF_REQUEST:
+		return "off (requested)";
+	case HEADLESS_OFF_PENDING:
+		return "off (pending)";
+	default:
+		return "unknown";
 	}
-
-	ret = morse_hw_attach_done_irq_enable(mors, true);
-	if (ret)
-		goto exit;
-
-	morse_claim_bus(mors);
-	ret = morse_reg32_write(mors, MORSE_HW_ATTACH_TRGR_SET(mors), MORSE_HW_ATTACH_IRQ_BIT);
-	morse_release_bus(mors);
-
-	if (ret)
-		goto exit;
-
-	WRITE_ONCE(mors->attach_done, &attach_done);
-	rem = wait_for_completion_timeout(mors->attach_done, msecs_to_jiffies(timeout_ms));
-	WRITE_ONCE(mors->attach_done, NULL);
-
-	if (rem == 0)
-		ret = -ETIMEDOUT;
-
-exit:
-	if (ret)
-		MORSE_ERR(mors, "%s: failed to attach to hardware (ret:%d)\n", __func__, ret);
-	else
-		MORSE_INFO(mors, "%s: Attached to running hardware\n", __func__);
-
-	morse_hw_attach_done_irq_enable(mors, false);
-
-	return ret;
 }
 
-int morse_hw_detach(struct morse *mors)
+static int hw_headless_done_irq_enable(struct morse *mors, bool enable)
+{
+	return hw_enable_irq(mors, MORSE_HW_HEADLESS_DONE_NUM, enable);
+}
+
+int morse_hw_headless_done_irq_enable(struct morse *mors, bool enable)
 {
 	int ret;
 
-	if (!(mors->firmware_flags & MORSE_FW_FLAGS_SUPPORT_HW_REATTACH)) {
-		ret = -ENOTSUPP;
-		goto exit;
-	}
-
 	morse_claim_bus(mors);
-	ret = morse_reg32_write(mors, MORSE_HW_DETACH_TRGR_SET(mors), MORSE_HW_DETACH_IRQ_BIT);
+	ret = hw_headless_done_irq_enable(mors, enable);
 	morse_release_bus(mors);
-
-exit:
-	if (ret)
-		MORSE_ERR(mors, "%s: failed to detach from hardware (ret:%d)\n", __func__, ret);
-	else
-		MORSE_INFO(mors, "%s: Detached from hardware\n", __func__);
 
 	return ret;
 }
 
-bool morse_hw_is_stopped(struct morse *mors)
+/**
+ * hw_trigger_attach - Send attach interrupt to hardware
+ *
+ * @mors: morse struct
+ *
+ * @return 0 on success
+ */
+static int hw_trigger_attach(struct morse *mors)
+{
+	return morse_reg32_write(mors, MORSE_HW_ATTACH_TRGR_SET(mors), MORSE_HW_ATTACH_IRQ_BIT);
+}
+
+/**
+ * hw_trigger_detach - Send detach interrupt to hardware
+ *
+ * @mors: morse struct
+ *
+ * @return 0 on success
+ */
+static int hw_trigger_detach(struct morse *mors)
+{
+	return morse_reg32_write(mors, MORSE_HW_DETACH_TRGR_SET(mors), MORSE_HW_DETACH_IRQ_BIT);
+}
+
+int morse_hw_trigger_detach(struct morse *mors)
+{
+	int ret = 0;
+
+	morse_claim_bus(mors);
+	ret = hw_trigger_detach(mors);
+	morse_release_bus(mors);
+
+	return ret;
+}
+
+bool morse_hw_headless_is_off(struct morse *mors)
+{
+	return mors->headless.state == HEADLESS_OFF;
+}
+
+void morse_hw_headless_work(struct work_struct *work)
+{
+	struct morse *mors = container_of(work, struct morse, headless.work);
+	struct completion *drv_work;
+	enum headless_state now, after;
+
+	/* Necessary to wake the chip from power save before interacting
+	 * with the hostsync register
+	 */
+	morse_ps_wakers_inc(mors);
+	morse_ps_force_eval(mors);
+
+	/* Claim headless lock before claiming the whole bus */
+	mutex_lock(&mors->headless.lock);
+	morse_claim_bus(mors);
+
+	drv_work = READ_ONCE(mors->headless.wait);
+	now = mors->headless.state;
+	switch (mors->headless.state) {
+	case HEADLESS_ON_REQUEST:
+		(void)morse_reg32_write(mors,
+					mors->chip_if->headless_cfg_addr,
+					mors->headless.pending_cfg);
+		hw_headless_done_irq_enable(mors, true);
+		mors->headless.state = HEADLESS_ON_PENDING;
+		hw_trigger_detach(mors);
+		break;
+	case HEADLESS_ON_PENDING:
+		hw_headless_done_irq_enable(mors, false);
+		mors->headless.state = HEADLESS_ON;
+		morse_watchdog_pause(mors);
+
+		if (mors->cfg->ops->flush_cache)
+			mors->cfg->ops->flush_cache(mors);
+
+		if (drv_work)
+			complete(drv_work);
+		break;
+	case HEADLESS_OFF_REQUEST:
+		(void)morse_reg32_write(mors,
+					mors->chip_if->headless_cfg_addr,
+					mors->headless.pending_cfg);
+		hw_headless_done_irq_enable(mors, true);
+		mors->headless.state = HEADLESS_OFF_PENDING;
+		hw_trigger_attach(mors);
+		break;
+	case HEADLESS_OFF_PENDING:
+		hw_headless_done_irq_enable(mors, false);
+		mors->headless.state = HEADLESS_OFF;
+		morse_watchdog_resume(mors);
+
+		if (drv_work)
+			complete(drv_work);
+		break;
+	default:
+		MORSE_HEADLESS_WARN(mors, "%s: ignoring event for %s", __func__,
+				    hw_headless_state_to_str(now));
+	}
+	after = mors->headless.state;
+	mutex_unlock(&mors->headless.lock);
+
+	morse_release_bus(mors);
+	/* ps will be evaluated by the initiator once the operation is complete */
+	morse_ps_wakers_dec(mors);
+
+	trace_headless_work(hw_headless_state_to_str(now), hw_headless_state_to_str(after));
+	MORSE_HEADLESS_DBG(mors,
+			   "%s: %s -> %s\n",
+			   __func__,
+			   hw_headless_state_to_str(now),
+			   hw_headless_state_to_str(after));
+}
+
+void morse_hw_headless_reset(struct morse *mors)
+{
+	enum headless_state now = mors->headless.state;
+
+	mors->headless.state = HEADLESS_OFF;
+	MORSE_HEADLESS_DBG(mors,
+		"%s: %s -> %s\n",
+		__func__,
+		hw_headless_state_to_str(now),
+		hw_headless_state_to_str(mors->headless.state));
+}
+
+int morse_hw_detach(struct morse *mors, int cfg)
+{
+	int ret = 0;
+	bool triggered = false;
+	unsigned int rem;
+	DECLARE_COMPLETION_ONSTACK(drv_work);
+
+	trace_headless_detach(cfg);
+	mutex_lock(&mors->headless.lock);
+
+	if (!(mors->firmware_flags & MORSE_FW_FLAGS_SUPPORT_HW_REATTACH)) {
+		ret = -ENOTSUPP;
+	} else if (mors->headless.wait) {
+		ret = -EALREADY;
+	} else if (mors->headless.state == HEADLESS_ON) {
+		ret = 0; /* Already detached - go straight to exit */
+		goto exit;
+	} else if (mors->headless.state != HEADLESS_OFF) {
+		ret = -EINVAL;
+	}
+
+	if (ret)
+		goto exit;
+
+	morse_ps_wakers_inc(mors);
+
+	WRITE_ONCE(mors->headless.wait, &drv_work);
+	mors->headless.pending_cfg = cfg;
+	mors->headless.state = HEADLESS_ON_REQUEST;
+	MORSE_HEADLESS_DBG(mors, "%s: headless on requested\n", __func__);
+	/* Queue headless ON request and wait for its completion */
+	queue_work(mors->chip_wq, &mors->headless.work);
+	mutex_unlock(&mors->headless.lock);
+
+	rem = wait_for_completion_timeout(mors->headless.wait,
+		msecs_to_jiffies(HEADLESS_TIMEOUT_MS));
+	mutex_lock(&mors->headless.lock);
+	WRITE_ONCE(mors->headless.wait, NULL);
+
+	morse_ps_wakers_dec(mors);
+	morse_ps_queue_eval(mors);
+
+	triggered = true;
+	if (rem == 0)
+		ret = -ETIMEDOUT;
+	else
+		ret = 0;
+
+exit:
+	mutex_unlock(&mors->headless.lock);
+	if (ret)
+		MORSE_HEADLESS_ERR(mors, "%s: failed (ret:%d)\n", __func__, ret);
+	else if (triggered)
+		MORSE_HEADLESS_INFO(mors, "%s: success\n", __func__);
+
+	trace_headless_detach_return(ret);
+	return ret;
+}
+
+int morse_hw_attach(struct morse *mors, int cfg)
+{
+	int ret = 0;
+	unsigned int rem;
+	bool triggered = false;
+	DECLARE_COMPLETION_ONSTACK(drv_work);
+
+	trace_headless_attach(cfg);
+	mutex_lock(&mors->headless.lock);
+
+	if (!(mors->firmware_flags & MORSE_FW_FLAGS_SUPPORT_HW_REATTACH)) {
+		ret = -ENOTSUPP;
+	} else if (mors->headless.wait) {
+		ret = -EALREADY;
+	} else if (mors->headless.state == HEADLESS_OFF) {
+		ret = 0; /* Already attached - go straight to exit */
+		goto exit;
+	} else if (mors->headless.state != HEADLESS_ON) {
+		ret = -EINVAL;
+	}
+
+	if (ret)
+		goto exit;
+
+	morse_ps_wakers_inc(mors);
+
+	WRITE_ONCE(mors->headless.wait, &drv_work);
+	mors->headless.pending_cfg = cfg;
+	mors->headless.state = HEADLESS_OFF_REQUEST;
+	MORSE_HEADLESS_DBG(mors, "%s: headless off requested\n", __func__);
+	/* Queue headless OFF request and wait its completion */
+	queue_work(mors->chip_wq, &mors->headless.work);
+	mutex_unlock(&mors->headless.lock);
+
+	rem = wait_for_completion_timeout(mors->headless.wait,
+		msecs_to_jiffies(HEADLESS_TIMEOUT_MS));
+	mutex_lock(&mors->headless.lock);
+	WRITE_ONCE(mors->headless.wait, NULL);
+
+	morse_ps_wakers_dec(mors);
+	morse_ps_queue_eval(mors);
+
+	triggered = true;
+	if (rem == 0)
+		ret = -ETIMEDOUT;
+	else
+		ret = 0;
+
+exit:
+	mutex_unlock(&mors->headless.lock);
+	if (ret)
+		MORSE_HEADLESS_ERR(mors, "%s: failed (ret:%d)\n", __func__, ret);
+	else if (triggered)
+		MORSE_HEADLESS_INFO(mors, "%s: success\n", __func__);
+
+	trace_headless_attach_return(ret);
+	return ret;
+}
+
+void morse_hw_headless_init(struct morse *mors)
+{
+	INIT_WORK(&mors->headless.work, morse_hw_headless_work);
+	mutex_init(&mors->headless.lock);
+
+	/* Assume initially that headless is ON until hardware is succesfully
+	 * loaded or attached.
+	 */
+	mors->headless.state = HEADLESS_ON;
+}
+
+bool morse_hw_is_stopped_notification_set(struct morse *mors)
 {
 	u32 status1 = 0;
 	int ret = 0;
@@ -508,4 +760,69 @@ bool morse_hw_is_stopped(struct morse *mors)
 bool morse_hw_should_reattach(void)
 {
 	return reattach_hw;
+}
+
+static const u8 *hw_state_to_str(enum morse_hw_state state)
+{
+	switch (state) {
+	case MORSE_HW_STATE_OFF:
+		return "off";
+	case MORSE_HW_STATE_ON:
+		return "on";
+	case MORSE_HW_STATE_STOPPED:
+		return "stopped";
+	case MORSE_HW_STATE_RESTARTING:
+		return "restarting";
+	default:
+		return "unknown";
+	}
+}
+
+bool morse_hw_is_restarting(const struct morse *mors)
+{
+	return mors->hw_state == MORSE_HW_STATE_RESTARTING;
+}
+
+bool morse_hw_is_on(const struct morse *mors)
+{
+	return mors->hw_state == MORSE_HW_STATE_ON;
+}
+
+bool morse_hw_is_stopped(const struct morse *mors)
+{
+	return mors->hw_state == MORSE_HW_STATE_STOPPED;
+}
+
+void morse_hw_set_state(struct morse *mors, enum morse_hw_state next)
+{
+	bool transition_okay;
+	enum morse_hw_state state;
+
+	lockdep_assert_held(&mors->lock);
+
+	state = mors->hw_state;
+	switch (state) {
+	case MORSE_HW_STATE_OFF:
+		transition_okay = (next == MORSE_HW_STATE_ON);
+		break;
+	case MORSE_HW_STATE_ON:
+		transition_okay = (next == MORSE_HW_STATE_STOPPED ||
+				   next == MORSE_HW_STATE_RESTARTING ||
+				   next == MORSE_HW_STATE_OFF);
+		break;
+	case MORSE_HW_STATE_STOPPED:
+		transition_okay = (next == MORSE_HW_STATE_RESTARTING ||
+				   next == MORSE_HW_STATE_OFF);
+		break;
+	case MORSE_HW_STATE_RESTARTING:
+		transition_okay = (next == MORSE_HW_STATE_ON || next == MORSE_HW_STATE_STOPPED);
+		break;
+	default:
+		transition_okay = false;
+		break;
+	}
+
+	MORSE_INFO(mors, "%s: %s -> %s", __func__, hw_state_to_str(state), hw_state_to_str(next));
+	mors->hw_state = next;
+	MORSE_WARN_ON(FEATURE_ID_DEFAULT, !transition_okay);
 }

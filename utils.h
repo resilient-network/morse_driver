@@ -22,6 +22,9 @@
 /** Convert seconds to milliseconds */
 #define MORSE_SECS_TO_MSECS(x)	((x) * 1000)
 
+/** Convert microseconds to milliseconds via ceiling */
+#define MORSE_USECS_TO_MSECS_CEIL(x)	MORSE_INT_CEIL(x, 1000)
+
 #define LOWER_32_BITS(x) ((x) & GENMASK(31, 0))
 #define UPPER_32_BITS(x) (((x) >> 32) & GENMASK(31, 0))
 
@@ -76,6 +79,56 @@ static inline void *align_down(void *ptr, uint alignment)
 			TYPE NAME[]; \
 		}
 #endif
+#endif
+
+/**
+ * TIMER_TO_OBJ() – retrieve the containing object pointer from a timer_list
+ * @_s:    name of the object pointer to return
+ * @_l:    pointer to the timer_list instance
+ * @_t:    name of the timer_list member in the containing struct
+ */
+#if KERNEL_VERSION(6, 16, 0) > LINUX_VERSION_CODE
+#define TIMER_TO_OBJ(_s, _l, _t) from_timer(_s, _l, _t)
+#else
+#define TIMER_TO_OBJ(_s, _l, _t) timer_container_of(_s, _l, _t)
+#endif
+
+/**
+ * DEL_TIMER_SYNC() – synchronously delete a timer
+ * @_t:    pointer to the timer_list instance to delete
+ */
+#if KERNEL_VERSION(6, 15, 0) > LINUX_VERSION_CODE
+#define DEL_TIMER_SYNC(_t) del_timer_sync(_t)
+#else
+#define DEL_TIMER_SYNC(_t) timer_delete_sync(_t)
+#endif
+
+/**
+ * HTIMER_INIT() – initialize a high-resolution timer and install its callback
+ * @_t:    pointer to struct hrtimer to initialize
+ * @_func: callback function to invoke on expiry
+ *		(@fn must match enum hrtimer_restart (*)(struct hrtimer *))
+ * @...:   remaining args: clock ID (clockid_t) and mode (enum hrtimer_mode)
+ */
+#if KERNEL_VERSION(6, 15, 0) > LINUX_VERSION_CODE
+#define HTIMER_INIT(_t, _func, ...) \
+			do { \
+				hrtimer_init(_t, __VA_ARGS__); \
+				mors->watchdog.timer.function = _func; \
+			} while (0)
+#else
+#define HTIMER_INIT(_t, _func, ...) hrtimer_setup(_t, _func, __VA_ARGS__)
+#endif
+
+/**
+ * MORSE_CRC7_BYTE() – update CRC-7 with a single byte
+ * @crc:  current CRC-7 value
+ * @data: next byte to include (u8)
+ */
+#if KERNEL_VERSION(6, 15, 0) > LINUX_VERSION_CODE
+#define CRC7_BYTE(crc, data)     crc7_be_byte((crc), (data))
+#else
+#define CRC7_BYTE(crc, data)     crc7_be((crc), &(data), 1)
 #endif
 
 #endif /* !_MORSE_UTILS_H_ */

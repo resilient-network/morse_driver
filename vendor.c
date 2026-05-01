@@ -61,6 +61,7 @@ morse_vendor_cmd_to_morse(struct wiphy *wiphy, struct wireless_dev *wdev,
 
 	skb_len = skb->len;
 	dataout = (struct morse_cmd_resp_vendor *)skb_put(skb, sizeof(*dataout));
+	memset(dataout, 0, sizeof(*dataout));
 
 	mutex_lock(&mors->lock);
 	if (wdev)

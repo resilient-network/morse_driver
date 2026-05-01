@@ -17,10 +17,16 @@
 #define MIN_BSS_STATS_MONITOR_WINDOW_MS 500
 /** Maximum BSS Statistics event period in msec */
 #define MAX_BSS_STATS_MONITOR_WINDOW_MS 20000
+/** Reset Interval for Tx & Rx MCS histograms in msec */
+#define TX_RX_HIST_RESET_INTVL_SECS 60000
 /** Inactive STA, without traffic in monitoring window */
 #define MORSE_STA_TYPE_INACTIVE 0
 /** Inactive STA, with traffic in monitoring window */
 #define MORSE_STA_TYPE_ACTIVE   1
+
+struct morse_sta_stats_mcs_hist {
+	u32 h[MMRC_SUPP_NUM_MCS][MMRC_SUPP_NUM_BW];
+};
 
 /** Station statistics info */
 struct morse_sta_stats {
@@ -40,26 +46,42 @@ struct morse_sta_stats {
 	u64 last_rx_timestamp_us;
 	u32 num_tx_retries;
 	u32 num_rx_retries;
+	/*
+	 * Keep the following fields at the end of this struct to do the partial reset
+	 * remaining fields and preserve the MCS histograms for longer interval.
+	 */
 	u64 last_reset_time;
+	u32 hist_last_reset_jiffies;
+
+#ifdef CONFIG_MORSE_RC
+	/* MCS histograms (reset only every 60s, not every monitor window) */
+	struct morse_sta_stats_mcs_hist tx_mcs_hist;
+	struct morse_sta_stats_mcs_hist rx_mcs_hist;
+#endif
+};
+
+struct morse_bss_stats_config {
+	/** Flag to keep track of enable/disable  */
+	bool enabled;
+	/** Flag to keep track of pause/resume  */
+	bool paused;
+	/** Statistics event interval */
+	u32 monitor_window_ms;
 };
 
 /** BSS statistics context */
 struct morse_bss_stats_context {
-    /** Flag to keep track of enable/disable  */
-	bool enabled;
-    /** Flag to keep track of pause/resume  */
-	bool paused;
-    /** Serialize stats update and timer functions */
+	/** Pointer to the globally stored config */
+	struct morse_bss_stats_config *config;
+	/** Serialize stats update and timer functions */
 	spinlock_t lock;
-    /** Stations List */
+	/** Stations List */
 	struct list_head stas;
-    /** Station statistics reporting timer */
+	/** Station statistics reporting timer */
 	struct timer_list timer;
-    /** Statistics event interval */
-	u32 monitor_window_ms;
-    /** back pointer to morse */
+	/** back pointer to morse */
 	struct morse *mors;
-    /** back pointer to morse_vif */
+	/** back pointer to morse_vif */
 	struct morse_vif *mors_vif;
 };
 
@@ -70,12 +92,20 @@ struct morse_bss_stats_sta {
 	unsigned long last_update;
 };
 
+struct morse_bss_stats_mcs_info {
+	u8 mcs : 4;
+	u8 bw : 3;
+	u8 short_gi : 1;
+} __packed;
+
 /** Morse event data for active STA statistics */
 struct morse_active_sta_stats {
 	u8 mac_addr[ETH_ALEN];
 	u8 raw_priority;
 	u16 aid;
 	s16 avg_rssi;
+	/* Pad to align to a 4-byte boundary */
+	u8  __pad_align0;
 	u32 num_tx_bytes[IEEE80211_NUM_ACS];
 	u32 num_rx_bytes[IEEE80211_NUM_ACS];
 	u32 num_tx_pkts[IEEE80211_NUM_ACS];
@@ -88,11 +118,11 @@ struct morse_active_sta_stats {
 	u32 avg_rx_jitter_us;
 	u32 num_tx_retries;
 	u32 num_rx_retries;
-	u8 last_tx_rate_mcs;
-	u8 last_rx_rate_mcs;
 	u32 last_tx_rate_kbps;
 	u32 last_rx_rate_kbps;
 	u32 monitor_window_us;
+	struct morse_bss_stats_mcs_info avg_tx_mcs_info;
+	struct morse_bss_stats_mcs_info avg_rx_mcs_info;
 } __packed;
 
 /** Morse event data for inactive STA statistics */
@@ -189,13 +219,22 @@ void morse_bss_stats_update_sta_state(struct morse *mors,
 /**
  * morse_cmd_process_bss_stats_conf() - Stats config to enable and configure interval
  *
+ * @mors: Global Morse structure
  * @mors_vif: Morse VIF
  * @config: pointer to BSS stats config
  *
  * Return: 0 if command was processed successfully, otherwise error code
  */
-int morse_cmd_process_bss_stats_conf(struct morse_vif *mors_vif,
-				  struct morse_cmd_req_config_bss_stats *config);
+int morse_cmd_process_bss_stats_conf(struct morse *mors, struct morse_vif *mors_vif,
+			struct morse_cmd_req_config_bss_stats *config);
+
+/**
+ * morse_bss_stats_reconfig() - Restore BSS stats from the stored global config
+ *
+ * @mors: Global Morse structure
+ * @mors_vif: Morse VIF
+ */
+void morse_bss_stats_reconfig(struct morse *mors, struct morse_vif *mors_vif);
 
 /**
  * morse_bss_stats_pause() - Pause BSS Stats module, if it's enabled

@@ -176,22 +176,16 @@ uint morse_watchdog_get_interval(struct morse *mors)
 	return mors->watchdog.interval_secs;
 }
 
-int morse_watchdog_init(struct morse *mors, uint interval_s,
+void morse_watchdog_init(struct morse *mors, uint interval_s,
 						watchdog_callback_t ping)
 {
-	int ret = 0;
-
-	hrtimer_init(&mors->watchdog.timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
-	mors->watchdog.timer.function = &morse_watchdog_fire;
-
+	HTIMER_INIT(&mors->watchdog.timer, &morse_watchdog_fire, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
 	mors->watchdog.interval_secs = interval_s;
 	mors->watchdog.ping = ping;
 	mors->watchdog.consumers = 0;
 	mors->watchdog.paused = 0;
 
 	mutex_init(&mors->watchdog.lock);
-
-	return ret;
 }
 
 int morse_watchdog_cleanup(struct morse *mors)

@@ -21,7 +21,6 @@
 
 #include "bus.h"
 #include "command.h"
-#include "debug.h"
 #include "mac.h"
 #include "morse.h"
 #include "ps.h"
@@ -254,6 +253,7 @@ static void morse_wiphy_update_arp_filter(struct morse_vif *mors_vif)
 
 static int morse_ndev_open(struct net_device *dev)
 {
+	struct morse_persistent_vif_configs *mors_vif_conf;
 	struct morse_vif *mors_vif = netdev_priv(dev);
 	struct wireless_dev *wdev = &mors_vif->wdev;
 	struct morse *mors = wiphy_priv(wdev->wiphy);
@@ -277,19 +277,31 @@ static int morse_ndev_open(struct net_device *dev)
 	if (ret)
 		goto out;
 
+	/* Inform the firmware of our desired duty cycle mode. The actual duty cycle may be
+	 * reduced from 100% later by the firmware, according to its regulatory rules.
+	 */
+	ret = morse_cmd_set_duty_cycle(mors, duty_cycle_mode, 10000, true);
+	if (ret)
+		goto out;
+
 	ret = morse_cmd_add_if(mors, &mors_vif->id, dev->dev_addr, wdev->iftype);
 	if (ret)
 		goto out;
 	if (wdev->iftype == NL80211_IFTYPE_MONITOR)
 		mors->mon_if.id = mors_vif->id;
 
-	morse_vendor_ie_init_interface(mors_vif);
-
 	if (mors->cfg->set_slow_clock_mode)
 		mors->cfg->set_slow_clock_mode(mors, morse_mac_slow_clock_mode());
 
-	mors->started = true;
+	mutex_lock(&mors->persistent_vif_config.lock);
+	mors_vif_conf = morse_get_vif_conf_from_id(mors, mors_vif->id);
+	if (mors_vif_conf)
+		memcpy(mors_vif_conf->addr, dev->dev_addr, ETH_ALEN);
+	mutex_unlock(&mors->persistent_vif_config.lock);
 
+	morse_vendor_ie_init_interface(mors_vif, false);
+
+	mors->wiphy_started = true;
 out:
 	mutex_unlock(&mors->lock);
 
@@ -305,19 +317,21 @@ static int morse_ndev_close(struct net_device *dev)
 
 	mutex_lock(&mors->lock);
 
-	if (!mors->started)
+	if (!mors->wiphy_started)
 		goto out;
 
 	morse_wiphy_cleanup(mors);
 
-	morse_vendor_ie_deinit_interface(mors_vif);
+	morse_vendor_ie_deinit_interface(mors_vif, false);
 
 	ret = morse_cmd_rm_if(mors, mors_vif->id);
 
+	morse_ps_iface_down_notify(mors, mors_vif);
+
 	if (wdev->iftype == NL80211_IFTYPE_MONITOR)
 		mors->mon_if.id = INVALID_VIF_ID;
-	mors->started = false;
 
+	mors->wiphy_started = false;
 out:
 	mutex_unlock(&mors->lock);
 
@@ -329,10 +343,17 @@ static netdev_tx_t morse_ndev_data_tx(struct sk_buff *skb, struct net_device *de
 	int ret;
 	int aci;
 	struct morse_skbq *mq;
-
 	struct morse_vif *mors_vif = netdev_priv(dev);
 	struct morse *mors = wiphy_priv(mors_vif->wdev.wiphy);
-	struct morse_skb_tx_info tx_info = { 0 };
+	struct morse_skb_tx_info tx_info = {
+		.flags = cpu_to_le32(MORSE_TX_CONF_FLAGS_FULLMAC_REPORT),
+	};
+
+	if (!test_bit(MORSE_SME_STATE_CONNECTED, &mors_vif->sme_state)) {
+		dev_kfree_skb_any(skb);
+		dev->stats.tx_dropped++;
+		return NETDEV_TX_OK;
+	}
 
 	sk_pacing_shift_update(skb->sk, SK_PACING_SHIFT);
 
@@ -351,7 +372,7 @@ static netdev_tx_t morse_ndev_data_tx(struct sk_buff *skb, struct net_device *de
 	return NETDEV_TX_OK;
 
 tx_err:
-	MORSE_ERR_RATELIMITED(mors, "%s failed with error [%d]\n", __func__, ret);
+	MORSE_DBG_RATELIMITED(mors, "%s failed with error [%d]\n", __func__, ret);
 	dev->stats.tx_dropped++;
 	dev->stats.tx_aborted_errors++;
 
@@ -415,11 +436,15 @@ morse_wiphy_fill_vendor_ies(struct morse_vif *mors_vif, u8 *dest,
 			   enum morse_vendor_ie_mgmt_type_flags mgmt_type_mask)
 {
 	struct vendor_ie_list_item *vendor_ie, *tmp;
+	struct morse_vendor_ie *vie_config;
 	u16 dest_idx = 0;
 
 	spin_lock_bh(&mors_vif->vendor_ie.lock);
+	vie_config = mors_vif->vendor_ie.vie_config;
+	if (!vie_config)
+		goto exit;
 
-	list_for_each_entry_safe(vendor_ie, tmp, &mors_vif->vendor_ie.ie_list, list) {
+	list_for_each_entry_safe(vendor_ie, tmp, &vie_config->ie_list, list) {
 		if (vendor_ie->mgmt_type_mask & mgmt_type_mask) {
 			dest[dest_idx++] = vendor_ie->ie.element_id;
 			dest[dest_idx++] = vendor_ie->ie.len;
@@ -428,6 +453,7 @@ morse_wiphy_fill_vendor_ies(struct morse_vif *mors_vif, u8 *dest,
 		}
 	}
 
+exit:
 	spin_unlock_bh(&mors_vif->vendor_ie.lock);
 }
 
@@ -795,17 +821,12 @@ static int morse_wiphy_connect(struct wiphy *wiphy, struct net_device *ndev,
 		/* SAE offload is mandatory for this driver: if SAE is selected then
 		 * the SAE passphrase must also be given.
 		 */
-#if KERNEL_VERSION(5, 3, 0) <= MAC80211_VERSION_CODE
 		if (!sme->crypto.sae_pwd || !sme->crypto.sae_pwd_len) {
 			ret = -EINVAL;
 			goto out;
 		}
 		params.sae_pwd = sme->crypto.sae_pwd;
 		params.sae_pwd_len = sme->crypto.sae_pwd_len;
-#else
-		ret = -EOPNOTSUPP;
-		goto out;
-#endif
 	}
 
 	switch (sme->auth_type) {
@@ -881,6 +902,7 @@ static int morse_wiphy_disconnect(struct wiphy *wiphy, struct net_device *ndev, 
 	ret = morse_cmd_disconnect(mors);
 
 	if (test_and_clear_bit(MORSE_SME_STATE_CONNECTING, &mors_vif->sme_state)) {
+		/* Cancelling a connection attempt while it is in progress. */
 		cfg80211_connect_timeout(ndev, /* bssid */ NULL,
 					 /* req_ie */ NULL, /* req_ie_len */ 0,
 					 GFP_KERNEL
@@ -888,7 +910,15 @@ static int morse_wiphy_disconnect(struct wiphy *wiphy, struct net_device *ndev, 
 					 , NL80211_TIMEOUT_UNSPECIFIED
 #endif
 		    );
-		clear_bit(MORSE_SME_STATE_CONNECTED, &mors_vif->sme_state);
+
+		if (test_and_clear_bit(MORSE_SME_STATE_CONNECTED, &mors_vif->sme_state)) {
+			/* The connection attempt being cancelled was a roam request. If we
+			 * received a DISCONNECTED event before this point, we suppressed it in
+			 * anticipation of the subsequent CONNECTED event when roaming finishes.
+			 */
+			netif_carrier_off(ndev);
+			queue_work(mors->wiphy_wq, &mors_vif->disconnected_work);
+		}
 	}
 
 out:
@@ -916,7 +946,7 @@ static int morse_wiphy_get_channel(struct wiphy *wiphy, struct wireless_dev *wde
 
 	mutex_lock(&mors->lock);
 
-	if (!mors->started || mors->ps.suspended) {
+	if (!mors->wiphy_started || mors->ps.suspended) {
 		ret = -EBUSY;
 		goto out;
 	}
@@ -1012,7 +1042,11 @@ out:
 	return ret;
 }
 
-static int morse_wiphy_set_wiphy_params(struct wiphy *wiphy, u32 changed)
+static int morse_wiphy_set_wiphy_params(struct wiphy *wiphy,
+#if KERNEL_VERSION(6, 17, 0) <= MAC80211_VERSION_CODE
+					 int radio_idx,
+#endif
+					 u32 changed)
 {
 	struct morse *mors = wiphy_priv(wiphy);
 	int ret = 0;
@@ -1030,12 +1064,20 @@ static int morse_wiphy_set_wiphy_params(struct wiphy *wiphy, u32 changed)
 			}
 			MORSE_DBG(mors, "setting RTS threshold %u\n", wiphy->rts_threshold);
 			ret = morse_cmd_set_rts_threshold(mors, wiphy->rts_threshold);
+			if (ret)
+				goto out;
+			if (morse_mac_is_cts_to_self_enabled()) {
+				MORSE_DBG(mors, "enabling CTS-to-self\n");
+				ret = morse_cmd_set_cts_to_self(mors, true);
+				if (ret)
+					goto out;
+			}
 		} else {
 			MORSE_DBG(mors, "disabling RTS\n");
 			ret = morse_cmd_set_rts_threshold(mors, 0);
+			if (ret)
+				goto out;
 		}
-		if (ret)
-			goto out;
 	}
 	if (changed & WIPHY_PARAM_FRAG_THRESHOLD) {
 		MORSE_DBG(mors, "setting fragmentation threshold %u\n", wiphy->frag_threshold);
@@ -1057,6 +1099,7 @@ morse_wiphy_set_power_mgmt(struct wiphy *wiphy, struct net_device *dev, bool ena
 	 */
 	const bool enable_dynamic_ps_offload = enabled;
 	struct morse *mors = wiphy_priv(wiphy);
+	struct morse_vif *mors_vif = netdev_priv(dev);
 	int ret;
 
 	if (!morse_mac_ps_enabled(mors))
@@ -1064,17 +1107,16 @@ morse_wiphy_set_power_mgmt(struct wiphy *wiphy, struct net_device *dev, bool ena
 
 	mutex_lock(&mors->lock);
 
-	if (mors->config_ps == enabled) {
-		ret = 0;
+	if (morse_ps_is_interface_same(mors, mors_vif) &&
+	    morse_ps_is_interface_enabled(mors) == enabled) {
+		ret = 0; /* Required PS state is already set for VIF */
 		goto out;
 	}
 
-	ret = morse_cmd_set_ps(mors, enabled, enable_dynamic_ps_offload);
+	ret = morse_cmd_set_ps(mors, mors_vif->id, enabled, enable_dynamic_ps_offload);
 	if (ret)
 		goto out;
-
-	mors->config_ps = enabled;
-	ret = 0;
+	morse_ps_update_interface_state(mors, mors_vif, enabled);
 
 out:
 	mutex_unlock(&mors->lock);
@@ -1137,8 +1179,6 @@ static void morse_wiphy_connected_work(struct work_struct *work)
 			MORSE_WARN(mors, "Failed to enable in-chip DHCP client\n");
 	}
 
-	morse_ps_enable(mors);
-
 	mutex_unlock(&mors->lock);
 }
 
@@ -1167,8 +1207,6 @@ static void morse_wiphy_disconnected_work(struct work_struct *work)
 
 	mutex_lock(&mors->lock);
 
-	morse_ps_disable(mors);
-
 	morse_wiphy_disconnected_update_rts(mors);
 
 	if (mors_vif->connected_bss) {
@@ -1176,6 +1214,7 @@ static void morse_wiphy_disconnected_work(struct work_struct *work)
 		cfg80211_put_bss(wiphy, mors_vif->connected_bss);
 		mors_vif->connected_bss = NULL;
 	}
+	mors_vif->bss_vendor_info.valid = false;
 
 	mutex_unlock(&mors->lock);
 }
@@ -1367,10 +1406,11 @@ morse_wiphy_mgmt_tx(struct wiphy *wiphy,
 	u32 flags = 0;
 	int ret;
 
-	if (params->dont_wait_for_ack) {
+	if (params->dont_wait_for_ack)
 		flags |= MORSE_TX_STATUS_FLAGS_NO_REPORT;
-		tx_info.flags = cpu_to_le32(flags);
-	}
+	else
+		flags |= MORSE_TX_CONF_FLAGS_FULLMAC_REPORT;
+	tx_info.flags = cpu_to_le32(flags);
 
 	mgmt_q = mors->cfg->ops->skbq_mgmt_tc_q(mors);
 	skb = morse_skbq_alloc_skb(mgmt_q, params->len);
@@ -1537,9 +1577,8 @@ int morse_wiphy_init(struct morse *mors)
 
 	memcpy(wiphy->perm_addr, mors->macaddr, ETH_ALEN);
 
-#if KERNEL_VERSION(5, 3, 0) <= MAC80211_VERSION_CODE
 	wiphy_ext_feature_set(wiphy, NL80211_EXT_FEATURE_SAE_OFFLOAD);
-#endif
+
 #if KERNEL_VERSION(6, 7, 0) <= MAC80211_VERSION_CODE
 	wiphy_ext_feature_set(wiphy, NL80211_EXT_FEATURE_OWE_OFFLOAD);
 #endif
@@ -1624,7 +1663,8 @@ void morse_wiphy_cleanup(struct morse *mors)
 	if (mors_vif && test_and_clear_bit(MORSE_SME_STATE_CONNECTED, &mors_vif->sme_state)) {
 		cfg80211_disconnected(ndev, WLAN_REASON_UNSPECIFIED,
 				      NULL, 0, disconnect_locally_generated, GFP_KERNEL);
-		morse_ps_disable(mors);
+		morse_ps_wakers_inc(mors);
+		morse_ps_queue_eval(mors);
 	}
 
 	if (mors_vif && test_and_clear_bit(MORSE_SME_STATE_CONNECTING, &mors_vif->sme_state))
@@ -1642,8 +1682,7 @@ void morse_wiphy_cleanup(struct morse *mors)
 		mors->scan_req = NULL;
 	}
 	clear_bit(MORSE_SCAN_STATE_ABORTED, &mors->scan_state);
-
-	mors->started = false;
+	mors->wiphy_started = false;
 }
 
 void morse_wiphy_restarted(struct morse *mors)
@@ -1653,8 +1692,6 @@ void morse_wiphy_restarted(struct morse *mors)
 	int ret;
 
 	lockdep_assert_held(&mors->lock);
-
-	mors->started = true;
 
 	ret = morse_cmd_set_country(mors, mors->country);
 	if (ret)
@@ -1676,6 +1713,10 @@ void morse_wiphy_restarted(struct morse *mors)
 	ret = morse_wiphy_fixed_rate(mors);
 	if (ret)
 		MORSE_ERR(mors, "error setting fixed transmission rate after restart: %d\n", ret);
+
+	ret = morse_cmd_set_duty_cycle(mors, duty_cycle_mode, 10000, true);
+	if (ret)
+		MORSE_ERR(mors, "error setting duty cycle mode after restart: %d\n", ret);
 
 	if (sta_vif) {
 		struct morse_vif *mors_vif = sta_vif;
@@ -1701,6 +1742,22 @@ void morse_wiphy_restarted(struct morse *mors)
 				  "error adding monitor interface to chip after restart: %d\n",
 				  ret);
 	}
+
+	if (sta_vif) {
+		ret = morse_cmd_set_ps(mors, sta_vif->id, sta_vif->is_ps_enabled,
+				       sta_vif->is_ps_enabled);
+		if (ret)
+			MORSE_ERR(mors,
+				  "error updating chip power save state after restart: %d\n",
+				  ret);
+		else
+			morse_ps_update_interface_state(mors, sta_vif, sta_vif->is_ps_enabled);
+	}
+
+	if (ret)
+		MORSE_ERR(mors, "error configuring powersave after restart: %d\n", ret);
+
+	mors->wiphy_started = true;
 }
 
 /**
@@ -1780,9 +1837,18 @@ morse_wiphy_rx_mgmt(struct morse *mors,
 		    struct morse_skb_rx_status *hdr_rx_status)
 {
 	struct morse_vif *mors_vif = morse_wiphy_get_sta_vif(mors);
+	u32 freq_5g, freq_s1g, bw_s1g, chan_s1g, chan_5g;
 	struct wireless_dev *wdev = &mors_vif->wdev;
+	enum dot11_bandwidth bw_idx;
 
-	cfg80211_rx_mgmt(wdev, 0, le16_to_cpu(hdr_rx_status->rssi), skb->data, skb->len, 0);
+	freq_s1g = KHZ100_TO_KHZ(le16_to_cpu(hdr_rx_status->freq_100khz));
+	bw_idx = morse_ratecode_bw_index_get(hdr_rx_status->morse_ratecode);
+	bw_s1g = morse_ratecode_bw_index_to_s1g_bw_mhz(bw_idx);
+	chan_s1g = morse_dot11ah_freq_khz_bw_mhz_to_chan(freq_s1g, bw_s1g);
+	chan_5g = morse_dot11ah_s1g_chan_to_5g_chan(chan_s1g);
+	freq_5g = ieee80211_channel_to_frequency(chan_5g, NL80211_BAND_5GHZ);
+
+	cfg80211_rx_mgmt(wdev, freq_5g, le16_to_cpu(hdr_rx_status->rssi), skb->data, skb->len, 0);
 	morse_mac_skb_free(mors, skb);
 }
 
@@ -1891,7 +1957,7 @@ int morse_wiphy_scan_result(struct morse *mors, struct morse_cmd_evt_scan_result
 
 void morse_wiphy_scan_done(struct morse *mors, bool aborted)
 {
-	if (!mors->started)
+	if (!mors->wiphy_started)
 		return;
 
 	if (aborted)
@@ -2019,7 +2085,7 @@ void morse_wiphy_disconnected(struct morse *mors)
 	struct morse_vif *mors_vif = sta_vif;
 	struct net_device *ndev = mors_vif->ndev;
 
-	if (!mors->started)
+	if (!mors->wiphy_started)
 		return;
 
 	if (test_bit(MORSE_SME_STATE_CONNECTING, &mors_vif->sme_state))
@@ -2039,34 +2105,53 @@ void morse_wiphy_disconnected(struct morse *mors)
 	cfg80211_disconnected(ndev, WLAN_REASON_UNSPECIFIED,
 			      /* ie */ NULL, /* ie_len */ 0,
 			      /* locally_generated */ false, GFP_KERNEL);
-	mors_vif->bss_vendor_info.valid = false;
 
 	queue_work(mors->wiphy_wq, &mors_vif->disconnected_work);
 }
 
 int morse_wiphy_traffic_control(struct morse *mors, bool pause_data_traffic, int sources)
 {
-	int ret = -1;
 	unsigned long *event_flags = &mors->chip_if->event_flags;
 	bool sources_includes_twt = (sources & MORSE_CMD_UMAC_TRAFFIC_CONTROL_SOURCE_TWT);
-
-	if (sources_includes_twt) {
-		/* TWT not supported.. LMAC should not be signalling traffic control */
-		WARN_ONCE(1, "TWT not supported on interface\n");
-		goto exit;
-	}
 
 	if (pause_data_traffic) {
 		set_bit(MORSE_DATA_TRAFFIC_PAUSE_PEND, event_flags);
 		queue_work(mors->chip_wq, &mors->chip_if_work);
-		/* TODO(SW-13279): pause watchdog here if sources_includes_twt */
+		if (sources_includes_twt)
+			morse_watchdog_pause(mors);
 	} else {
 		set_bit(MORSE_DATA_TRAFFIC_RESUME_PEND, event_flags);
 		queue_work(mors->chip_wq, &mors->chip_if_work);
-		/* TODO(SW-13279): resume watchdog here if sources_includes_twt */
+		if (sources_includes_twt)
+			morse_watchdog_resume(mors);
 	}
 
-	ret = 0;
-exit:
-	return ret;
+	return 0;
+}
+
+void morse_wiphy_stop_tx_queues(struct morse *mors)
+{
+	struct morse_vif *mors_vif = sta_vif;
+
+	if (!mors_vif || !mors_vif->ndev)
+		return;
+
+	mors->debug.page_stats.queue_stop++;
+	netif_stop_queue(mors_vif->ndev);
+
+	set_bit(MORSE_STATE_FLAG_DATA_QS_STOPPED, &mors->state_flags);
+}
+
+void morse_wiphy_wake_tx_queues(struct morse *mors)
+{
+	struct morse_vif *mors_vif = sta_vif;
+
+	if (!mors->wiphy_started)
+		return;
+	if (!mors_vif || !mors_vif->ndev)
+		return;
+
+	netif_wake_queue(mors_vif->ndev);
+
+	clear_bit(MORSE_STATE_FLAG_DATA_QS_STOPPED, &mors->state_flags);
 }

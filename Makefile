@@ -8,7 +8,7 @@ else
 endif
 
 # Set 0 to a version number. This is done to match the Linux expectations
-override MORSE_VERSION = "0-rel_1_16_4_2025_Sep_18"
+override MORSE_VERSION = "0-rel_1_17_8_2026_Mar_24"
 
 USING_CLANG := $(shell $(CC) -v 2>&1 | grep -c "clang version")
 
@@ -31,8 +31,15 @@ ccflags-$(CONFIG_MORSE_DEBUG_IRQ) += "-DCONFIG_MORSE_DEBUG_IRQ"
 ccflags-$(CONFIG_MORSE_DEBUG_TXSTATUS) += "-DCONFIG_MORSE_DEBUG_TXSTATUS"
 ccflags-$(CONFIG_MORSE_IPMON) += "-DCONFIG_MORSE_IPMON"
 ccflags-$(CONFIG_MORSE_MONITOR) += "-DCONFIG_MORSE_MONITOR"
-ccflags-$(CONFIG_MORSE_PAGESET_TRACE) += "-DCONFIG_MORSE_PAGESET_TRACE"
-ccflags-$(CONFIG_MORSE_BUS_TRACE) += "-DCONFIG_MORSE_BUS_TRACE"
+ccflags-$(CONFIG_MORSE_TRACE_LOG_MSG) += -D"CONFIG_MORSE_TRACE_LOG_MSG"
+ccflags-$(CONFIG_MORSE_TRACE_BUS) += "-DCONFIG_MORSE_TRACE_BUS"
+ccflags-$(CONFIG_MORSE_TRACE_HW_IRQ) += "-DCONFIG_MORSE_TRACE_HW_IRQ"
+ccflags-$(CONFIG_MORSE_TRACE_PS) += "-DCONFIG_MORSE_TRACE_PS"
+ccflags-$(CONFIG_MORSE_TRACE_PAGER_HW) += "-DCONFIG_MORSE_TRACE_PAGER_HW"
+ccflags-$(CONFIG_MORSE_TRACE_PAGESET) += "-DCONFIG_MORSE_TRACE_PAGESET"
+ccflags-$(CONFIG_MORSE_TRACE_RX) += "-DCONFIG_MORSE_TRACE_RX"
+ccflags-$(CONFIG_MORSE_TRACE_HEADLESS) += "-DCONFIG_MORSE_TRACE_HEADLESS"
+ccflags-$(CONFIG_MORSE_TRACE_SUSPEND) += "-DCONFIG_MORSE_TRACE_SUSPEND"
 ccflags-$(CONFIG_ANDROID) += "-DCONFIG_ANDROID"
 
 ifneq ($(CONFIG_BACKPORT_VERSION),)
@@ -61,6 +68,9 @@ ccflags-y += "-DCONFIG_MORSE_POWERSAVE_MODE=$(CONFIG_MORSE_POWERSAVE_MODE)"
 CONFIG_MORSE_SDIO_ALIGNMENT ?= 2
 ccflags-y += "-DCONFIG_MORSE_SDIO_ALIGNMENT=$(CONFIG_MORSE_SDIO_ALIGNMENT)"
 
+ifneq ($(CONFIG_DISABLE_MORSE_FULLMAC),y)
+	ccflags-y += "-DCONFIG_MORSE_FULLMAC"
+endif
 ifneq ($(CONFIG_DISABLE_MORSE_RC),y)
 	ccflags-y += "-DCONFIG_MORSE_RC"
 ifeq ($(CONFIG_ANDROID),y)
@@ -94,14 +104,6 @@ else
 	ccflags-y += "-DENABLE_SURVEY_DEFAULT=1"
 endif
 
-ifeq ($(CONFIG_MORSE_PAGESET_TRACE),y)
-	ccflags-y += "-DPAGESET_TRACE_DEPTH=64"
-endif
-
-ifeq ($(CONFIG_MORSE_BUS_TRACE),y)
-	ccflags-y += "-DBUS_TRACE_DEPTH=64"
-endif
-
 ccflags_trace.o := -I$(src)
 CFLAGS_trace.o := -I$(src)
 
@@ -125,8 +127,8 @@ morse-y += mm6108.o
 morse-y += command.o
 morse-y += hw.o
 morse-y += beacon.o
-morse-y += pager_if.o
 morse-y += pageset.o
+morse-y += pager_hw.o
 morse-y += ps.o
 morse-y += raw.o
 morse-y += twt.o
@@ -134,17 +136,14 @@ morse-y += cac.o
 morse-y += ndpprobe.o
 morse-y += of.o
 morse-y += firmware.o
-morse-y += pager_if_hw.o
-morse-y += pager_if_sw.o
 morse-y += yaps.o
-morse-y += yaps-hw.o
+morse-y += yaps_hw.o
 morse-y += watchdog.o
 morse-y += event.o
 morse-y += crc16_xmodem.o
 morse-y += offload.o
 morse-y += vendor_ie.o
 morse-y += bus_test.o
-morse-y += wiphy.o
 morse-y += ocs.o
 morse-y += mbssid.o
 morse-y += mesh.o
@@ -155,6 +154,8 @@ morse-y += coredump.o
 morse-y += peer.o
 morse-y += led.o
 morse-y += bss_stats.o
+morse-y += hw_beacon.o
+morse-$(CONFIG_PM) += wowlan.o
 morse-$(CONFIG_MORSE_MONITOR) += monitor.o
 morse-$(CONFIG_MORSE_SDIO) += sdio.o
 morse-$(CONFIG_MORSE_SPI) += spi.o
@@ -162,10 +163,11 @@ morse-$(CONFIG_MORSE_USB) += usb.o
 morse-$(CONFIG_MORSE_VENDOR_COMMAND) += vendor.o
 morse-$(CONFIG_MORSE_USER_ACCESS) += uaccess.o
 morse-$(CONFIG_MORSE_HW_TRACE) += hw_trace.o
-morse-$(CONFIG_MORSE_PAGESET_TRACE) += pageset_trace.o
-morse-$(CONFIG_MORSE_BUS_TRACE) += bus_trace.o
 morse-$(CONFIG_ANDROID) += apf.o
 
+ifneq ($(CONFIG_DISABLE_MORSE_FULLMAC),y)
+	morse-y += wiphy.o
+endif
 ifeq ($(CONFIG_DISABLE_MORSE_RC),y)
 	morse-y += minstrel_rc.o
 else

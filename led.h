@@ -21,26 +21,25 @@ struct morse;
 /**
  * LED behaviour configuration
  *	- DISABLED does not initialise the LED
- *	- HOST is controlled directly by the driver and indicates that the chip has been
- *		correctly initialised
- * The remaining five options register the LED with the kernel subsystem LED callbacks
+ * The remaining seven options register the LED with the kernel subsystem LED callbacks
  *	- TX and RX indicate there is network traffic
  *	- TPT flashes based on traffic with faster flashing for higher throughput
  *	- ASSOC indicates that the station has associated (STA only)
  *	- RADIO indicates that the RF is up/down
- *	- USER_DEF registers the LED with mac80211 but does not set a default behaviour
- * All of the mac80211-registered configurations can be configured and controlled in
+ *	- DEFAULT_OFF and DEFAULT_ON registers the LED with the kernel but does not set a
+ *		default behaviour
+ * All of the kernel-registered configurations can be configured and controlled in
  * userspace in /sys/class/leds/<led_name>
  */
 enum led_mode {
 	MORSE_LED_DISABLED,
-	MORSE_LED_HOST,
 	MORSE_LED_TPT,
 	MORSE_LED_TX,
 	MORSE_LED_RX,
 	MORSE_LED_ASSOC,
 	MORSE_LED_RADIO,
-	MORSE_LED_USER_DEF,
+	MORSE_LED_DEFAULT_OFF,
+	MORSE_LED_DEFAULT_ON
 };
 
 struct morse_led {
@@ -55,6 +54,7 @@ struct morse_led_group {
 	bool enable_led_support;
 	int num_leds;
 	struct morse_led leds[NUM_LEDS];
+	const char *tpt_trigger_name;
 };
 
 /**
@@ -68,5 +68,11 @@ void morse_led_init(struct morse *mors);
  * @mors: Global Morse structure
  */
 void morse_led_exit(struct morse *mors);
+
+/**
+ * Restore LED registers after HW restart
+ * @mors: Global Morse structure
+ */
+void morse_led_restore_after_restart(struct morse *mors);
 
 #endif

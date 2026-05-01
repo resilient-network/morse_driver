@@ -42,17 +42,18 @@ static void morse_schedule_mesh_probe_timer(struct morse_mesh *mesh, int delay)
 int morse_cmd_process_mbca_conf(struct morse_vif *mors_vif,
 				struct morse_cmd_req_set_mcba_conf *mbca)
 {
-	struct morse_mesh *mesh;
+	struct morse_mesh_config *mesh_conf;
 
-	if (!mors_vif || !mors_vif->mesh)
+	if (!mors_vif || !mors_vif->mesh || !mors_vif->mesh->conf)
 		return -EFAULT;
 
-	mesh = mors_vif->mesh;
-	mesh->mbca.config = mbca->mbca_config;
-	mesh->mbca.beacon_timing_report_interval = mbca->beacon_timing_report_interval;
-	mesh->mbca.min_beacon_gap_ms = mbca->min_beacon_gap_ms;
-	mesh->mbca.tbtt_adj_interval_ms = le16_to_cpu(mbca->tbtt_adj_interval_ms);
-	mesh->mbca.mbss_start_scan_duration_ms = le16_to_cpu(mbca->mbss_start_scan_duration_ms);
+	mesh_conf = mors_vif->mesh->conf;
+	mesh_conf->mbca.config = mbca->mbca_config;
+	mesh_conf->mbca.beacon_timing_report_interval = mbca->beacon_timing_report_interval;
+	mesh_conf->mbca.min_beacon_gap_ms = mbca->min_beacon_gap_ms;
+	mesh_conf->mbca.tbtt_adj_interval_ms = le16_to_cpu(mbca->tbtt_adj_interval_ms);
+	mesh_conf->mbca.mbss_start_scan_duration_ms =
+				le16_to_cpu(mbca->mbss_start_scan_duration_ms);
 
 	return 0;
 }
@@ -60,132 +61,55 @@ int morse_cmd_process_mbca_conf(struct morse_vif *mors_vif,
 int morse_cmd_process_dynamic_peering_conf(struct morse_vif *mors_vif,
 					   struct morse_cmd_req_dynamic_peering_config *req)
 {
-	struct morse_mesh *mesh;
 	struct morse *mors;
+	struct morse_mesh_config *mesh_conf;
 
-	if (!mors_vif || !mors_vif->mesh)
+	if (!mors_vif || !mors_vif->mesh || !mors_vif->mesh->conf)
 		return -EFAULT;
 
 	mors = morse_vif_to_morse(mors_vif);
 
-	mesh = mors_vif->mesh;
-	mesh->dynamic_peering = req->enabled;
-	mesh->rssi_margin = req->rssi_margin;
-	mesh->blacklist_timeout = le32_to_cpu(req->blacklist_timeout);
+	mesh_conf = mors_vif->mesh->conf;
+	mesh_conf->dynamic_peering = req->enabled;
+	mesh_conf->rssi_margin = req->rssi_margin;
+	mesh_conf->blacklist_timeout = le32_to_cpu(req->blacklist_timeout);
 
 	MORSE_MESH_INFO(mors, "dynamic_peering=%u, rssi_margin=%u, timeout=%u\n",
-			mesh->dynamic_peering, mesh->rssi_margin, mesh->blacklist_timeout);
+			mesh_conf->dynamic_peering, mesh_conf->rssi_margin,
+			mesh_conf->blacklist_timeout);
 
 	return 0;
 }
 
 int morse_cmd_cfg_mesh_bss(struct morse_vif *mors_vif, bool stop_mesh)
 {
-	struct morse_mesh *mesh = mors_vif->mesh;
+	struct morse_mesh_config *mesh_conf;
 	struct morse *mors = morse_vif_to_morse(mors_vif);
 	int ret;
 
-	/* Reset MBCA configuration parameter if beaconing is not enabled */
-	if (mesh->mesh_beaconless_mode)
-		mesh->mbca.config = 0;
+	if (!mors_vif->mesh || !mors_vif->mesh->conf)
+		return -ENXIO;
 
-	ret = morse_cmd_cfg_mesh(mors, mors_vif, stop_mesh, !mesh->mesh_beaconless_mode);
+	mesh_conf = mors_vif->mesh->conf;
+
+	/* Reset MBCA configuration parameter if beaconing is not enabled */
+	if (mesh_conf->mesh_beaconless_mode)
+		mesh_conf->mbca.config = 0;
+
+	ret = morse_cmd_cfg_mesh(mors, mors_vif, stop_mesh, !mesh_conf->mesh_beaconless_mode);
 	if (!ret)
 		MORSE_MESH_INFO(mors, "%s: beaconless:%u stop:%u mbca.config:0x%02x\n",
-				__func__, mesh->mesh_beaconless_mode, stop_mesh, mesh->mbca.config);
+				__func__, mesh_conf->mesh_beaconless_mode, stop_mesh,
+				mesh_conf->mbca.config);
 
-	mesh->mbca.beacon_count = 0;
+	mesh_conf->mbca.beacon_count = 0;
 
 	return ret;
 }
 
-/**
- * morse_find_mesh_config - Find the mesh config for the VIF stored in the list
- *
- * @mors: Global morse sruct
- * @addr: VIF address to find the config
- *
- * @return: Pointer to stored config, else NULL
- */
-static struct morse_mesh_config_list *morse_find_mesh_config(struct morse *mors, u8 addr[ETH_ALEN])
-{
-	struct morse_mesh_config_list *config;
-
-	lockdep_assert_held(&mors->mesh_config.lock);
-	if (!addr)
-		return NULL;
-
-	list_for_each_entry(config, &mors->mesh_config.list, list) {
-		if (memcmp(config->addr, addr, ETH_ALEN) == 0)
-			return config;
-	}
-	return NULL;
-}
-
-int morse_restore_mesh_config(struct morse_vif *mors_vif)
-{
-	struct morse_mesh_config_list *config;
-	struct morse_mesh *mesh;
-	struct morse *mors;
-	struct ieee80211_vif *vif;
-
-	if (!mors_vif)
-		return -EFAULT;
-
-	vif = morse_vif_to_ieee80211_vif(mors_vif);
-	mesh = mors_vif->mesh;
-	mors = morse_vif_to_morse(mors_vif);
-
-	spin_lock_bh(&mors->mesh_config.lock);
-	config = morse_find_mesh_config(mors, vif->addr);
-	if (!config) {
-		spin_unlock_bh(&mors->mesh_config.lock);
-		return -ENOENT;
-	}
-
-	memcpy(&mesh->mbca, &config->mbca, sizeof(mesh->mbca));
-	spin_unlock_bh(&mors->mesh_config.lock);
-
-	if (morse_cmd_set_mesh_config(mors_vif, NULL, config))
-		return -EINVAL;
-
-	return 0;
-}
-
-static void morse_store_mesh_config(struct ieee80211_vif *vif, struct morse_mesh *mesh)
-{
-	struct morse_mesh_config_list *config;
-
-	struct morse_vif *mors_vif = ieee80211_vif_to_morse_vif(vif);
-	struct morse *mors = morse_vif_to_morse(mors_vif);
-
-	spin_lock_bh(&mors->mesh_config.lock);
-	config = morse_find_mesh_config(mors, vif->addr);
-
-	if (!config) {
-		config = kzalloc(sizeof(*config), GFP_ATOMIC);
-		if (!config)
-			goto exit;
-		list_add(&config->list, &mors->mesh_config.list);
-	}
-
-	memcpy(&config->mbca, &mesh->mbca, sizeof(mesh->mbca));
-	memcpy(config->addr, vif->addr, ETH_ALEN);
-	memcpy(config->mesh_conf.mesh_id, mesh->mesh_id, mesh->mesh_id_len);
-	config->mesh_conf.mesh_id_len = mesh->mesh_id_len;
-	config->mesh_conf.mesh_beaconless_mode = mesh->mesh_beaconless_mode;
-	config->mesh_conf.max_plinks = mesh->max_plinks;
-	config->dynamic_peering = mesh->dynamic_peering;
-	config->rssi_margin = mesh->rssi_margin;
-	config->blacklist_timeout = mesh->blacklist_timeout;
-
-exit:
-	spin_unlock_bh(&mors->mesh_config.lock);
-}
-
 int morse_cmd_set_mesh_config(struct morse_vif *mors_vif,
 			      struct morse_cmd_req_set_mesh_config *mesh_req,
-			      struct morse_mesh_config_list *stored_config)
+				  bool in_reconfig)
 {
 	struct ieee80211_vif *vif;
 	struct morse_mesh *mesh;
@@ -197,35 +121,31 @@ int morse_cmd_set_mesh_config(struct morse_vif *mors_vif,
 	vif = morse_vif_to_ieee80211_vif(mors_vif);
 	mesh = mors_vif->mesh;
 
-	if (!ieee80211_vif_is_mesh(vif) || mesh->is_mesh_active)
+	mesh_config = mors_vif->mesh->conf;
+	if (!mesh_config)
+		return -ENXIO;
+
+	if (!ieee80211_vif_is_mesh(vif) ||
+	    (mesh_config->is_mesh_active && !in_reconfig) ||
+	    (!mesh_config->is_mesh_active && in_reconfig))
 		return -ENOENT;
 
-	if (stored_config) {
-		mesh_config = &stored_config->mesh_conf;
-		if (mesh_config->mesh_id_len  > IEEE80211_MAX_SSID_LEN)
-			return -EINVAL;
-		memcpy(mesh->mesh_id, mesh_config->mesh_id, mesh_config->mesh_id_len);
-		mesh->mesh_id_len = mesh_config->mesh_id_len;
-		mesh->mesh_beaconless_mode = mesh_config->mesh_beaconless_mode;
-		mesh->max_plinks = mesh_config->max_plinks;
-	} else {
+	if (mesh_req) {
 		if (mesh_req->mesh_id_len  > IEEE80211_MAX_SSID_LEN)
 			return -EINVAL;
-		memcpy(mesh->mesh_id, mesh_req->mesh_id, mesh_req->mesh_id_len);
-		mesh->mesh_id_len = mesh_req->mesh_id_len;
-		mesh->mesh_beaconless_mode = mesh_req->mesh_beaconless_mode;
-		mesh->max_plinks = mesh_req->max_plinks;
+
+		memcpy(mesh_config->mesh_id, mesh_req->mesh_id, mesh_req->mesh_id_len);
+		mesh_config->mesh_id_len = mesh_req->mesh_id_len;
+		mesh_config->mesh_beaconless_mode = mesh_req->mesh_beaconless_mode;
+		mesh_config->max_plinks = mesh_req->max_plinks;
 	}
 
 	if (morse_cmd_cfg_mesh_bss(mors_vif, false))
 		return -EPERM;
 
-	if (mesh->mesh_beaconless_mode)
+	if (mesh_config->mesh_beaconless_mode)
 		morse_schedule_mesh_probe_timer(mesh, 0);
-	mesh->is_mesh_active = true;
-
-	if (!stored_config)
-		morse_store_mesh_config(vif, mesh);
+	mesh_config->is_mesh_active = true;
 
 	return 0;
 }
@@ -239,7 +159,7 @@ static void morse_mesh_probe_timer_cb(struct timer_list *t)
 #if KERNEL_VERSION(4, 14, 0) > LINUX_VERSION_CODE
 	struct morse_mesh *mesh = (struct morse_mesh *)addr;
 #else
-	struct morse_mesh *mesh = from_timer(mesh, t, mesh_probe_timer);
+	struct morse_mesh *mesh = TIMER_TO_OBJ(mesh, t, mesh_probe_timer);
 #endif
 	struct morse_vif *mors_vif = mesh->mors_vif;
 	struct ieee80211_vif *vif;
@@ -270,8 +190,8 @@ static void morse_mesh_probe_timer_cb(struct timer_list *t)
 int morse_mac_tx_mesh_probe_req(struct morse_vif *mors_vif, const u8 *dest_addr)
 {
 	struct ieee80211_vif *vif;
-	struct morse_mesh *mesh;
 	struct morse *mors;
+	struct morse_mesh_config *mesh_conf;
 	struct sk_buff *skb = NULL;
 	struct ieee80211_hdr *hdr;
 
@@ -280,14 +200,16 @@ int morse_mac_tx_mesh_probe_req(struct morse_vif *mors_vif, const u8 *dest_addr)
 
 	vif = morse_vif_to_ieee80211_vif(mors_vif);
 	mors = morse_vif_to_morse(mors_vif);
-	mesh = mors_vif->mesh;
 
-	if (!ieee80211_vif_is_mesh(vif) || !mesh || !mesh->mesh_id_len) {
+	if (!ieee80211_vif_is_mesh(vif) || !mors_vif->mesh ||
+	    !mors_vif->mesh->conf || !mors_vif->mesh->conf->mesh_id_len) {
 		MORSE_MESH_ERR(mors, "Failed to send mesh probe req\n");
 		return -ENOENT;
 	}
 
-	skb = ieee80211_probereq_get(mors->hw, vif->addr, mesh->mesh_id, mesh->mesh_id_len, 0);
+	mesh_conf = mors_vif->mesh->conf;
+	skb = ieee80211_probereq_get(mors->hw, vif->addr, mesh_conf->mesh_id,
+			mesh_conf->mesh_id_len, 0);
 	if (!skb) {
 		MORSE_MESH_ERR(mors, "Failed to allocate mesh probe req\n");
 		return -ENOMEM;
@@ -312,6 +234,7 @@ int morse_mac_process_rx_mesh_probe_req(struct morse_vif *mors_vif,
 	struct ieee80211_vif *vif;
 	struct ie_element *mesh_id_ie = &ies_mask->ies[WLAN_EID_MESH_ID];
 	struct morse_mesh *mesh;
+	struct morse_mesh_config *mesh_conf;
 	struct morse *mors;
 	struct ieee80211_sta *sta;
 
@@ -325,6 +248,11 @@ int morse_mac_process_rx_mesh_probe_req(struct morse_vif *mors_vif,
 	if (!ieee80211_vif_is_mesh(vif))
 		return -ENOENT;
 
+	if (!mesh || !mesh->conf)
+		return -ENXIO;
+
+	mesh_conf = mesh->conf;
+
 	rcu_read_lock();
 	sta = ieee80211_find_sta_by_ifaddr(mors->hw, src_addr, vif->addr);
 	if (sta) {
@@ -336,8 +264,9 @@ int morse_mac_process_rx_mesh_probe_req(struct morse_vif *mors_vif,
 	if (morse_dot11ah_is_mesh_peer_known(src_addr))
 		return 0;
 
-	if (mesh_id_ie->len != 0 && (mesh_id_ie->len == mesh->mesh_id_len &&
-				     !memcmp(mesh_id_ie->ptr, mesh->mesh_id, mesh->mesh_id_len))) {
+	if (mesh_id_ie->len != 0 &&
+	    (mesh_id_ie->len == mesh_conf->mesh_id_len &&
+	     !memcmp(mesh_id_ie->ptr, mesh_conf->mesh_id, mesh_conf->mesh_id_len))) {
 		memcpy(&mesh->probe_rx_status, rx_status, sizeof(mesh->probe_rx_status));
 	}
 
@@ -351,20 +280,23 @@ int morse_mac_add_meshid_ie(struct morse_vif *mors_vif, struct sk_buff *skb,
 	struct ie_element *ssid_ie = &ies_mask->ies[WLAN_EID_SSID];
 	struct ie_element *mesh_id_ie = &ies_mask->ies[WLAN_EID_MESH_ID];
 	struct morse_mesh *mesh;
+	struct morse_mesh_config *mesh_conf;
 
 	if (!mors_vif || !ies_mask)
 		return -EFAULT;
 
 	mesh = mors_vif->mesh;
 
-	if (!mesh || !mesh->mesh_id_len)
+	if (!mesh || !mesh->conf || !mesh->conf->mesh_id_len)
 		return -1;
 
-	memcpy(mesh_id, mesh->mesh_id, mesh->mesh_id_len);
+	mesh_conf = mesh->conf;
+	memcpy(mesh_id, mesh_conf->mesh_id, mesh_conf->mesh_id_len);
 
 	mesh_id_ie->ptr = NULL;
 
-	morse_dot11ah_insert_element(ies_mask, WLAN_EID_MESH_ID, (u8 *)mesh_id, mesh->mesh_id_len);
+	morse_dot11ah_insert_element(ies_mask, WLAN_EID_MESH_ID, (u8 *)mesh_id,
+			mesh_conf->mesh_id_len);
 
 	ssid_ie->len = 0;
 
@@ -380,6 +312,7 @@ int morse_mac_process_mesh_tx_mgmt(struct morse_vif *mors_vif,
 	struct morse *mors;
 	struct sk_buff *skb_probe_resp;
 	struct ieee80211_rx_status *rx_status;
+	struct morse_mesh_config *mesh_conf;
 
 	if (!mors_vif || !skb || !ies_mask)
 		return -EFAULT;
@@ -389,9 +322,14 @@ int morse_mac_process_mesh_tx_mgmt(struct morse_vif *mors_vif,
 	mors = morse_vif_to_morse(mors_vif);
 	mesh = mors_vif->mesh;
 
+	if (!mesh || !mesh->conf)
+		return -ENXIO;
+
+	mesh_conf = mesh->conf;
+
 	if (ieee80211_is_probe_resp(hdr->frame_control)) {
 		/* Probe resp processing */
-		if (mesh->mesh_beaconless_mode) {
+		if (mesh_conf->mesh_beaconless_mode) {
 			struct ieee80211_mgmt *mgt_probe_resp;
 
 			rx_status = &mesh->probe_rx_status;
@@ -417,7 +355,7 @@ int morse_mac_process_mesh_tx_mgmt(struct morse_vif *mors_vif,
 					le16_to_cpu(mgt_probe_resp->u.probe_resp.capab_info),
 					hdr->addr1);
 
-		} else if (mesh->mbca.config != 0) {
+		} else if (mesh_conf->mbca.config != 0) {
 			u8 *ptr = ies_mask->ies[WLAN_EID_MESH_CONFIG].ptr;
 
 			/* Enable MBCA Capability */
@@ -426,7 +364,7 @@ int morse_mac_process_mesh_tx_mgmt(struct morse_vif *mors_vif,
 		}
 	} else if (ieee80211_is_probe_req(hdr->frame_control)) {
 		/* Add Mesh ID to probe req in beaconless mode */
-		if (mesh->mesh_beaconless_mode)
+		if (mesh_conf->mesh_beaconless_mode)
 			morse_mac_add_meshid_ie(mors_vif, skb, ies_mask);
 	}
 
@@ -487,19 +425,25 @@ static void morse_mac_check_for_dynamic_peering(struct morse_vif *mors_vif, u8 *
 	struct ie_element *mesh_id_ie = &ies_mask->ies[WLAN_EID_MESH_ID];
 	struct ie_element *mesh_conf_ie = &ies_mask->ies[WLAN_EID_MESH_CONFIG];
 	struct ieee80211_vif *vif = morse_vif_to_ieee80211_vif(mors_vif);
+	struct morse_mesh_config *mesh_conf;
 	struct lowest_peer_rssi_iter data = {
 		.is_set = false,
 		.on_vif = vif
 	};
 	bool accept_additional_peer;
 
+	if (!mesh || !mesh->conf)
+		return;
+
+	mesh_conf = mesh->conf;
+
 	/* Check if number of peers reached the limit */
-	if (mors_vif->ap->num_stas < mesh->max_plinks)
+	if (mors_vif->ap->num_stas < mesh_conf->max_plinks)
 		return;
 
 	/* process frames from same mesh BSS */
-	if (!mesh_id_ie || mesh_id_ie->len != mesh->mesh_id_len ||
-	    memcmp(mesh_id_ie->ptr, mesh->mesh_id, mesh_id_ie->len)) {
+	if (!mesh_id_ie || mesh_id_ie->len != mesh_conf->mesh_id_len ||
+	    memcmp(mesh_id_ie->ptr, mesh_conf->mesh_id, mesh_id_ie->len)) {
 		return;
 	}
 
@@ -518,7 +462,7 @@ static void morse_mac_check_for_dynamic_peering(struct morse_vif *mors_vif, u8 *
 	ieee80211_iterate_stations_atomic(mors->hw, peer_with_lowest_rssi, &data);
 
 	/* Check if the new peer has better signal than existing peer */
-	if (data.is_set && (data.rssi + mesh->rssi_margin) < rssi) {
+	if (data.is_set && (data.rssi + mesh_conf->rssi_margin) < rssi) {
 		struct morse_mesh_peer_addr_vendor_evt event;
 		int ret;
 
@@ -580,11 +524,14 @@ int morse_mac_process_mesh_rx_mgmt(struct morse_vif *mors_vif, struct sk_buff *s
 	struct morse *mors = morse_vif_to_morse(mors_vif);
 	struct ieee80211_mgmt *mgmt = (struct ieee80211_mgmt *)skb->data;
 	struct ieee80211_sta *sta;
+	struct morse_mesh_config *mesh_conf;
 	u8 *src_addr;
 	u16 stype;
 
-	if (!mesh->is_mesh_active)
+	if (!mesh || !mesh->conf || !mesh->conf->is_mesh_active)
 		return -ENOENT;
+
+	mesh_conf = mesh->conf;
 
 	if (ieee80211_is_s1g_beacon(mgmt->frame_control))
 		src_addr = mgmt->da;
@@ -592,12 +539,12 @@ int morse_mac_process_mesh_rx_mgmt(struct morse_vif *mors_vif, struct sk_buff *s
 		src_addr = mgmt->sa;
 	stype = le16_to_cpu(mgmt->frame_control) & IEEE80211_FCTL_STYPE;
 
-	if (mesh->mesh_beaconless_mode && stype == IEEE80211_STYPE_PROBE_REQ)
+	if (mesh_conf->mesh_beaconless_mode && stype == IEEE80211_STYPE_PROBE_REQ)
 		return morse_mac_process_rx_mesh_probe_req(mors_vif, ies_mask, rx_status, mgmt->sa);
 
-	if (mesh->dynamic_peering && (ieee80211_is_s1g_beacon(mgmt->frame_control) ||
-				      stype == IEEE80211_STYPE_ACTION ||
-				      stype == IEEE80211_STYPE_PROBE_RESP)) {
+	if (mesh_conf->dynamic_peering &&
+	    (ieee80211_is_s1g_beacon(mgmt->frame_control) ||
+	     stype == IEEE80211_STYPE_ACTION || stype == IEEE80211_STYPE_PROBE_RESP)) {
 		struct ie_element *mesh_conf_ie = &ies_mask->ies[WLAN_EID_MESH_CONFIG];
 		u8 no_of_peerings = 0;
 
@@ -640,40 +587,41 @@ int morse_mac_process_mesh_rx_mgmt(struct morse_vif *mors_vif, struct sk_buff *s
 	return 0;
 }
 
-void morse_mac_clear_mesh_list(struct morse *mors)
+void morse_mesh_reconfig(struct morse *mors, struct morse_vif *mors_vif)
 {
-	struct morse_mesh_config_list *config, *tmp;
+	struct morse_mesh *mesh = mors_vif->mesh;
+	struct morse_persistent_vif_configs *mors_vif_conf =
+					morse_get_vif_conf_from_id(mors, mors_vif->id);
 
-	spin_lock_bh(&mors->mesh_config.lock);
-	/* Free allocated list */
-	list_for_each_entry_safe(config, tmp, &mors->mesh_config.list, list) {
-		list_del(&config->list);
-		kfree(config);
-	}
-	spin_unlock_bh(&mors->mesh_config.lock);
+	lockdep_assert_held(&mors->persistent_vif_config.lock);
+
+	if (!mesh)
+		return;
+
+	mesh->conf = &mors_vif_conf->mesh_conf;
+	morse_cmd_set_mesh_config(mors_vif, NULL, morse_mlme_in_reconfig(mors));
 }
 
 int morse_mesh_deinit(struct morse_vif *mors_vif)
 {
 	struct morse_mesh *mesh = mors_vif->mesh;
 
-	del_timer_sync(&mesh->mesh_probe_timer);
+	DEL_TIMER_SYNC(&mesh->mesh_probe_timer);
+	mors_vif->mesh->conf = NULL;
 	kfree(mors_vif->mesh);
+	mors_vif->mesh = NULL;
 
 	return 0;
 }
 
-void morse_mesh_config_list_init(struct morse *mors)
-{
-	struct morse_mesh_config_list *mesh_config = &mors->mesh_config;
-
-	INIT_LIST_HEAD(&mesh_config->list);
-	spin_lock_init(&mesh_config->lock);
-}
-
-int morse_mesh_init(struct morse_vif *mors_vif)
+int morse_mesh_init(struct morse_vif *mors_vif, bool in_reconfig)
 {
 	struct morse_mesh *mesh;
+	struct morse_mesh_config *mesh_conf;
+	struct morse_persistent_vif_configs *mors_vif_conf;
+	struct morse *mors = morse_vif_to_morse(mors_vif);
+	struct ieee80211_vif *vif = morse_vif_to_ieee80211_vif(mors_vif);
+	int ret = 0;
 
 	mors_vif->mesh = kzalloc(sizeof(*mors_vif->mesh), GFP_KERNEL);
 	if (!mors_vif->mesh)
@@ -681,7 +629,6 @@ int morse_mesh_init(struct morse_vif *mors_vif)
 
 	mesh = mors_vif->mesh;
 	mesh->mors_vif = mors_vif;
-	mesh->mesh_id_len = 0;
 #if KERNEL_VERSION(4, 14, 0) > LINUX_VERSION_CODE
 	init_timer(&mesh->mesh_probe_timer);
 	mesh->mesh_probe_timer.data = (unsigned long)mesh;
@@ -690,21 +637,37 @@ int morse_mesh_init(struct morse_vif *mors_vif)
 #else
 	timer_setup(&mesh->mesh_probe_timer, morse_mesh_probe_timer_cb, 0);
 #endif
+	morse_set_max_skb_txq_len(MORSE_MESH_MAX_TXQ_LENGTH);
 
+	mutex_lock(&mors->persistent_vif_config.lock);
+
+	mors_vif_conf = morse_get_vif_conf_from_addr(mors, vif->addr);
+	if (!mors_vif_conf) {
+		ret = -ENXIO;
+		goto exit;
+	}
+
+	mesh->conf = &mors_vif_conf->mesh_conf;
+
+	if (in_reconfig)
+		goto exit;
+
+	mesh_conf = mesh->conf;
+	mesh_conf->mesh_id_len = 0;
 	/* Assign default values for Mesh Beacon Collision Avoidance configuration
 	 * parameters. It will be overwritten by supplicant configuration before interface
 	 * start.
 	 */
-	mesh->mbca.config = MESH_MBCA_CFG_TBTT_SEL_ENABLE;
-	mesh->mbca.beacon_timing_report_interval = DEFAULT_MESH_BCN_TIMING_REPORT_INT;
-	mesh->mbca.mbss_start_scan_duration_ms = DEFAULT_MBSS_START_SCAN_DURATION_MS;
-	mesh->mbca.min_beacon_gap_ms = DEFAULT_MBCA_MIN_BEACON_GAP_MS;
-	mesh->mbca.tbtt_adj_interval_ms = DEFAULT_TBTT_ADJ_INTERVAL_MSEC;
-	mesh->dynamic_peering = DEFAULT_DYNAMIC_MESH_PEERING;
-	mesh->rssi_margin = DEFAULT_MESH_RSSI_MARGIN;
-	mesh->blacklist_timeout = DEFAULT_MESH_BLACKLIST_TIMEOUT;
+	mesh_conf->mbca.config = MESH_MBCA_CFG_TBTT_SEL_ENABLE;
+	mesh_conf->mbca.beacon_timing_report_interval = DEFAULT_MESH_BCN_TIMING_REPORT_INT;
+	mesh_conf->mbca.mbss_start_scan_duration_ms = DEFAULT_MBSS_START_SCAN_DURATION_MS;
+	mesh_conf->mbca.min_beacon_gap_ms = DEFAULT_MBCA_MIN_BEACON_GAP_MS;
+	mesh_conf->mbca.tbtt_adj_interval_ms = DEFAULT_TBTT_ADJ_INTERVAL_MSEC;
+	mesh_conf->dynamic_peering = DEFAULT_DYNAMIC_MESH_PEERING;
+	mesh_conf->rssi_margin = DEFAULT_MESH_RSSI_MARGIN;
+	mesh_conf->blacklist_timeout = DEFAULT_MESH_BLACKLIST_TIMEOUT;
 
-	morse_set_max_skb_txq_len(MORSE_MESH_MAX_TXQ_LENGTH);
-
-	return 0;
+exit:
+	mutex_unlock(&mors->persistent_vif_config.lock);
+	return ret;
 }

@@ -71,6 +71,11 @@ static bool morse_twt_req_flag_is_set(__le16 le_flags, u16 flag)
 	return !!(flags & flag);
 }
 
+static struct morse_vif *morse_twt_to_morse_vif(struct morse_twt *twt)
+{
+	return container_of(twt, struct morse_vif, twt);
+}
+
 static u64 morse_twt_calculate_wake_interval_us(struct ieee80211_twt_params *params)
 {
 	u16 exp = (le16_to_cpu(params->req_type) & IEEE80211_TWT_REQTYPE_WAKE_INT_EXP) >>
@@ -185,6 +190,12 @@ static void morse_twt_to_install_queue_purge(struct morse *mors, struct morse_tw
 {
 	MORSE_TWT_DBG(mors, "Purging install queue\n");
 	morse_twt_queue_purge(mors, &twt->sta_vif.to_install_uninstall, addr, NULL);
+}
+
+static void morse_twt_req_event_tx_finish(struct morse_twt *twt)
+{
+	kfree(twt->req_event_tx);
+	twt->req_event_tx = NULL;
 }
 
 void morse_twt_dump_wake_interval_tree(struct seq_file *file, struct morse_vif *mors_vif)
@@ -1792,12 +1803,13 @@ void morse_mac_process_twt_action_tx_finish(struct morse *mors, struct ieee80211
  * @mors_vif   Morse virtual interface
  * @data       The data for the TWT IE.
  * @cmd        The setup command to be sent, must match the data.
+ * @in_reconfig Reconfig in progress after HW restart
  *
  * @return 0 on success, else error code
  */
 static int morse_twt_requester_send(struct morse *mors, struct morse_vif *mors_vif,
 				    struct morse_twt_agreement_data *data,
-				    enum ieee80211_twt_setup_cmd cmd)
+				    enum ieee80211_twt_setup_cmd cmd, bool in_reconfig)
 {
 	struct morse_twt *twt;
 	struct morse_twt_event *req;
@@ -1841,10 +1853,14 @@ static int morse_twt_requester_send(struct morse *mors, struct morse_vif *mors_v
 
 	/* We can safely omit the addr and flow ID in the request case. */
 	req->type = MORSE_TWT_EVENT_SETUP;
-	req->setup.agr_data = data;
 	req->setup.cmd = cmd;
+	req->setup.agr_data = kmalloc(sizeof(*req->setup.agr_data), GFP_ATOMIC);
+	if (!req->setup.agr_data)
+		return -ENOMEM;
 
-	if (morse_mac_is_sta_vif_associated(vif)) {
+	memcpy(req->setup.agr_data, data, sizeof(*req->setup.agr_data));
+
+	if (morse_mac_is_sta_vif_associated(vif) && !in_reconfig) {
 		MORSE_TWT_DBG(mors,
 			"New TWT agreement Req on VIF:%u,send TWT action for Flow ID: %u,\n",
 			mors_vif->id, req->flow_id);
@@ -2100,6 +2116,7 @@ void morse_twt_finish_vif(struct morse *mors, struct morse_vif *mors_vif)
 	morse_twt_sta_remove_all(mors, twt);
 	morse_twt_tx_queue_purge(mors, twt, NULL);
 	morse_twt_to_install_queue_purge(mors, twt, NULL);
+	morse_twt_req_event_tx_finish(twt);
 	twt->requester = false;
 	twt->responder = false;
 	spin_unlock_bh(&twt->lock);
@@ -2134,13 +2151,67 @@ static u64 twt_calculate_wake_interval_fields(u64 wake_interval, __le16 *mantiss
 	return twt_calculate_wake_interval(le16_to_cpu(*mantissa), *exponent);
 }
 
+static int morse_twt_configure_agreement(struct morse *mors,
+			struct morse_vif *mors_vif, struct morse_twt_config *twt_conf,
+			struct morse_cmd_req_set_twt_conf *req_set_twt, bool in_reconfig)
+{
+	int vif_id;
+	int ret = 0;
+	struct morse_twt_agreement_data *agreement = &twt_conf->agreement;
+	struct morse_twt *twt = &mors_vif->twt;
+	u8 opcode = twt_conf->opcode;
+
+	if (req_set_twt)
+		vif_id = le16_to_cpu(req_set_twt->hdr.vif_id);
+	else
+		vif_id = mors_vif->id;
+
+	if (opcode == MORSE_CMD_TWT_CONF_OP_FORCE_INSTALL_AGREEMENT) {
+		/* Send cmd to fw */
+		if (req_set_twt)
+			agreement->params.twt = req_set_twt->target_wake_time;
+
+		ret = morse_cmd_twt_agreement_install_req(mors, agreement, vif_id);
+
+		/* If we force installation of an agreement then we must be a requester. */
+		if (!ret) {
+			spin_lock_bh(&twt->lock);
+			mors_vif->twt.requester = true;
+			mors_vif->twt.responder = false;
+			set_bit(twt_conf->flow_id, &twt->sta_vif.active_agreement_bitmap);
+			spin_unlock_bh(&twt->lock);
+		}
+		return ret;
+	}
+
+	/* Verify the values we are sending are compatible with the running firmware. */
+	ret = morse_cmd_twt_agreement_validate_req(mors, agreement, vif_id);
+
+	if (req_set_twt) {
+		agreement->params.req_type |= cpu_to_le16(IEEE80211_TWT_REQTYPE_REQUEST);
+		agreement->params.req_type |= cpu_to_le16((req_set_twt->twt_setup_command <<
+						IEEE80211_TWT_REQTYPE_SETUP_CMD_OFFSET) &
+						IEEE80211_TWT_REQTYPE_SETUP_CMD);
+	}
+
+	if (ret) {
+		MORSE_TWT_WARN(mors, "TWT request invalid\n");
+		return ret;
+	}
+
+	return morse_twt_requester_send(mors, mors_vif, agreement, opcode, in_reconfig);
+}
+
 static int morse_twt_process_set_cmd(struct morse *mors,
 				     struct morse_vif *mors_vif,
 				     struct morse_cmd_req_set_twt_conf *req_set_twt)
 {
 	int ret = 0;
 	int exponent = 0;
+	struct morse_persistent_vif_configs *mors_vif_conf;
 	struct morse_twt_agreement_data *agreement = NULL;
+	struct ieee80211_vif *vif = morse_vif_to_ieee80211_vif(mors_vif);
+	struct morse_twt_config *twt_conf;
 	__le64 *wake_interval_us = &req_set_twt->wake_interval.wake_interval_us;
 	struct morse_twt *twt = &mors_vif->twt;
 
@@ -2151,10 +2222,17 @@ static int morse_twt_process_set_cmd(struct morse *mors,
 		return -EPERM;
 	}
 
-	agreement = kzalloc(sizeof(*agreement), GFP_KERNEL);
+	mutex_lock(&mors->persistent_vif_config.lock);
+	mors_vif_conf = morse_get_vif_conf_from_addr(mors, vif->addr);
+	if (!mors_vif_conf) {
+		ret = -ENXIO;
+		goto exit;
+	}
 
-	if (!agreement)
-		return -EINVAL;
+	twt_conf = &mors_vif_conf->twt_conf;
+	agreement = &twt_conf->agreement;
+	twt_conf->opcode = req_set_twt->opcode;
+	twt_conf->flow_id = req_set_twt->flow_id;
 
 	if (req_set_twt->opcode == MORSE_CMD_TWT_CONF_OP_CONFIGURE_EXPLICIT) {
 		agreement->params.mantissa =
@@ -2180,43 +2258,10 @@ static int morse_twt_process_set_cmd(struct morse *mors,
 		      agreement->params.min_twt_dur, agreement->params.mantissa,
 		      exponent, agreement->wake_interval_us, agreement->params.req_type);
 
-	if (req_set_twt->opcode == MORSE_CMD_TWT_CONF_OP_FORCE_INSTALL_AGREEMENT) {
-		/* Send cmd to fw */
-		agreement->params.twt = req_set_twt->target_wake_time;
-		ret = morse_cmd_twt_agreement_install_req(mors,
-						agreement, le16_to_cpu(req_set_twt->hdr.vif_id));
-
-		/* If we force installation of an agreement then we must be a requester. YMMV if
-		 * something else is in conflict.
-		 */
-		if (!ret) {
-			spin_lock_bh(&twt->lock);
-			mors_vif->twt.requester = true;
-			mors_vif->twt.responder = false;
-			set_bit(req_set_twt->flow_id, &twt->sta_vif.active_agreement_bitmap);
-			spin_unlock_bh(&twt->lock);
-		}
-		goto exit;
-	}
-
-	/* Verify the values we are sending are compatible with the running firmware. */
-	ret = morse_cmd_twt_agreement_validate_req(mors,
-						   agreement, le16_to_cpu(req_set_twt->hdr.vif_id));
-
-	agreement->params.req_type |= cpu_to_le16(IEEE80211_TWT_REQTYPE_REQUEST);
-	agreement->params.req_type |= cpu_to_le16((req_set_twt->twt_setup_command <<
-				       IEEE80211_TWT_REQTYPE_SETUP_CMD_OFFSET) &
-	    IEEE80211_TWT_REQTYPE_SETUP_CMD);
-
-	if (ret) {
-		MORSE_TWT_WARN(mors, "TWT request invalid\n");
-		goto exit;
-	}
-
-	return morse_twt_requester_send(mors, mors_vif, agreement, req_set_twt->opcode);
+	ret = morse_twt_configure_agreement(mors, mors_vif, twt_conf, req_set_twt, false);
 
 exit:
-	kfree(agreement);
+	mutex_unlock(&mors->persistent_vif_config.lock);
 	return ret;
 }
 
@@ -2228,6 +2273,9 @@ static int morse_twt_process_remove_cmd(struct morse *mors,
 	struct morse_twt *twt;
 	struct ieee80211_vif *vif;
 	int ret;
+	struct morse_twt_config *twt_conf;
+	struct morse_twt_agreement_data *agreement;
+	struct morse_persistent_vif_configs *mors_vif_conf;
 
 	if (!mors || !mors_vif || !req_remove_twt)
 		return -EINVAL;
@@ -2255,6 +2303,23 @@ static int morse_twt_process_remove_cmd(struct morse *mors,
 	} else {
 		ret = morse_twt_uninstall_agreement(mors, mors_vif, req_remove_twt->flow_id);
 	}
+
+	if (!ret) {
+		mutex_lock(&mors->persistent_vif_config.lock);
+		mors_vif_conf = morse_get_vif_conf_from_addr(mors, vif->addr);
+		if (!mors_vif_conf) {
+			mutex_unlock(&mors->persistent_vif_config.lock);
+			return -ENXIO;
+		}
+
+		twt_conf = &mors_vif_conf->twt_conf;
+		agreement = &twt_conf->agreement;
+		twt_conf->opcode = req_remove_twt->opcode;
+		twt_conf->flow_id = req_remove_twt->flow_id;
+		memset(agreement, 0, sizeof(*agreement));
+		mutex_unlock(&mors->persistent_vif_config.lock);
+	}
+
 	return ret;
 }
 
@@ -2304,4 +2369,24 @@ int morse_process_twt_cmd(struct morse *mors, struct morse_vif *mors_vif, struct
 		return morse_twt_process_remove_cmd(mors, mors_vif, req_twt);
 
 	return -EFAULT;
+}
+
+void morse_twt_reconfig(struct morse *mors, struct morse_vif *mors_vif)
+{
+	struct morse_persistent_vif_configs *mors_vif_conf =
+					morse_get_vif_conf_from_id(mors, mors_vif->id);
+
+	struct morse_twt_config *twt_conf = &mors_vif_conf->twt_conf;
+
+	lockdep_assert_held(&mors->persistent_vif_config.lock);
+
+	/* TWT configured is already removed or no valid agreement present.
+	 * No need to proceed with installation.
+	 */
+	if (twt_conf->opcode == MORSE_CMD_TWT_CONF_OP_REMOVE_AGREEMENT ||
+	    (!twt_conf->agreement.wake_interval_us && !twt_conf->agreement.wake_duration_us))
+		return;
+
+	morse_twt_configure_agreement(mors, mors_vif, twt_conf, NULL,
+			morse_mlme_in_reconfig(mors));
 }

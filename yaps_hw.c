@@ -7,7 +7,7 @@
 
 #include "linux/crc7.h"
 
-#include "yaps-hw.h"
+#include "yaps_hw.h"
 #include "bus.h"
 #include "debug.h"
 #include "chip_if.h"
@@ -69,6 +69,9 @@
 #define MORSE_YAPS_INFO(_m, _f, _a...)		morse_info(FEATURE_ID_YAPS, _m, _f, ##_a)
 #define MORSE_YAPS_WARN(_m, _f, _a...)		morse_warn(FEATURE_ID_YAPS, _m, _f, ##_a)
 #define MORSE_YAPS_ERR(_m, _f, _a...)		morse_err(FEATURE_ID_YAPS, _m, _f, ##_a)
+
+#define MORSE_YAPS_WARN_RATELIMITED(_m, _f, _a...) \
+	morse_warn_ratelimited(FEATURE_ID_YAPS, _m, _f, ##_a)
 
 /* This maps directly to the status window block in chip memory */
 struct morse_yaps_status_registers {
@@ -182,12 +185,14 @@ static void morse_yaps_fill_aux_data_from_hw_tbl(struct morse_yaps_hw_aux_data *
 static inline u8 morse_yaps_crc(u32 word)
 {
 	u8 crc = 0;
+	u8 data;
 	int len = sizeof(word);
 
 	/* Mask to look at only non-crc bits in both metadata word and delimiters */
 	word &= 0x1ffffff;
 	while (len--) {
-		crc = crc7_be_byte(crc, (word >> 24) & 0xff);
+		data = (word >> 24) & 0xff;
+		crc = CRC7_BYTE(crc, data);
 		word <<= 8;
 	}
 	return crc >> 1;
@@ -475,11 +480,9 @@ static int morse_yaps_hw_read_pkts(struct morse_yaps *yaps,
 			break;
 
 		if (!morse_yaps_is_valid_delimiter(delim)) {
-			/* This will start a hunt for a valid delimiter. Given the CRC is only 7 bit
-			 * it's possible to find an invalid block with a valid delimiter, leading to
-			 * desynchronisation.
-			 */
-			MORSE_YAPS_WARN(yaps->mors, "yaps invalid delim\n");
+			MORSE_YAPS_WARN_RATELIMITED(yaps->mors,
+						    "YAPS invalid delimiter 0x%x, discard %d bytes\n",
+						    delim, bytes_remaining);
 			break;
 		}
 
@@ -574,15 +577,8 @@ static int morse_yaps_hw_update_status(struct morse_yaps *yaps)
 
 	} while (!ret && status_regs->lock);
 
-	if (ret) {
-		if (ret != -ENODEV) {
-			/* TODO remove, this is not a kernel bug */
-			WARN_ON_ONCE(ret);
-			MORSE_YAPS_ERR(yaps->mors, "%s: error reading yaps status registers: %d\n",
-					__func__, ret);
-		}
+	if (ret)
 		goto exit_unlock;
-	}
 
 	status_regs->tc_tx_pool_num_pages =
 		le32_to_cpu((__force __le32)status_regs->tc_tx_pool_num_pages);
@@ -752,6 +748,7 @@ int morse_yaps_hw_init(struct morse *mors)
 	/* yaps irq will claim and release the bus */
 	morse_release_bus(mors);
 	morse_hw_enable_stop_notifications(mors, true);
+	morse_hw_headless_done_irq_enable(mors, false);
 
 	return ret;
 

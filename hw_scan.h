@@ -108,6 +108,8 @@ struct morse_hw_scan {
 	struct morse_hw_scan_params *params;
 	/** Work to timeout uncompleted scans */
 	struct delayed_work timeout;
+	/** Default time to dwell on each channel during active scans */
+	u32 default_active_dwell_ms;
 	/** Time to dwell on home channel during all scans */
 	u32 home_dwell_ms;
 };
@@ -261,15 +263,6 @@ void morse_hw_scan_destroy(struct morse *mors);
 void morse_hw_stop_sched_scan(struct morse *mors, bool requested);
 
 /**
- * morse_hw_sched_scan_finish - Forcibly complete a sched scan without waiting for
- *                              the firmware to complete gracefully. Typically
- *                              called on driver restart.
- *
- * @mors: morse context
- */
-void morse_hw_sched_scan_finish(struct morse *mors);
-
-/**
  * morse_hw_scan_finish - Forcibly complete a hw scan without waiting for
  *                        the firmware to complete gracefully. Typically
  *                        called on driver restart.
@@ -284,5 +277,14 @@ void morse_hw_scan_finish(struct morse *mors);
  * @hw: ieee80211_hw the scheduled scan was operating on
  */
 void morse_sched_scan_results_evt(struct ieee80211_hw *hw);
+
+/**
+ * morse_hw_scan_set_default_scan_dwell - Set the default time to dwell on each channel during
+ *                                        active scans
+ *
+ * @mors: morse context
+ * @dwell_ms: Default active scan dwell time
+ */
+void morse_hw_scan_set_default_active_scan_dwell(struct morse *mors, uint32_t dwell_ms);
 
 #endif  /* !_MORSE_HW_SCAN_H_ */

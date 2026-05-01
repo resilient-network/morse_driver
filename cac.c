@@ -110,8 +110,11 @@ static int cac_set_threshold_change(struct morse_cac *cac, bool end_of_period)
 	struct morse *mors = cac->mors;
 	int i;
 
-	for (i = 0; i < cac->rules.rule_tot; i++) {
-		struct cac_threshold_change_rule *rule = &cac->rules.rule[i];
+	if (!cac->conf)
+		return -ENOENT;
+
+	for (i = 0; i < cac->conf->rules.rule_tot; i++) {
+		struct cac_threshold_change_rule *rule = &cac->conf->rules.rule[i];
 
 		MORSE_CAC_DBG(mors, "CAC:   %i: arfs=%u change=%d\n",
 			i, rule->arfs, rule->threshold_change);
@@ -146,7 +149,7 @@ static void cac_timer_work(struct morse_cac *cac)
 	int threshold_change = 0;
 	bool end_of_period = false;
 
-	if (!cac->enabled)
+	if (!cac->conf || !cac->conf->enabled)
 		return;
 
 	cac_test(cac);
@@ -185,7 +188,7 @@ static void cac_timer(struct timer_list *t)
 #if KERNEL_VERSION(4, 14, 0) > LINUX_VERSION_CODE
 	struct morse_cac *cac = (struct morse_cac *)addr;
 #else
-	struct morse_cac *cac = from_timer(cac, t, timer);
+	struct morse_cac *cac = TIMER_TO_OBJ(cac, t, timer);
 #endif
 
 	spin_lock_bh(&cac->lock);
@@ -199,8 +202,9 @@ void morse_cac_insert_ie(struct dot11ah_ies_mask *ies_mask, struct ieee80211_vif
 {
 	struct morse_vif *mors_vif = ieee80211_vif_to_morse_vif(vif);
 	struct dot11ah_s1g_auth_control_ie cac_ie = { 0 };
+	struct morse_cac *cac = &mors_vif->cac;
 
-	if (!mors_vif->cac.enabled)
+	if (!cac->conf || !cac->conf->enabled)
 		return;
 
 	/* At the moment only apply to Probe Response and Beacon frames */
@@ -216,22 +220,21 @@ bool morse_cac_is_enabled(struct morse_vif *mors_vif)
 {
 	struct morse_cac *cac = &mors_vif->cac;
 
-	return cac->enabled;
+	return cac->conf && cac->conf->enabled;
 }
 
 int morse_cac_deinit(struct morse_vif *mors_vif)
 {
 	struct morse_cac *cac = &mors_vif->cac;
 
-	if (!cac->enabled)
+	if (!cac->conf || !cac->conf->enabled)
 		return 0;
 
-	cac->enabled = 0;
-
+	cac->conf = NULL;
 	if (!mors_vif->ap)
 		return 0;
 
-	del_timer_sync(&cac->timer);
+	DEL_TIMER_SYNC(&cac->timer);
 
 	return 0;
 }
@@ -240,9 +243,12 @@ static void morse_cac_cfg_threshold_rules_default(struct morse *mors, struct mor
 {
 	struct morse_cac *cac = &mors_vif->cac;
 
+	if (!cac->conf)
+		return;
+
 	spin_lock_bh(&cac->lock);
 
-	memcpy(&cac->rules, &cac_threshold_change_rules_default, sizeof(cac->rules));
+	memcpy(&cac->conf->rules, &cac_threshold_change_rules_default, sizeof(cac->conf->rules));
 
 	spin_unlock_bh(&cac->lock);
 }
@@ -252,9 +258,12 @@ void morse_cac_get_rules(struct morse_vif *mors_vif, struct cac_threshold_change
 {
 	struct morse_cac *cac = &mors_vif->cac;
 
+	if (!cac->conf)
+		return;
+
 	spin_lock_bh(&cac->lock);
 
-	memcpy(rules, &cac->rules, sizeof(cac->rules));
+	memcpy(rules, &cac->conf->rules, sizeof(cac->conf->rules));
 
 	spin_unlock_bh(&cac->lock);
 }
@@ -263,25 +272,60 @@ void morse_cac_set_rules(struct morse_vif *mors_vif, struct cac_threshold_change
 {
 	struct morse_cac *cac = &mors_vif->cac;
 
+	if (!cac->conf)
+		return;
+
 	spin_lock_bh(&cac->lock);
 
-	memcpy(&cac->rules, rules, sizeof(cac->rules));
+	memcpy(&cac->conf->rules, rules, sizeof(cac->conf->rules));
 
 	spin_unlock_bh(&cac->lock);
 }
 
-int morse_cac_init(struct morse *mors, struct morse_vif *mors_vif)
+void morse_cac_reconfig(struct morse *mors, struct morse_vif *mors_vif)
 {
+	struct morse_persistent_vif_configs *mors_vif_conf =
+					morse_get_vif_conf_from_id(mors, mors_vif->id);
 	struct morse_cac *cac = &mors_vif->cac;
 
-	if (cac->enabled)
-		return 0;
+	lockdep_assert_held(&mors->persistent_vif_config.lock);
 
-	if (!mors_vif->ap) {
-		/* STA mode - just set the interface flag */
-		cac->enabled = 1;
-		return 0;
+	cac->conf = &mors_vif_conf->cac_conf;
+}
+
+int morse_cac_init(struct morse *mors, struct morse_vif *mors_vif, bool in_reconfig)
+{
+	struct morse_persistent_vif_configs *mors_vif_conf;
+	struct morse_cac *cac = &mors_vif->cac;
+	struct ieee80211_vif *vif = morse_vif_to_ieee80211_vif(mors_vif);
+	int ret = 0;
+
+	mutex_lock(&mors->persistent_vif_config.lock);
+
+	mors_vif_conf = morse_get_vif_conf_from_addr(mors, vif->addr);
+	if (!mors_vif_conf) {
+		ret = -ENXIO;
+		goto exit;
 	}
+
+	cac->conf = &mors_vif_conf->cac_conf;
+
+	/* CAC config not enabled before trying to reconfig or has already been
+	 * configured while being in ON state.
+	 */
+	if ((in_reconfig && !cac->conf->enabled) || (!in_reconfig && cac->conf->enabled))
+		goto exit;
+
+	if (!in_reconfig)
+		memset(cac->conf, 0, sizeof(*cac->conf));
+
+	if (vif->type == NL80211_IFTYPE_STATION) {
+		cac->conf->enabled = 1;
+		goto exit;
+	}
+
+	if (vif->type != NL80211_IFTYPE_AP)
+		goto exit;
 
 	spin_lock_init(&cac->lock);
 
@@ -298,8 +342,12 @@ int morse_cac_init(struct morse *mors, struct morse_vif *mors_vif)
 
 	mod_timer(&cac->timer, jiffies + msecs_to_jiffies(MORSE_CAC_CHECK_INTERVAL_MS));
 	cac->threshold_value = CAC_THRESHOLD_MAX;
-	morse_cac_cfg_threshold_rules_default(mors, mors_vif);
-	cac->enabled = 1;
+	if (!in_reconfig) {
+		cac->conf->enabled = 1;
+		morse_cac_cfg_threshold_rules_default(mors, mors_vif);
+	}
 
-	return 0;
+exit:
+	mutex_unlock(&mors->persistent_vif_config.lock);
+	return ret;
 }

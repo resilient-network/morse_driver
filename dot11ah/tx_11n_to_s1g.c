@@ -235,7 +235,7 @@ static int morse_dot11ah_insert_country_ie(struct dot11ah_ies_mask *ies_mask,
 
 	memset(&country_ie, 0, sizeof(country_ie));
 
-	regdom = morse_reg_alpha_lookup(region);
+	regdom = morse_reg_alpha_lookup(region, morse_dot11ah_get_channelization_scheme());
 	if (!regdom)
 		return 0;
 
@@ -828,8 +828,6 @@ static void morse_dot11ah_beacon_to_s1g(struct ieee80211_vif *vif,
 	struct ieee80211_ext *s1g_beacon;
 	const struct ieee80211_ht_cap *ht_cap;
 	u8 *s1g_beacon_opt_fields = NULL;
-	u8 *rsn_ie;
-	u8 rsn_ie_len;
 	u16 frame_control = IEEE80211_FTYPE_EXT | IEEE80211_STYPE_S1G_BEACON;
 	struct s1g_operation_parameters s1g_oper_params = {
 		.chan_centre_freq_num = morse_dot11ah_freq_khz_bw_mhz_to_chan(HZ_TO_KHZ
@@ -876,16 +874,7 @@ static void morse_dot11ah_beacon_to_s1g(struct ieee80211_vif *vif,
 	s1g_beacon_opt_fields = s1g_beacon->u.s1g_beacon.variable;
 	ht_cap = (const struct ieee80211_ht_cap *)ies_mask->ies[WLAN_EID_HT_CAPABILITY].ptr;
 
-	/* Take backup of RSN IE to restore it for mesh interface, after masking */
-	rsn_ie = ies_mask->ies[WLAN_EID_RSN].ptr;
-	rsn_ie_len = ies_mask->ies[WLAN_EID_RSN].len;
-
 	morse_dot11ah_mask_ies(ies_mask, true, true);
-	/* Include RSN IE for Beacon in Mesh for SAE connection */
-	if (ieee80211_vif_is_mesh(vif)) {
-		ies_mask->ies[WLAN_EID_RSN].ptr = rsn_ie;
-		ies_mask->ies[WLAN_EID_RSN].len = rsn_ie_len;
-	}
 
 	/* The SSID is 2 octets into the value returned by find ie, and the
 	 * length is the second octet

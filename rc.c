@@ -93,7 +93,7 @@ static void morse_rc_timer(struct timer_list *t)
 #if KERNEL_VERSION(4, 14, 0) > LINUX_VERSION_CODE
 	struct morse *mors = (struct morse *)addr;
 #else
-	struct morse_rc *mrc = from_timer(mrc, t, timer);
+	struct morse_rc *mrc = TIMER_TO_OBJ(mrc, t, timer);
 	struct morse *mors = mrc->mors;
 #endif
 
@@ -118,13 +118,16 @@ int morse_rc_init(struct morse *mors)
 
 	mors->mrc.mors = mors;
 	mod_timer(&mors->mrc.timer, jiffies + msecs_to_jiffies(100));
+
+	mmrc_init();
+
 	return 0;
 }
 
 int morse_rc_deinit(struct morse *mors)
 {
 	cancel_work_sync(&mors->mrc.work);
-	del_timer_sync(&mors->mrc.timer);
+	DEL_TIMER_SYNC(&mors->mrc.timer);
 
 	return 0;
 }
@@ -644,7 +647,7 @@ static void morse_rc_sta_set_rates(struct morse *mors,
 				   struct morse_sta *msta,
 				   struct mmrc_rate_table *rates,
 				   int attempts,
-				   bool is_agg_mode, u32 success, u32 failure)
+				   bool was_aggregated)
 {
 	struct list_head *pos;
 
@@ -653,10 +656,7 @@ static void morse_rc_sta_set_rates(struct morse *mors,
 		struct morse_rc_sta *mrc_sta = list_entry(pos, struct morse_rc_sta, list);
 
 		if (&msta->rc == mrc_sta) {
-			if (is_agg_mode)
-				mmrc_feedback_agg(msta->rc.tb, rates, attempts, success, failure);
-			else
-				mmrc_feedback(msta->rc.tb, rates, attempts);
+			mmrc_feedback(msta->rc.tb, rates, attempts, was_aggregated);
 			break;
 		}
 	}
@@ -675,7 +675,6 @@ void morse_rc_sta_feedback_rates(struct morse *mors, struct sk_buff *skb,
 	struct mmrc_rate_table rates;
 	struct morse_sta *msta = NULL;
 	struct ieee80211_vif *vif = NULL;
-	u32 agg_success, agg_packets;
 	struct morse_vif *mors_vif;
 
 	vif = txi->control.vif ? txi->control.vif : morse_get_vif_from_tx_status(mors, tx_sts);
@@ -727,14 +726,8 @@ void morse_rc_sta_feedback_rates(struct morse *mors, struct sk_buff *skb,
 		}
 	}
 
-	if (tx_sts->ampdu_info) {
-		agg_success = MORSE_TXSTS_AMPDU_INFO_GET_SUC(le16_to_cpu(tx_sts->ampdu_info));
-		agg_packets = MORSE_TXSTS_AMPDU_INFO_GET_LEN(le16_to_cpu(tx_sts->ampdu_info));
-		morse_rc_sta_set_rates(mors, msta, &rates, attempts, true, agg_success,
-				       agg_packets - agg_success);
-	} else {
-		morse_rc_sta_set_rates(mors, msta, &rates, attempts, false, 0, 0);
-	}
+	morse_rc_sta_set_rates(mors, msta, &rates, attempts,
+			       !!(le32_to_cpu(tx_sts->flags) & MORSE_TX_STATUS_WAS_AGGREGATED));
 
 exit:
 	ieee80211_tx_info_clear_status(txi);
@@ -779,8 +772,6 @@ exit:
 		txi->flags &= ~IEEE80211_TX_STATUS_EOSP;
 		ieee80211_sta_eosp(sta);
 	}
-
-	MORSE_IEEE80211_TX_STATUS(mors->hw, skb);
 }
 
 void morse_rc_sta_state_check(struct morse *mors,

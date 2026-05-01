@@ -25,7 +25,7 @@
 #include "firmware.h"
 #include "debug.h"
 #include "of.h"
-#include "bus_trace.h"
+#include "trace.h"
 
 #ifdef CONFIG_MORSE_USER_ACCESS
 #include "uaccess.h"
@@ -80,12 +80,23 @@ struct morse_sdio {
 	u32 register_addr_base;
 	struct sdio_func *func;
 	const struct sdio_device_id *id;
-	struct bus_trace trace;
 };
 
 #ifdef CONFIG_MORSE_USER_ACCESS
 struct uaccess *morse_uaccess;
 #endif
+
+#ifdef CONFIG_MORSE_TRACE_BUS
+static inline void trace_bus_set_base(bool bulk, uint fn, u32 address)
+{
+	if (bulk)
+		trace_bus_set_bulk_base(fn, address, 4);
+	else
+		trace_bus_set_reg_base(fn, address, 4);
+}
+#else
+#define trace_bus_set_base(...)
+#endif /* CONFIG_MORSE_TRACE_BUS */
 
 static void morse_sdio_remove(struct sdio_func *func);
 
@@ -97,6 +108,13 @@ static void sdio_log_err(struct morse_sdio *sdio, const char *operation, unsigne
 	if (!mors)
 		return;
 
+	trace_sdio_err(operation,
+		       fn,
+		       address,
+		       len,
+		       sdio->register_addr_base,
+		       sdio->bulk_addr_base,
+		       ret);
 	MORSE_SDIO_ERR(mors, "sdio: %s fn=%d 0x%08x:%d r=0x%08x b=0x%08x (ret:%d)",
 		       operation, fn, address, len, sdio->register_addr_base,
 		       sdio->bulk_addr_base, ret);
@@ -115,9 +133,7 @@ static void irq_handler(struct sdio_func *func1)
 
 	handled = morse_hw_irq_handle(mors);
 	if (!handled)
-		MORSE_SDIO_WARN(mors, "%s: nothing was handled\n", __func__);
-
-	bus_trace_log(&sdio->trace, BUS_TRACE_EVENT_ID_HANDLE_IRQ, func->num, 0, handled);
+		MORSE_SDIO_DBG(mors, "%s: nothing was handled\n", __func__);
 }
 
 static int morse_sdio_enable_irq(struct morse_sdio *sdio)
@@ -132,7 +148,8 @@ static int morse_sdio_enable_irq(struct morse_sdio *sdio)
 	ret = sdio_claim_irq(func1, irq_handler);
 	if (ret)
 		MORSE_SDIO_ERR(mors, "Failed to enable sdio irq: %d\n", ret);
-	bus_trace_log(&sdio->trace, BUS_TRACE_EVENT_ID_EN_IRQ, func1->num, 0, (ret) ? 0 : 1);
+
+	trace_bus_en_irq(func1->num, 0, (ret) ? 0 : 1);
 	sdio_release_host(func);
 	return ret;
 }
@@ -144,7 +161,7 @@ static void morse_sdio_disable_irq(struct morse_sdio *sdio)
 
 	sdio_claim_host(func);
 	sdio_release_irq(func1);
-	bus_trace_log(&sdio->trace, BUS_TRACE_EVENT_ID_EN_IRQ, func1->num, 0, 0);
+	trace_bus_en_irq(func1->num, 0, 0);
 	sdio_release_host(func);
 }
 
@@ -167,7 +184,7 @@ static void morse_sdio_reset_base_address(struct morse_sdio *sdio)
 {
 	sdio->bulk_addr_base = MORSE_SDIO_BASE_ADDR_UNSET;
 	sdio->register_addr_base = MORSE_SDIO_BASE_ADDR_UNSET;
-	bus_trace_log(&sdio->trace, BUS_TRACE_EVENT_ID_RESET_BASE_ADDRESSES, 0, 0, 0);
+	trace_bus_reset_base(0, 0, 0);
 }
 
 static int morse_sdio_set_func_address_base(struct morse_sdio *sdio,
@@ -253,9 +270,7 @@ retry:
 	if (retries)
 		MORSE_SDIO_INFO(mors, "%s succeeded after %d retries\n", __func__, retries);
 
-	bus_trace_log(&sdio->trace, (bulk) ? BUS_TRACE_EVENT_ID_SET_BULK_BASE_ADDRESS :
-		      BUS_TRACE_EVENT_ID_SET_REG_BASE_ADDRESS,
-		      func_to_use->num, *current_addr_base, 4);
+	trace_bus_set_base(bulk, func_to_use->num, *current_addr_base);
 	return ret;
 err:
 	retries++;
@@ -266,9 +281,7 @@ err:
 	}
 
 	*current_addr_base = MORSE_SDIO_BASE_ADDR_UNSET;
-	bus_trace_log(&sdio->trace, (bulk) ? BUS_TRACE_EVENT_ID_SET_BULK_BASE_ADDRESS :
-		      BUS_TRACE_EVENT_ID_SET_REG_BASE_ADDRESS,
-		      func_to_use->num, *current_addr_base, 4);
+	trace_bus_set_base(bulk, func_to_use->num, *current_addr_base);
 	return ret;
 }
 
@@ -323,7 +336,7 @@ static int morse_sdio_regl_write(struct morse_sdio *sdio, u32 address, u32 value
 		goto exit;
 	}
 
-	bus_trace_log(&sdio->trace, BUS_TRACE_EVENT_ID_REG_WRITE, func_to_use->num, address, 4);
+	trace_bus_reg_write(func_to_use->num, address, 4);
 	address &= 0x0000FFFF;	/* remove base and keep offset */
 	sdio_writel(func_to_use, (__force u32)cpu_to_le32(value),
 				(__force u32)cpu_to_le32(address), (int *)&ret);
@@ -359,7 +372,7 @@ static int morse_sdio_regl_read(struct morse_sdio *sdio, u32 address, u32 *value
 		goto exit;
 	}
 
-	bus_trace_log(&sdio->trace, BUS_TRACE_EVENT_ID_REG_READ, func_to_use->num, address, 4);
+	trace_bus_reg_read(func_to_use->num, address, 4);
 	address &= 0x0000FFFF;	/* remove base and keep offset */
 	*value = sdio_readl(func_to_use,  (__force u32)cpu_to_le32(address), (int *)&ret);
 	/* return read size */
@@ -389,7 +402,7 @@ static int morse_sdio_mem_write(struct morse_sdio *sdio, u32 address, u8 *data, 
 		goto exit;
 	}
 
-	bus_trace_log(&sdio->trace, BUS_TRACE_EVENT_ID_BULK_WRITE, func_to_use->num, address, size);
+	trace_bus_bulk_write(func_to_use->num, address, size);
 	address &= 0x0000FFFF;	/* remove base and keep offset */
 	if (access == MORSE_CONFIG_ACCESS_4BYTE) {
 		if (unlikely(!IS_ALIGNED((uintptr_t)data, mors->bus_ops->bulk_alignment))) {
@@ -457,7 +470,7 @@ static int morse_sdio_mem_read(struct morse_sdio *sdio, u32 address, u8 *data, s
 		goto exit;
 	}
 
-	bus_trace_log(&sdio->trace, BUS_TRACE_EVENT_ID_BULK_READ, func_to_use->num, address, size);
+	trace_bus_bulk_read(func_to_use->num, address, size);
 	address &= 0x0000FFFF;	/* remove base and keep offset */
 	if (access == MORSE_CONFIG_ACCESS_4BYTE) {
 		if (unlikely(!IS_ALIGNED((uintptr_t)data, mors->bus_ops->bulk_alignment))) {
@@ -631,8 +644,11 @@ static void morse_sdio_bus_enable(struct morse *mors, bool enable)
 	struct sdio_func *func = sdio->func;
 	struct mmc_host *host = func->card->host;
 
+	if (enable)
+		morse_sdio_clk_freq_switch(mors, FAST_SDIO_CLK_HZ);
+
 	sdio_claim_host(func);
-	bus_trace_log(&sdio->trace, BUS_TRACE_EVENT_ID_BUS_EN, func->num, 0, enable);
+	trace_bus_en(func->num, 0, enable);
 
 	if (enable) {
 		/* No need to do anything special to re-enable the sdio bus. This will happen
@@ -655,7 +671,9 @@ static void morse_sdio_bus_enable(struct morse *mors, bool enable)
 	}
 
 	sdio_release_host(func);
-	morse_sdio_clk_freq_switch(mors, (enable) ? FAST_SDIO_CLK_HZ : SLOW_SDIO_CLK_HZ);
+
+	if (!enable)
+		morse_sdio_clk_freq_switch(mors, SLOW_SDIO_CLK_HZ);
 }
 
 static int morse_sdio_reset(int reset_pin, struct sdio_func *func)
@@ -676,15 +694,26 @@ static int morse_sdio_reset(int reset_pin, struct sdio_func *func)
 
 	sdio_claim_host(func);
 	sdio_disable_func(func);
-#if KERNEL_VERSION(5, 18, 0) > LINUX_VERSION_CODE
-	mmc_hw_reset(func->card->host);
-#else
+#if (KERNEL_VERSION(5, 18, 0) <= LINUX_VERSION_CODE) || \
+	(defined(MAC80211_BACKPORT_VERSION_CODE) && \
+	KERNEL_VERSION(5, 18, 0) <= MAC80211_BACKPORT_VERSION_CODE)
 	mmc_hw_reset(func->card);
+#else
+	mmc_hw_reset(func->card->host);
 #endif
 	sdio_enable_func(func);
 	sdio_release_host(func);
 
 	return ret;
+}
+
+static int morse_sdio_set_pm_flags(struct morse *mors)
+{
+	/* Keep SDIO powered even when in suspend */
+	struct morse_sdio *sdio = (struct morse_sdio *)mors->drv_priv;
+	struct sdio_func *func = sdio->func;
+
+	return sdio_set_host_pm_flags(func, MMC_PM_KEEP_POWER);
 }
 
 static int morse_sdio_bus_reset(struct morse *mors)
@@ -716,6 +745,7 @@ static const struct morse_bus_ops morse_sdio_ops = {
 	.release = morse_sdio_release_host,
 	.reset = morse_sdio_bus_reset,
 	.config_burst_mode = morse_sdio_config_burst_mode,
+	.config_pm_flags = morse_sdio_set_pm_flags,
 	.set_irq = morse_sdio_set_irq,
 	.bulk_alignment = MORSE_SDIO_ALIGNMENT
 };
@@ -787,11 +817,12 @@ static int morse_sdio_probe(struct sdio_func *func, const struct sdio_device_id 
 		goto err_exit;
 	}
 
+	morse_hw_headless_init(mors);
+
 	sdio = (struct morse_sdio *)mors->drv_priv;
 	sdio->func = func;
 	sdio->id = id;
 	sdio->enabled = true;
-	bus_trace_init(&sdio->trace);
 	morse_sdio_reset_base_address(sdio);
 
 	mors->bus_ops = &morse_sdio_ops;
@@ -847,12 +878,13 @@ static int morse_sdio_probe(struct sdio_func *func, const struct sdio_device_id 
 		goto err_exit;
 	}
 
-	ret = morse_firmware_prepare_and_init(mors, reset_hw, morse_hw_should_reattach());
+	ret = morse_firmware_prepare(mors, reset_hw, morse_hw_should_reattach());
 	if (ret == -EALREADY)
 		attach = true;
 	else if (ret)
 		goto err_exit;
 
+	morse_hw_set_state(mors, MORSE_HW_STATE_ON);
 	if (morse_test_mode_is_interactive(test_mode)) {
 		mors->chip_wq = create_singlethread_workqueue("MorseChipIfWorkQ");
 		if (!mors->chip_wq) {
@@ -891,6 +923,12 @@ static int morse_sdio_probe(struct sdio_func *func, const struct sdio_device_id 
 	}
 	irq_enabled = true;
 
+	if (attach) {
+		ret = morse_hw_attach(mors, 0);
+		if (ret)
+			goto err_exit;
+	}
+
 	if (morse_test_mode_is_interactive(test_mode)) {
 		ret = morse_mac_register(mors);
 		if (ret) {
@@ -899,12 +937,6 @@ static int morse_sdio_probe(struct sdio_func *func, const struct sdio_device_id 
 		}
 		mac_registered = true;
 	}
-
-	if (attach)
-		ret = morse_hw_attach(mors);
-
-	if (ret)
-		goto err_exit;
 
 #ifdef CONFIG_MORSE_ENABLE_TEST_MODES
 	if (test_mode == MORSE_CONFIG_TEST_MODE_BUS)
@@ -931,6 +963,7 @@ static int morse_sdio_probe(struct sdio_func *func, const struct sdio_device_id 
 	if (IS_ERR(morse_uaccess)) {
 		MORSE_PR_ERR(FEATURE_ID_SDIO, "uaccess_alloc() failed\n");
 		ret = PTR_ERR(morse_uaccess);
+		morse_uaccess = NULL;
 		goto err_exit;
 	}
 
@@ -946,7 +979,6 @@ static int morse_sdio_probe(struct sdio_func *func, const struct sdio_device_id 
 		goto err_exit;
 	}
 #endif
-
 	/* morse_buffers_test(mors); */
 	return ret;
 
@@ -956,9 +988,9 @@ err_exit:
 		uaccess_cleanup(morse_uaccess);
 		morse_uaccess = NULL;
 	}
+#endif
 	if (mac_registered)
 		morse_mac_unregister(mors);
-#endif
 	if (irq_enabled)
 		morse_sdio_disable_irq(sdio);
 	if (sdio_enabled)
@@ -995,6 +1027,7 @@ static void morse_sdio_remove(struct sdio_func *func)
 #ifdef CONFIG_MORSE_USER_ACCESS
 		uaccess_device_unregister(mors);
 		uaccess_cleanup(morse_uaccess);
+		morse_uaccess = NULL;
 #endif
 
 		if (morse_test_mode_is_interactive(test_mode)) {
@@ -1006,9 +1039,18 @@ static void morse_sdio_remove(struct sdio_func *func)
 			flush_workqueue(mors->net_wq);
 			destroy_workqueue(mors->net_wq);
 			if (reattach_hw) {
-				ret = morse_hw_detach(mors);
-				if (ret)
+				/* Trigger detach interrupt but don't wait for it since
+				 * we are removing the driver anyway
+				 */
+				ret = morse_hw_trigger_detach(mors);
+				if (ret) {
 					is_hw_detached = false;
+					MORSE_ERR(mors,
+						"%s: failed to detach from hardware (ret:%d)\n",
+						__func__, ret);
+				} else {
+					MORSE_INFO(mors, "%s: Detached from hardware\n", __func__);
+				}
 			}
 		} else {
 			morse_sdio_disable_irq(sdio);

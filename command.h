@@ -12,6 +12,7 @@
 #include "morse.h"
 #include "morse_commands.h"
 #include "wiphy.h"
+#include "hw_beacon.h"
 
 #define MORSE_CMD_IS_REQ(cmd)	(le16_to_cpu((cmd)->hdr.flags) & MORSE_CMD_TYPE_REQ)
 #define MORSE_CMD_IS_RESP(cmd)	(le16_to_cpu((cmd)->hdr.flags) & MORSE_CMD_TYPE_RESP)
@@ -70,13 +71,16 @@ int morse_cmd_set_duty_cycle(struct morse *mors, enum morse_cmd_duty_cycle_mode 
 			     int duty_cycle, bool omit_ctrl_resp);
 int morse_cmd_set_mpsw(struct morse *mors, int min, int max, int window);
 
-int morse_cmd_set_ps(struct morse *mors, bool enabled, bool enable_dynamic_ps_offload);
+int morse_cmd_set_ps(struct morse *mors, u16 vif_id, bool enabled, bool enable_dynamic_ps_offload);
 int morse_cmd_set_txpower(struct morse *mors, s32 *out_power, int txpower);
 int morse_cmd_get_max_txpower(struct morse *mors, s32 *out_power);
 int morse_cmd_add_if(struct morse *mors, u16 *id, const u8 *addr, enum nl80211_iftype type);
 int morse_cmd_rm_if(struct morse *mors, u16 id);
 int morse_cmd_resp_process(struct morse *mors, struct sk_buff *skb);
 int morse_cmd_cfg_bss(struct morse *mors, u16 id, u16 beacon_int, u16 dtim_period, u32 cssid);
+int morse_cmd_set_bssid(struct morse *mors, u16 vif_id, const u8 *bssid);
+int morse_cmd_set_max_away_duration(struct ieee80211_vif *vif, int max_away_duration);
+int morse_cmd_set_ap_power_save(struct ieee80211_vif *vif, bool enable);
 
 /**
  * morse_cmd_vendor() - Handle vendor command sent to the virtual interface (e.g. wlan0)
@@ -108,8 +112,13 @@ int morse_cmd_vendor(struct morse *mors, struct morse_vif *mors_vif,
 int morse_hw_cmd_vendor(struct morse *mors,
 			const struct morse_cmd_req_vendor *cmd, int cmd_len,
 			struct morse_cmd_resp_vendor *resp, int *resp_len);
-int morse_cmd_set_channel(struct morse *mors, u32 op_chan_freq_hz,
-			  u8 pri_1mhz_chan_idx, u8 op_bw_mhz, u8 pri_bw_mhz, s32 *power_dbm);
+int morse_cmd_set_channel(struct morse *mors,
+			  u32 op_chan_freq_hz,
+			  u8 pri_1mhz_chan_idx,
+			  u8 op_bw_mhz,
+			  u8 pri_bw_mhz,
+			  u8 is_off_channel,
+			  s32 *power_mbm);
 int morse_cmd_get_current_channel(struct morse *mors, u32 *op_chan_freq_hz,
 				  u8 *pri_1mhz_chan_idx, u8 *op_bw_mhz, u8 *pri_bw_mhz);
 int morse_cmd_get_version(struct morse *mors);
@@ -173,6 +182,7 @@ int morse_cmd_cfg_multicast_filter(struct morse *mors, struct morse_vif *mors_vi
 int morse_cmd_get_available_channels(struct morse *mors, struct morse_cmd_resp *resp);
 int morse_cmd_get_hw_version(struct morse *mors, struct morse_cmd_resp *resp);
 
+int morse_cmd_get_frag_threshold(struct morse *mors, u32 *frag_threshold);
 int morse_cmd_set_frag_threshold(struct morse *mors, u32 frag_threshold);
 
 /**
@@ -214,6 +224,18 @@ int morse_cmd_pv1_set_rx_ampdu_state(struct morse_vif *mors_vif, u8 *sta_addr, u
 		u16 buf_size, bool ba_session_enable);
 
 /**
+ * morse_process_twt_cmd() - Process TWT message triggered by morsectrl
+ *
+ * @mors        Morse device
+ * @morse_vif   Morse virtual interface
+ * @cmd         Incoming TWT conf command parameters
+ *
+ * @return 0 on success, else error code
+ */
+int morse_process_twt_cmd(struct morse *mors, struct morse_vif *mors_vif,
+			struct morse_cmd_req *cmd);
+
+/**
  * morse_cmd_configure_page_slicing() - Configure page slicing in target.
  *
  * @mors_vif: morse interface object
@@ -253,7 +275,9 @@ int morse_cmd_set_country(struct morse *mors, const char *country_code);
 int morse_cmd_set_rate_control(struct morse *mors);
 int morse_cmd_set_fixed_transmission_rate(struct morse *mors, s32 bandwidth_mhz, s32 mcs_index,
 					  s8 use_sgi, s8 nss_idx);
+int morse_cmd_get_rts_threshold(struct morse *mors, u32 *rts_threshold);
 int morse_cmd_set_rts_threshold(struct morse *mors, u32 rts_threshold);
+int morse_cmd_set_cts_to_self(struct morse *mors, bool enabled);
 int morse_cmd_start_scan(struct morse *mors, u8 n_ssids, const u8 *ssid, size_t ssid_len,
 			 const u8 *extra_ies, size_t extra_ies_len, u32 dwell_time_ms);
 int morse_cmd_abort_scan(struct morse *mors);
@@ -291,5 +315,38 @@ int morse_cmd_get_apf_capabilities(struct morse *mors, struct morse_vif *mors_vi
  */
 int morse_cmd_read_write_apf(struct morse *mors, struct morse_vif *mors_vif, bool write,
 							 u16 program_len, u8 *program, u32 offset);
+
+/**
+ * morse_cmd_beacon_offload() - Control the beacon offload feature
+ *
+ * @mors_vif: Pointer to morse vif struct.
+ * @operation: operation for the beacon offload command to perform
+ *
+ * Return: 0 on success, else error code
+ */
+int morse_cmd_beacon_offload(struct morse_vif *mors_vif, enum morse_beacon_offload_op operation);
+
+/**
+ * morse_cmd_probe_response_offload() - Configure the probe response template stored in the chip
+ *
+ * @mors: Morse structure
+ * @mors_vif: Morse vif struct.
+ * @enable: Indicates whether to fill the template or disable probe response offloading
+ *
+ * Return: 0 on success, else error code
+ */
+int morse_cmd_probe_response_offload(struct morse *mors, struct morse_vif *mors_vif, bool enable);
+
+/**
+ * morse_cmd_set_bss_color_in_s1g_capab() - Set BSS color in S1G capabilities
+ *
+ * @mors:	Global Morse struct
+ * @mors_vif:	Morse virtual interface
+ * @mors_vif_conf: Morse persistent vif config
+ * @bss_color:	BSS color to be set
+ */
+void morse_cmd_set_bss_color_in_s1g_capab(struct morse *mors,
+					struct morse_vif *mors_vif,
+					u8 bss_color);
 
 #endif /* !_MORSE_COMMAND_H_ */

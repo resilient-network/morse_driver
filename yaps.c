@@ -16,7 +16,7 @@
 #include "bus.h"
 #include "command.h"
 #include "skbq.h"
-#include "yaps-hw.h"
+#include "yaps_hw.h"
 
 #define BENCHMARK_PKT_LEN		(1496)
 #define BENCHMARK_WAIT_MS		(5000)
@@ -84,7 +84,7 @@ static int yaps_irq_handler(struct morse *mors, u32 status)
 
 	if (test_bit(MORSE_INT_YAPS_FC_PACKET_FREED_UP_IRQN, (unsigned long *)&status)) {
 		/* No need for the timer anymore */
-		del_timer_sync(&mors->chip_if->yaps->chip_queue_full.timer);
+		DEL_TIMER_SYNC(&mors->chip_if->yaps->chip_queue_full.timer);
 		set_bit(MORSE_TX_PACKET_FREED_UP_PEND, &mors->chip_if->event_flags);
 	}
 
@@ -100,6 +100,13 @@ static int morse_hw_restarted(struct morse *mors)
 	ret = morse_hw_enable_stop_notifications(mors, true);
 	if (ret) {
 		MORSE_ERR(mors, "%s: morse_hw_enable_stop_notifications failed: %d\n",
+			__func__, ret);
+		err = ret;
+	}
+
+	ret = morse_hw_headless_done_irq_enable(mors, false);
+	if (ret) {
+		MORSE_ERR(mors, "%s: morse_hw_headless_done_irq_enable failed: %d\n",
 			__func__, ret);
 		err = ret;
 	}
@@ -497,10 +504,9 @@ void morse_yaps_stale_tx_work(struct work_struct *work)
 	if (flushed) {
 		MORSE_YAPS_DBG(mors, "%s: Flushed %d stale TX SKBs\n", __func__, flushed);
 
-		if (mors->ps.enable &&
-		    !mors->ps.suspended && (morse_yaps_get_tx_buffered_count(mors) == 0)) {
+		if (morse_yaps_get_tx_buffered_count(mors) == 0) {
 			/* Evaluate ps to check if it was gated on a stale tx status */
-			queue_delayed_work(mors->chip_wq, &mors->ps.delayed_eval_work, 0);
+			morse_ps_queue_eval(mors);
 		}
 	}
 }
@@ -514,14 +520,19 @@ void morse_yaps_work(struct work_struct *work)
 	struct morse_yaps *yaps = mors->chip_if->yaps;
 
 	/* Don't attempt to interact with device once it becomes unresponsive */
-	if (test_bit(MORSE_STATE_FLAG_CHIP_UNRESPONSIVE, &mors->state_flags))
+	if (!morse_hw_is_on(mors))
 		return;
 
 	if (!*flags)
 		return;
 
-	/* Disable power save in case it is running */
-	morse_ps_disable(mors);
+	/* Once the system starts suspend process, prevent chip communication */
+	if (test_bit(MORSE_STATE_FLAG_SYSTEM_IN_SUSPEND, &mors->state_flags))
+		goto exit;
+
+	/* Ensure chip is awake while communicating with it */
+	morse_ps_wakers_inc(mors);
+	morse_ps_force_eval(mors);
 	morse_claim_bus(mors);
 
 	/* Handle any populated RX pages from chip first to
@@ -535,7 +546,8 @@ void morse_yaps_work(struct work_struct *work)
 			set_bit(MORSE_RX_PEND, flags);
 
 		if (yaps->data_rx_q.skbq.qlen > buffered)
-			ps_bus_timeout_ms = max(ps_bus_timeout_ms, NETWORK_BUS_TIMEOUT_MS);
+			ps_bus_timeout_ms = max(ps_bus_timeout_ms,
+						mors_ps_get_net_timeout_ms(mors));
 	}
 
 	/* TX any commands before considering data */
@@ -552,7 +564,7 @@ void morse_yaps_work(struct work_struct *work)
 
 	/* TX mgmt before considering data */
 	if (test_and_clear_bit(MORSE_TX_MGMT_PEND, flags)) {
-		ps_bus_timeout_ms = max(ps_bus_timeout_ms, NETWORK_BUS_TIMEOUT_MS);
+		ps_bus_timeout_ms = max(ps_bus_timeout_ms, mors_ps_get_net_timeout_ms(mors));
 		if (morse_yaps_tx_mgmt_handler(yaps))
 			set_bit(MORSE_TX_MGMT_PEND, flags);
 	}
@@ -588,7 +600,7 @@ void morse_yaps_work(struct work_struct *work)
 
 	/* Finally TX any data */
 	if (test_and_clear_bit(MORSE_TX_DATA_PEND, flags)) {
-		ps_bus_timeout_ms = max(ps_bus_timeout_ms, NETWORK_BUS_TIMEOUT_MS);
+		ps_bus_timeout_ms = max(ps_bus_timeout_ms, mors_ps_get_net_timeout_ms(mors));
 		if (morse_yaps_tx_data_handler(yaps))
 			set_bit(MORSE_TX_DATA_PEND, flags);
 
@@ -606,9 +618,9 @@ exit:
 	if (ps_bus_timeout_ms)
 		morse_ps_bus_activity(mors, ps_bus_timeout_ms);
 
-	/* Disable power save in case it is running */
 	morse_release_bus(mors);
-	morse_ps_enable(mors);
+	morse_ps_wakers_dec(mors);
+	morse_ps_force_eval(mors);
 
 	/* Don't requeue work if we are shutting down. */
 	if (yaps->finish)
@@ -669,7 +681,7 @@ static void morse_tx_chip_full_timer(unsigned long addr)
 #else
 static void morse_tx_chip_full_timer(struct timer_list *t)
 {
-	struct morse_yaps *yaps = from_timer(yaps, t, chip_queue_full.timer);
+	struct morse_yaps *yaps = TIMER_TO_OBJ(yaps, t, chip_queue_full.timer);
 #endif
 
 	if (!yaps || !yaps->mors)
@@ -695,7 +707,7 @@ static int morse_tx_chip_full_timer_init(struct morse_yaps *yaps)
 
 static int morse_tx_chip_full_timer_finish(struct morse_yaps *yaps)
 {
-	del_timer_sync(&yaps->chip_queue_full.timer);
+	DEL_TIMER_SYNC(&yaps->chip_queue_full.timer);
 
 	return 0;
 }

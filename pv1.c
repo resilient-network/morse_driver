@@ -1016,11 +1016,12 @@ int morse_mac_convert_pv0_to_pv1(struct morse *mors, struct morse_vif *mors_vif,
 	return morse_convert_pv0_to_pv1(mors, mors_vif, sta, skb);
 }
 
-void mors_pv1_init_vif(struct morse_vif *mors_vif)
+void mors_pv1_init_vif(struct morse_vif *mors_vif, bool enable_pv1)
 {
-	if (!mors_vif || !mors_vif->enable_pv1)
+	if (!mors_vif || !enable_pv1)
 		return;
 
+	mors_vif->enable_pv1 = enable_pv1;
 	mors_vif->pv1.hc_response_timeout = 0;
 	memset(&mors_vif->pv1.tx_request, 0, sizeof(mors_vif->pv1.tx_request));
 	memset(&mors_vif->pv1.rx_request, 0, sizeof(mors_vif->pv1.rx_request));

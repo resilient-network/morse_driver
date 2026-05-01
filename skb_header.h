@@ -44,6 +44,9 @@
  *                                        duty cycle restrictions.
  * @MORSE_TX_CONF_HAS_PV1_BPN_IN_BODY: The frame contains a PV1 BPN for TX CCMP derivation
  * @MORSE_TX_CONF_FLAGS_SEND_AFTER_DTIM: Do not send until after the next DTIM beacon
+ * @MORSE_TX_STATUS_WAS_AGGREGATED: This frame was transmitted as part of an aggregate at least once
+ * @MORSE_TX_CONF_FLAGS_FULLMAC_REPORT: Fullmac firmware should also report TX status for this frame
+ *                                      to the host.
  *
  * NOTE: Because morse_skb_tx_rx_info is treated as a union the following
  *       bit fields cannot overlap.
@@ -63,6 +66,8 @@ enum morse_tx_status_and_conf_flags {
 	MORSE_TX_STATUS_DUTY_CYCLE_CANT_SEND = (BIT(19)),
 	MORSE_TX_CONF_HAS_PV1_BPN_IN_BODY = (BIT(21)),
 	MORSE_TX_CONF_FLAGS_SEND_AFTER_DTIM = (BIT(22)),
+	MORSE_TX_STATUS_WAS_AGGREGATED = (BIT(23)),
+	MORSE_TX_CONF_FLAGS_FULLMAC_REPORT = BIT(24),
 	MORSE_TX_CONF_FLAGS_IMMEDIATE_REPORT = (BIT(31))
 };
 
@@ -150,6 +155,32 @@ enum morse_skb_channel {
 	MORSE_SKB_CHAN_COMMAND = 0xFE,
 	MORSE_SKB_CHAN_TX_STATUS = 0xFF
 };
+
+static inline const char *morse_skb_channel_name(enum morse_skb_channel channel)
+{
+	switch (channel) {
+	case MORSE_SKB_CHAN_DATA:
+		return "data";
+	case MORSE_SKB_CHAN_NDP_FRAMES:
+		return "ndp";
+	case MORSE_SKB_CHAN_DATA_NOACK:
+		return "data (noack)";
+	case MORSE_SKB_CHAN_BEACON:
+		return "beacon";
+	case MORSE_SKB_CHAN_MGMT:
+		return "mgmt";
+	case MORSE_SKB_CHAN_WIPHY:
+		return "wiphy";
+	case MORSE_SKB_CHAN_LOOPBACK:
+		return "loopback";
+	case MORSE_SKB_CHAN_COMMAND:
+		return "cmd";
+	case MORSE_SKB_CHAN_TX_STATUS:
+		return "tx status";
+	default:
+		return "unknown";
+	}
+}
 
 /** Maximum number of rates in the TX info
  *

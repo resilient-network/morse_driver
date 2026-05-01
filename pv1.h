@@ -282,8 +282,9 @@ void morse_mac_process_pv1_action_frame(struct morse_dot11ah_s1g_action *mgmt,
  * mors_pv1_init_vif -  Init PV1 context for VIF
  *
  * @mors_vif:    Valid AP/STA VIF
+ * @enable_pv1:	TRUE if PV1 is configured
  */
-void mors_pv1_init_vif(struct morse_vif *mors_vif);
+void mors_pv1_init_vif(struct morse_vif *mors_vif, bool enable_pv1);
 
 /**
  * morse_pv1_finish_vif - Deinit PV1 context for VIF

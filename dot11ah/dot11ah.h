@@ -21,6 +21,10 @@
 #define IEEE80211_FC_S1G_SECURITY_SUPPORTED			0x4000
 #define IEEE80211AH_UNKNOWN_SSID				"Unknown S1G Compressed"
 
+#define IEEE80211_NEXT_TBTT_SIZE			(3)
+#define IEEE80211_COMPRESS_SSID_SIZE			(4)
+#define IEEE80211_ANO_SIZE				(1)
+
 #define STYPE_S1G_BEACON_BSS_BW_OFFSET				11
 
 #define IEEE80211AH_GET_FC_BSS_BW(_x) \
@@ -227,6 +231,15 @@ enum ieee80211_s1g_protected_actioncode {
  */
 #define MORSE_FC_BSS_BW_UNDEFINED				(1)
 
+#define CHANNELIZATION_SCHEME_NONE 0
+/** Channelization per IEEE Std 802.11-2020 */
+#define CHANNELIZATION_SCHEME_IEEE80211_2020 1
+/** Channelization per IEEE Std 802.11-2024 */
+#define CHANNELIZATION_SCHEME_IEEE80211_2024 2
+/** Channelization per IEEE Std 802.11-REVmf */
+#define CHANNELIZATION_SCHEME_IEEE80211_REVMF 3
+#define CHANNELIZATION_SCHEME_DEFAULT CHANNELIZATION_SCHEME_IEEE80211_REVMF
+
 /**
  * enum ieee80211_li_usf - listen interval unified scal factors
  * @IEEE80211_LI_USF_1: 1
@@ -260,6 +273,7 @@ struct morse_dot11ah_channel {
 	/* Steal definition from Linux if necessary. */
 	struct ieee80211_channel_s1g ch;
 	u16 hw_value_map;
+	bool ignored;
 };
 
 enum station_type {
@@ -373,6 +387,7 @@ struct morse_dot11ah_cssid_item {
 	u8 fc_bss_bw_subfield;
 	/** Beacon interval */
 	u16 beacon_int;
+	u16 max_away_duration;
 };
 
 /*
@@ -452,6 +467,10 @@ struct s1g_operation_params_expanded {
 	bool primary_2mhz;
 	bool use_mcs10;
 	u8 op_bw;
+};
+
+struct dot11ah_mad_ie {
+	__le16 max_away_duration;
 };
 
 #define QOS_TRAFFIC_UP_SHIFT	(4)
@@ -556,10 +575,19 @@ struct morse_reg_rule {
 	} mpsw;
 };
 
+/**
+ * struct morse_regdomain - regulatory domain containing regulatory rules for a country.
+ *
+ * @n_reg_rules: Number of regulatory rules
+ * @alpha2: Country code
+ * @reg_rules: Pointer to regulatory rules
+ * @channelization_scheme: Channelization scheme of country
+ */
 struct morse_regdomain {
 	u32 n_reg_rules;
 	char alpha2[3];
 	struct morse_reg_rule *reg_rules;
+	u32 channelization_scheme;
 };
 
 int morse_dot11ah_s1g_to_11n_rx_packet_size(struct ieee80211_vif *vif,
@@ -587,6 +615,14 @@ int morse_dot11ah_s1g_to_probe_resp_ies_size(struct dot11ah_ies_mask *ies_mask);
  */
 void morse_dot11ah_s1g_to_probe_resp_ies(u8 *ies_11n, int length_11n,
 					 struct dot11ah_ies_mask *ies_mask);
+
+/**
+ * Helper function to get a pointer to the information elements in an S1G beacon
+ * @s1g_beacon S1G Beacon frame
+ *
+ * Return: pointer to start of information elements
+ */
+u8 *morse_dot11_find_s1g_beacon_ies(struct ieee80211_ext *s1g_beacon);
 
 struct dot11ah_ies_mask *morse_dot11ah_ies_mask_alloc(void);
 
@@ -639,6 +675,8 @@ bool morse_dot11ah_find_s1g_caps_for_bssid(u8 *bssid, struct ieee80211_s1g_cap *
 
 bool morse_dot11ah_find_bss_bw(u8 *bssid, u8 *fc_bss_bw_subfield);
 
+bool morse_dot11ah_find_bss_mad(const u8 *bssid, u16 *mad);
+
 /**
  * morse_dot11ah_prim_1mhz_channel_loc_to_idx() - Convert primary 1MHz channel number to 1MHz index
  * @op_bw_mhz: Operating bandwidth of the BSS
@@ -671,7 +709,15 @@ int morse_dot11_calc_prim_s1g_chan_loc(int prim_cent_freq, int op_chan_centre_fr
  */
 int morse_dot11ah_find_no_of_mesh_neighbors(u16 beacon_int);
 
-int morse_dot11ah_channel_set_map(const char *alpha);
+/**
+ * morse_dot11ah_channel_set_map() - Sets channel map for given country code
+ *
+ * @alpha: Country code to select the channel map.
+ * @channelization_scheme: Channelization scheme of the country
+ *
+ * Return: 0 on success, else an error code
+ */
+int morse_dot11ah_channel_set_map(const char *alpha, u32 channelization_scheme);
 
 int morse_update_reg_rules_to_country_ie(struct dot11ah_country_ie *country_ie,
 					 int start_chan, int end_chan, int eirp, int reg_rule);
@@ -791,7 +837,38 @@ const struct morse_reg_rule *morse_regdom_get_rule_for_freq(const char *alpha, i
 
 struct ieee80211_regdomain *morse_regdom_to_ieee80211(const struct morse_regdomain *morse_domain);
 
+/**
+ * morse_reg_set_alpha() - Set the regulatory domain rules for a given country
+ * Finds a set of regulatory rules based on a given alpha code, looking through
+ * the internally-defined domains.
+ *
+ * @alpha: The desired ISO/IEC Alpha2 Country to apply regulatory rules in
+ *
+ * Return: A pointer to the matching regdomain.
+ */
 const struct morse_regdomain *morse_reg_set_alpha(const char *alpha);
+
+/**
+ * morse_dot11ah_get_channelization_scheme() - Get channelization scheme in use.
+ *
+ * Return: Channelization scheme.
+ */
+u32 morse_dot11ah_get_channelization_scheme(void);
+
+/**
+ * morse_dot11ah_set_channelization_scheme() - Set channelization scheme
+ *
+ * @value: Channelization scheme.
+ */
+void morse_dot11ah_set_channelization_scheme(u32 value);
+
+/**
+ * morse_dot11ah_channelization_scheme_to_str() - Convert channelization scheme to string
+ * @value: Channelization scheme value.
+ *
+ * Return: String representation of channelization scheme
+ */
+const char *morse_dot11ah_channelization_scheme_to_str(u32 value);
 
 int morse_dot11ah_freq_khz_bw_mhz_to_chan(u32 freq, u8 bw);
 
@@ -837,14 +914,34 @@ const char *morse_dot11ah_get_region_str(void);
 int morse_dot11ah_get_num_channels(void);
 
 /**
- * @brief Mark S1G channel as disabled
- * @param S1G operating channel index
+ * morse_dot11ah_ignore_channel() - Mark S1G channel as disabled
  *
- * @return ENOENT if channel not found
+ * @chan_s1g: channel number to disable
+ * @bw_mhz: Bandwidth of the channel to disable
+ *
+ * Return: ENOENT if channel not found
  */
-int morse_dot11ah_ignore_channel(int chan_s1g);
+int morse_dot11ah_ignore_channel(int chan_s1g, u32 bw_mhz);
 
-const struct morse_regdomain *morse_reg_alpha_lookup(const char *alpha);
+/**
+ * morse_dot11ah_is_multi_channelization_country() - Check if country has multiple channelization.
+ *
+ * @alpha: A pointer to a country code
+ *
+ * Return: True if alpha matches a country with multiple channelization schemes.
+ */
+bool morse_dot11ah_is_multi_channelization_country(const char *alpha);
+
+/**
+ * morse_reg_alpha_lookup () - Return the regulatory domain matching with alpha and
+ * channelization scheme.
+ *
+ * @alpha: A pointer to a country alpha
+ * @channelization_scheme: Channelization scheme of the country
+ *
+ * Return: Pointer to morse_regdomain, NULL if no match is found
+ */
+const struct morse_regdomain *morse_reg_alpha_lookup(const char *alpha, u32 channelization_scheme);
 
 /**
  * @brief Fill out a channel list with the available channels for the currently configured country

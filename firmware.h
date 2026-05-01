@@ -11,7 +11,7 @@
 #include <linux/completion.h>
 #include "capabilities.h"
 #include "misc.h"
-#include "yaps-hw.h"
+#include "yaps_hw.h"
 
 #define BCF_DATABASE_SIZE               (1024)	/* From firmware */
 #define MORSE_FW_DIR                    "morse"
@@ -60,6 +60,7 @@ enum morse_fw_extended_host_table_tag {
 	MORSE_FW_HOST_TABLE_TAG_YAPS_TABLE = 3,
 	MORSE_FW_HOST_TABLE_TAG_PAGER_PKT_MEMORY = 4,
 	MORSE_FW_HOST_TABLE_TAG_PAGER_BYPASS_CMD_RESP = 5,
+	MORSE_FW_HOST_TABLE_TAG_HEADLESS_CFG_ADDR = 6,
 };
 
 struct extended_host_table_tlv_hdr {
@@ -114,6 +115,11 @@ struct extended_host_table_pager_bypass_cmd_resp {
 	__le32 cmd_resp_buffer_addr;
 };
 
+struct extended_host_table_headless_cfg_addr {
+	struct extended_host_table_tlv_hdr header;
+	__le32 headless_cfg_addr;
+};
+
 struct extended_host_table_insert_skb_checksum {
 	struct extended_host_table_tlv_hdr header;
 	u8 insert_and_validate_checksum;
@@ -146,19 +152,19 @@ struct extended_host_table {
 	u8 ext_host_table_data_tlvs[];
 } __packed;
 
-int morse_firmware_init(struct morse *mors, uint test_mode);
-
 /**
- * @brief Do necessary preparation and then initialise firmware
+ * morse_firmware_prepare() - Reset the chip and download firmware.
+ * @reset_hw: Perform a full chip reset (@reattach_hw is ignored)
+ * @reattach_hw: Do nothing if HW is ready to attach
  *
- * @param mors The global morse config object
- * @param reset_hw Perform non-destructive reset of the chip,
- *                 preserving the existing sdio enumeration whilst
- *                 resetting the firmware state
- * @param reattach_hw Reattach to running hardware
- * @return 0 if success else error code
+ * Unless reattaching, do a full chip reset if requested or if firmware is not loaded,
+ * download the firmware and verify that it is running. If using SDIO, the SDIO enumeration
+ * is preserved.
+ *
+ * Return: 0 if firmware is successfully downloaded, -EALREADY if @reattach_hw is set and
+ * HW is ready to attach, else an error code
  */
-int morse_firmware_prepare_and_init(struct morse *mors, bool reset_hw, bool reattach_hw);
+int morse_firmware_prepare(struct morse *mors, bool reset_hw, bool reattach_hw);
 
 /**
  * morse_firmware_build_fw_path() - Build path to the firmware image.

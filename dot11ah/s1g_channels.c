@@ -45,6 +45,7 @@ struct morse_dot11ah_ch_map {
 	int (*transform_overlapping_5g_chan)(int chan_5g);
 	u32 num_mapped_channels;
 	struct morse_dot11ah_channel *s1g_channels;
+	u32 channelization_scheme;
 };
 
 static int prim_1mhz_channel_loc_to_idx_default(int op_bw_mhz, int pr_bw_mhz, int pr_chan_num,
@@ -99,6 +100,30 @@ static int prim_1mhz_channel_loc_to_idx_jp(int op_bw_mhz, int pr_bw_mhz, int pr_
 	case 8:
 	default:
 		return -EINVAL;
+	}
+}
+
+static int prim_1mhz_channel_loc_to_idx_au(int op_bw_mhz, int pr_bw_mhz, int pr_chan_num,
+					    int chan_centre_freq_num, int chan_loc)
+{
+	if (chan_centre_freq_num > 50) {
+		switch (op_bw_mhz) {
+		case 4:
+			if (pr_bw_mhz == 1)
+				return (((pr_chan_num - chan_centre_freq_num) + 19) / 2);
+			else
+				return (((pr_chan_num - chan_centre_freq_num) + 18) / 2) + chan_loc;
+		case 8:
+			if (pr_bw_mhz == 1)
+				return (((pr_chan_num - chan_centre_freq_num) + 23) / 2);
+			else
+				return (((pr_chan_num - chan_centre_freq_num) + 22) / 2) + chan_loc;
+		default:
+				return -ENOENT;
+		}
+	} else {
+		return prim_1mhz_channel_loc_to_idx_default(op_bw_mhz, pr_bw_mhz, pr_chan_num,
+							chan_centre_freq_num, chan_loc);
 	}
 }
 
@@ -161,6 +186,30 @@ static int calculate_primary_s1g_channel_jp(int op_bw_mhz, int pr_bw_mhz, int ch
 	}
 }
 
+static int calculate_primary_s1g_channel_au(int op_bw_mhz, int pr_bw_mhz,
+					     int chan_centre_freq_num, int pr_1mhz_chan_idx)
+{
+	if (chan_centre_freq_num > 50) {
+		switch (op_bw_mhz) {
+		case 4:
+			if (pr_bw_mhz == 1)
+				return ((2 * pr_1mhz_chan_idx) - 19) + chan_centre_freq_num;
+			else
+				return ((pr_1mhz_chan_idx / 2) * 4) - 18 + chan_centre_freq_num;
+		case 8:
+			if (pr_bw_mhz == 1)
+				return ((2 * pr_1mhz_chan_idx) - 23) + chan_centre_freq_num;
+			else
+				return ((pr_1mhz_chan_idx / 2) * 4) - 22 + chan_centre_freq_num;
+		}
+	} else {
+		return calculate_primary_s1g_channel_default(op_bw_mhz, pr_bw_mhz,
+				chan_centre_freq_num, pr_1mhz_chan_idx);
+	}
+
+	return -EINVAL;
+}
+
 static int s1g_op_chan_pri_chan_to_5g_default(int s1g_op_chan, int s1g_pri_chan)
 {
 	return morse_dot11ah_s1g_chan_to_5g_chan(s1g_pri_chan);
@@ -185,6 +234,32 @@ static int s1g_op_chan_pri_chan_to_5g_jp(int s1g_op_chan, int s1g_pri_chan)
 	return morse_dot11ah_s1g_chan_to_5g_chan(s1g_pri_chan) + ht20mhz_offset;
 }
 
+static int s1g_op_chan_pri_chan_to_5g_au(int s1g_op_chan, int s1g_pri_chan)
+{
+	int htchan_offset = 0;
+	int chan_5g;
+
+	/* In the AU regulatory, some channels have duplicate entries.
+	 * The operating channel must be considered while mapping S1G channels
+	 * to 5G channels
+	 */
+	if (s1g_op_chan == 43 && s1g_pri_chan <= 42)
+		htchan_offset = 48;
+
+	if (s1g_op_chan == 51)
+		htchan_offset = 105;
+
+	if (s1g_op_chan == 55 || s1g_op_chan == 59) {
+		if (s1g_pri_chan <= 42)
+			htchan_offset = 105;
+		else
+			htchan_offset = 57;
+	}
+
+	chan_5g = morse_dot11ah_s1g_chan_to_5g_chan(s1g_pri_chan) + htchan_offset;
+	return chan_5g;
+}
+
 static int transform_overlapping_5g_chan_jp(int chan_5g)
 {
 	int ht20mhz_offset = 0;
@@ -197,6 +272,26 @@ static int transform_overlapping_5g_chan_jp(int chan_5g)
 		ht20mhz_offset = 12;
 
 	return chan_5g - ht20mhz_offset;
+}
+
+static int transform_overlapping_5g_chan_au(int chan_5g)
+{
+	int htchan_offset = 0;
+
+	/* In the AU regulatory, some S1G primary channels map to multiple 5G channels.
+	 * Only the first mapping is maintained, so transform the overlapping channels back
+	 * to the known set.
+	 */
+	if (chan_5g >= 100 && chan_5g <= 112)
+		htchan_offset = 48;
+
+	if (chan_5g >= 149 && chan_5g <= 169 && chan_5g != 155 && chan_5g != 163)
+		htchan_offset = 105;
+
+	if (chan_5g >= 173 && chan_5g <= 177)
+		htchan_offset = 57;
+
+	return chan_5g - htchan_offset;
 }
 
 static int get_pri_1mhz_chan_default(int primary_channel,
@@ -233,16 +328,43 @@ static int get_pri_1mhz_chan_jp(int primary_channel,
 	}
 }
 
-/* AU map */
-static const struct morse_dot11ah_ch_map mors_au_map = {
+/* AU map as per 802.11-2020 channelization */
+static const struct morse_dot11ah_ch_map mors_au_2020_map = {
 		.alpha = CHANNEL_ALPHA_AU,
 		.prim_1mhz_channel_loc_to_idx = &prim_1mhz_channel_loc_to_idx_default,
 		.calculate_primary_s1g = &calculate_primary_s1g_channel_default,
 		.s1g_op_chan_pri_chan_to_5g = &s1g_op_chan_pri_chan_to_5g_default,
 		.get_pri_1mhz_chan = &get_pri_1mhz_chan_default,
 		.transform_overlapping_5g_chan = NULL,
+		.num_mapped_channels = ARRAY_SIZE(au_2020_s1g_channels),
+		.s1g_channels = au_2020_s1g_channels,
+		.channelization_scheme = CHANNELIZATION_SCHEME_IEEE80211_2020,
+};
+
+/* AU map as per 802.11-2024 channelization */
+static const struct morse_dot11ah_ch_map mors_au_2024_map = {
+		.alpha = CHANNEL_ALPHA_AU,
+		.prim_1mhz_channel_loc_to_idx = &prim_1mhz_channel_loc_to_idx_au,
+		.calculate_primary_s1g = &calculate_primary_s1g_channel_au,
+		.s1g_op_chan_pri_chan_to_5g = &s1g_op_chan_pri_chan_to_5g_au,
+		.get_pri_1mhz_chan = &get_pri_1mhz_chan_default,
+		.transform_overlapping_5g_chan = &transform_overlapping_5g_chan_au,
+		.num_mapped_channels = ARRAY_SIZE(au_2024_s1g_channels),
+		.s1g_channels = au_2024_s1g_channels,
+		.channelization_scheme = CHANNELIZATION_SCHEME_IEEE80211_2024,
+};
+
+/* AU map as per 802.11-REVmf channelization */
+static const struct morse_dot11ah_ch_map mors_au_map = {
+		.alpha = CHANNEL_ALPHA_AU,
+		.prim_1mhz_channel_loc_to_idx = &prim_1mhz_channel_loc_to_idx_au,
+		.calculate_primary_s1g = &calculate_primary_s1g_channel_au,
+		.s1g_op_chan_pri_chan_to_5g = &s1g_op_chan_pri_chan_to_5g_au,
+		.get_pri_1mhz_chan = &get_pri_1mhz_chan_default,
+		.transform_overlapping_5g_chan = &transform_overlapping_5g_chan_au,
 		.num_mapped_channels = ARRAY_SIZE(au_s1g_channels),
 		.s1g_channels = au_s1g_channels,
+		.channelization_scheme = CHANNELIZATION_SCHEME_IEEE80211_REVMF,
 };
 
 /* NZ map */
@@ -255,6 +377,7 @@ static const struct morse_dot11ah_ch_map mors_nz_map = {
 		.transform_overlapping_5g_chan = NULL,
 		.num_mapped_channels = ARRAY_SIZE(nz_s1g_channels),
 		.s1g_channels = nz_s1g_channels,
+		.channelization_scheme = CHANNELIZATION_SCHEME_NONE,
 };
 
 /* CA map */
@@ -267,6 +390,7 @@ static const struct morse_dot11ah_ch_map mors_ca_map = {
 		.transform_overlapping_5g_chan = NULL,
 		.num_mapped_channels = ARRAY_SIZE(ca_s1g_channels),
 		.s1g_channels = ca_s1g_channels,
+		.channelization_scheme = CHANNELIZATION_SCHEME_NONE,
 };
 
 /* EU map */
@@ -279,6 +403,7 @@ static const struct morse_dot11ah_ch_map mors_eu_map = {
 		.transform_overlapping_5g_chan = NULL,
 		.num_mapped_channels = ARRAY_SIZE(eu_s1g_channels),
 		.s1g_channels = eu_s1g_channels,
+		.channelization_scheme = CHANNELIZATION_SCHEME_NONE,
 };
 
 /* GB map */
@@ -291,6 +416,7 @@ static const struct morse_dot11ah_ch_map mors_gb_map = {
 		.transform_overlapping_5g_chan = NULL,
 		.num_mapped_channels = ARRAY_SIZE(gb_s1g_channels),
 		.s1g_channels = gb_s1g_channels,
+		.channelization_scheme = CHANNELIZATION_SCHEME_NONE,
 };
 
 /* IN map */
@@ -303,6 +429,7 @@ static const struct morse_dot11ah_ch_map mors_in_map = {
 		.transform_overlapping_5g_chan = NULL,
 		.num_mapped_channels = ARRAY_SIZE(in_s1g_channels),
 		.s1g_channels = in_s1g_channels,
+		.channelization_scheme = CHANNELIZATION_SCHEME_NONE,
 };
 
 /* JP map */
@@ -315,6 +442,7 @@ static const struct morse_dot11ah_ch_map mors_jp_map = {
 		.transform_overlapping_5g_chan = &transform_overlapping_5g_chan_jp,
 		.num_mapped_channels = ARRAY_SIZE(jp_s1g_channels),
 		.s1g_channels = jp_s1g_channels,
+		.channelization_scheme = CHANNELIZATION_SCHEME_NONE,
 };
 
 /* KR map */
@@ -327,6 +455,7 @@ static const struct morse_dot11ah_ch_map mors_kr_map = {
 		.transform_overlapping_5g_chan = NULL,
 		.num_mapped_channels = ARRAY_SIZE(kr_s1g_channels),
 		.s1g_channels = kr_s1g_channels,
+		.channelization_scheme = CHANNELIZATION_SCHEME_NONE,
 };
 
 /* SG map */
@@ -339,6 +468,7 @@ static const struct morse_dot11ah_ch_map mors_sg_map = {
 		.transform_overlapping_5g_chan = NULL,
 		.num_mapped_channels = ARRAY_SIZE(sg_s1g_channels),
 		.s1g_channels = sg_s1g_channels,
+		.channelization_scheme = CHANNELIZATION_SCHEME_NONE,
 };
 
 /* US map */
@@ -351,9 +481,12 @@ static const struct morse_dot11ah_ch_map mors_us_map = {
 		.transform_overlapping_5g_chan = NULL,
 		.num_mapped_channels = ARRAY_SIZE(us_s1g_channels),
 		.s1g_channels = us_s1g_channels,
+		.channelization_scheme = CHANNELIZATION_SCHEME_NONE,
 };
 
 const struct morse_dot11ah_ch_map *mapped_channels[] = {
+	&mors_au_2020_map,
+	&mors_au_2024_map,
 	&mors_au_map,
 	&mors_ca_map,
 	&mors_eu_map,
@@ -368,16 +501,32 @@ const struct morse_dot11ah_ch_map *mapped_channels[] = {
 
 static const struct morse_dot11ah_ch_map *__mors_s1g_map;
 
-int morse_dot11ah_channel_set_map(const char *alpha)
+int morse_dot11ah_channel_set_map(const char *alpha, u32 channelization_scheme)
 {
 	int i;
 
 	if (WARN_ON(!alpha))
 		return -ENOENT;
 
-	for (i = 0; i < ARRAY_SIZE(mapped_channels); i++)
-		if (!strncmp(mapped_channels[i]->alpha, alpha, strlen(alpha)))
-			__mors_s1g_map = mapped_channels[i];
+	for (i = 0; i < ARRAY_SIZE(mapped_channels); i++) {
+		const struct morse_dot11ah_ch_map *s1g_ch_map = mapped_channels[i];
+
+		if (strncmp(s1g_ch_map->alpha, alpha, strlen(alpha)))
+			continue;
+
+		/*
+		 * Enforce channelization scheme only for countries that have
+		 * multiple channelization. For all others, ignore the
+		 * scheme and return the first alpha match.
+		 */
+		if (morse_dot11ah_is_multi_channelization_country(alpha) &&
+		    channelization_scheme != s1g_ch_map->channelization_scheme)
+			continue;
+
+		__mors_s1g_map = s1g_ch_map;
+
+		break;
+	}
 
 	if (!__mors_s1g_map)
 		return -ENOENT;
@@ -598,7 +747,18 @@ int morse_dot11ah_channel_to_freq_khz(int chan)
 	region = morse_reg_get_region(__mors_s1g_map->alpha);
 
 	switch (region) {
-	case MORSE_AU:
+	case MORSE_AU: {
+		u32 start_freq = 902000;
+		/* AU New Proposal channels 35, 39 and 43 are renumbered to 51, 55 and 59.
+		 * with starting frequency as 894000
+		 */
+		if (chan >= 51 &&
+		    morse_dot11ah_get_channelization_scheme() ==
+		    CHANNELIZATION_SCHEME_IEEE80211_REVMF)
+			start_freq = 894000;
+
+		return (start_freq + chan * 500);
+	}
 	case MORSE_CA:
 	case MORSE_NZ:
 	case MORSE_US:
@@ -643,7 +803,21 @@ int morse_dot11ah_freq_khz_bw_mhz_to_chan(u32 freq, u8 bw)
 	region = morse_reg_get_region(__mors_s1g_map->alpha);
 
 	switch (region) {
-	case MORSE_AU:
+	case MORSE_AU: {
+		u32 start_freq = 902000;
+
+		/* AU New Proposal channels 35, 39 and 43 are renumbered to
+		 * 51, 55 and 59 with starting frequency as 894000.
+		 */
+		if (((freq == 919500 && bw == 4) || (freq == 921500 && bw == 8) ||
+			(freq == 923500 && bw == 4)) &&
+			morse_dot11ah_get_channelization_scheme() ==
+			CHANNELIZATION_SCHEME_IEEE80211_REVMF)
+			start_freq = 894000;
+
+		channel = (freq - start_freq) /  500;
+		break;
+	}
 	case MORSE_CA:
 	case MORSE_NZ:
 	case MORSE_US:
@@ -715,13 +889,14 @@ int morse_dot11ah_get_pri_1mhz_chan(int primary_channel,
 }
 EXPORT_SYMBOL(morse_dot11ah_get_pri_1mhz_chan);
 
-int morse_dot11ah_ignore_channel(int chan_s1g)
+int morse_dot11ah_ignore_channel(int chan_s1g, u32 bw_mhz)
 {
 	int ch;
 
 	for (ch = 0; ch < __mors_s1g_map->num_mapped_channels; ch++) {
-		if (chan_s1g ==  __mors_s1g_map->s1g_channels[ch].ch.hw_value) {
-			__mors_s1g_map->s1g_channels[ch].ch.flags |= IEEE80211_CHAN_IGNORE;
+		if (chan_s1g ==  __mors_s1g_map->s1g_channels[ch].ch.hw_value &&
+		    bw_mhz == ch_flag_to_chan_bw(__mors_s1g_map->s1g_channels[ch].ch.flags)) {
+			__mors_s1g_map->s1g_channels[ch].ignored = true;
 			return 0;
 		}
 	}
@@ -753,7 +928,7 @@ int morse_dot11ah_fill_channel_list(struct morse_channel *list)
 		chan = &list[count];
 
 		/* Skip ignored channels */
-		if (map_entry->ch.flags & IEEE80211_CHAN_IGNORE)
+		if (map_entry->ignored)
 			continue;
 
 		chan->frequency_khz = ieee80211_channel_to_khz(&map_entry->ch);

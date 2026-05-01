@@ -66,6 +66,20 @@ void morse_rc_sta_state_check(struct morse *mors,
 			      enum ieee80211_sta_state old_state,
 			      enum ieee80211_sta_state new_state);
 
+/**
+ * Validate an MMRC rate descriptor against supported ranges.
+ *
+ * @param rate MMRC rate structure
+ *
+ * @return true if the bandwidth and MCS index are within supported ranges,
+ *         false otherwise.
+ */
+static inline bool mmrc_rate_is_valid(const struct mmrc_rate *rate)
+{
+	return (rate && rate->bw < MMRC_SUPP_NUM_BW &&
+			rate->rate < MMRC_SUPP_NUM_MCS);
+}
+
 /*
  * Reinitialize the associated stations when there is a change in BW.
  * Must be called with mors->lock held

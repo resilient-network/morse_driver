@@ -166,17 +166,6 @@ static inline void morse_enable_mbca_capability(u8 *mesh_config_ie)
 }
 
 /**
- * morse_restore_mesh_config() - Restores the mesh config to VIF mesh context,
- *				which is stored earlier when the config is received from
- *				wpa_supplicant via morsectrl
- *
- * @mors_vif : The mesh VIF in which config is being restored
- *
- * return 0 on success, relevant error on failure
- */
-int morse_restore_mesh_config(struct morse_vif *mors_vif);
-
-/**
  * morse_dot11_get_mpm_ampe_len() - Finds length of AMPE element (Authenticated
  *	Mesh Peering Exchange) in Mesh Peer management (MPM) frames
  *
@@ -191,13 +180,11 @@ int morse_dot11_get_mpm_ampe_len(struct sk_buff *skb);
  *
  * @mors_vif: pointer to morse interface
  * @mesh_config: pointer to mesh config structure
- * @stored_config: pointer to mesh config from the stored list if its a restore
  *
  * Return: 0 on success and error code on failure
  */
 int morse_cmd_set_mesh_config(struct morse_vif *mors_vif,
-			      struct morse_cmd_req_set_mesh_config *mesh_config,
-			      struct morse_mesh_config_list *stored_config);
+			      struct morse_cmd_req_set_mesh_config *mesh_config, bool in_reconfig);
 
 /**
  * morse_insert_beacon_timing_element() - Inserts Beacon Timing Element in Beacon or Probe Response
@@ -208,7 +195,7 @@ int morse_cmd_set_mesh_config(struct morse_vif *mors_vif,
  *
  * Return: None
  */
-void morse_insert_beacon_timing_element(struct morse_vif *mors_vif, struct sk_buff *skb,
+void morse_insert_beacon_timing_element(struct morse_vif *mors_vif,
 					struct dot11ah_ies_mask *ies_mask);
 
 /**
@@ -318,20 +305,6 @@ int morse_mac_process_mesh_tx_mgmt(struct morse_vif *mors_vif,
 				   struct sk_buff *skb, struct dot11ah_ies_mask *ies_mask);
 
 /**
- * morse_mac_clear_mesh_list() - Free up the mesh config list when device restarts
- *
- * @mors: Global morse struct
- */
-void morse_mac_clear_mesh_list(struct morse *mors);
-
-/**
- * morse_mesh_config_list_init () - Initializes local mesh config context
- *
- * @mors: Global morse struct
- */
-void morse_mesh_config_list_init(struct morse *mors);
-
-/**
  * morse_mesh_deinit() - Mesh de-initialization
  *
  * @mors_vif: pointer to morse interface
@@ -347,6 +320,14 @@ int morse_mesh_deinit(struct morse_vif *mors_vif);
  *
  * Return: 0 on success and error code on failure
  */
-int morse_mesh_init(struct morse_vif *mors_vif);
+int morse_mesh_init(struct morse_vif *mors_vif, bool in_reconfig);
+
+/**
+ * morse_mesh_reconfig() - Restore mesh configurations after assert
+ *
+ * @mors: global morse structure
+ * @mors_vif: Morse VIF
+ */
+void morse_mesh_reconfig(struct morse *mors, struct morse_vif *mors_vif);
 
 #endif /* _MORSE_MESH_H_ */

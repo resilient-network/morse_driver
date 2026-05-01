@@ -45,13 +45,4 @@
 			   reg_flags, duty_cycle_ap, duty_cycle_sta, duty_cycle_omit_ctrl_resp, \
 			   mpsw_min_us, mpsw_max_us, mpsw_win_length_us)
 
-/**
- * Take a channel alpha and return the corresponding regulatory domain
- *
- * @param alpha A pointer to a country alpha
- * @returns struct morse_regdomain of the domain with the matching channel alpha
- *			else NULL if no match is found
- */
-const struct morse_regdomain *morse_reg_alpha_lookup(const char *alpha);
-
 #endif /*_REG_RULES_H_ */

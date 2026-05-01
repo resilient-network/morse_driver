@@ -85,6 +85,10 @@
 #define MM810x_BOARD_TYPE_MAX_VALUE		(MM810x_OTP_BOARD_TYPE_MASK - 1)
 
 #define MM8108_FW_BASE				"mm8108"
+/* Maximum wait time (milliseconds) for firmware to boot (for host table pointer to be available) */
+#define FIRMWARE_BOOT_TIMEOUT_MS 1200
+/* Maximum wait time (milliseconds) for secureboot to complete */
+#define FIRMWARE_SECURE_BOOT_TIMEOUT_MS 4000
 
 static void mm810x_otp_power_up(struct morse *mors)
 {
@@ -242,10 +246,18 @@ static char *mm810x_get_fw_path(u32 chip_id)
 			 fw_variant_string);
 }
 
-static u8 mm810x_get_wakeup_delay_ms(u32 chip_id)
+static u8 mm810x_get_warm_boot_time_ms(u32 chip_id)
 {
 	/* MM8108 takes < 5ms to be active */
 	return 10;
+}
+
+static u32 mm810x_get_cold_boot_time_ms(u32 chip_id)
+{
+	u32 wait_time_ms = FIRMWARE_BOOT_TIMEOUT_MS;
+
+
+	return wait_time_ms;
 }
 
 static u32 mm810x_get_burst_mode_inter_block_delay_ns(const u8 burst_mode)
@@ -592,7 +604,8 @@ struct morse_hw_cfg mm8108_cfg = {
 	.led_group.enable_led_support = true,
 	.enable_sdio_burst_mode = mm810x_enable_burst_mode,
 	.digital_reset = mm810x_digital_reset,
-	.get_ps_wakeup_delay_ms = mm810x_get_wakeup_delay_ms,
+	.get_warm_boot_time_ms = mm810x_get_warm_boot_time_ms,
+	.get_cold_boot_time_ms = mm810x_get_cold_boot_time_ms,
 	.get_hw_version = mm810x_get_hw_version,
 	.get_fw_path = mm810x_get_fw_path,
 	.set_slow_clock_mode = mm810x_set_slow_clock_mode,

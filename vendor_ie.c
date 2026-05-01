@@ -38,6 +38,7 @@ MODULE_PARM_DESC(max_total_vendor_ie_bytes, "Max total bytes for runtime vendor 
 static int morse_vendor_ie_add_to_ie_list(struct morse_vif *mors_vif, u16 mgmt_type_mask,
 					  u8 *data, u16 data_len)
 {
+	struct morse_vendor_ie *vie_config;
 	struct vendor_ie_list_item *item;
 	const u8 full_ie_length = data_len + sizeof(item->ie.element_id) + sizeof(item->ie.len);
 
@@ -47,6 +48,10 @@ static int morse_vendor_ie_add_to_ie_list(struct morse_vif *mors_vif, u16 mgmt_t
 
 	if (!mors_vif)
 		return -ENODEV;
+
+	vie_config = mors_vif->vendor_ie.vie_config;
+	if (!vie_config)
+		return -ENXIO;
 
 	if ((morse_vendor_ie_get_ies_length(mors_vif, mgmt_type_mask) + full_ie_length) >
 	    max_total_vendor_ie_bytes)
@@ -62,7 +67,7 @@ static int morse_vendor_ie_add_to_ie_list(struct morse_vif *mors_vif, u16 mgmt_t
 	memcpy(item->ie.oui, data, data_len);
 
 	spin_lock_bh(&mors_vif->vendor_ie.lock);
-	list_add_tail(&item->list, &mors_vif->vendor_ie.ie_list);
+	list_add_tail(&item->list, &vie_config->ie_list);
 	spin_unlock_bh(&mors_vif->vendor_ie.lock);
 
 	return 0;
@@ -79,19 +84,25 @@ static int morse_vendor_ie_add_to_ie_list(struct morse_vif *mors_vif, u16 mgmt_t
 static int morse_vendor_ie_clear_ie_list(struct morse_vif *mors_vif, u16 mgmt_type_mask)
 {
 	struct vendor_ie_list_item *vendor_ie, *tmp;
+	struct morse_vendor_ie *vie_config;
 
 	if (!mors_vif)
 		return 0;
 
 	spin_lock_bh(&mors_vif->vendor_ie.lock);
-	list_for_each_entry_safe(vendor_ie, tmp, &mors_vif->vendor_ie.ie_list, list) {
+	vie_config = mors_vif->vendor_ie.vie_config;
+	if (!vie_config)
+		goto exit;
+
+	list_for_each_entry_safe(vendor_ie, tmp, &vie_config->ie_list, list) {
 		if (vendor_ie->mgmt_type_mask & mgmt_type_mask) {
 			list_del(&vendor_ie->list);
 			kfree(vendor_ie);
 		}
 	}
-	spin_unlock_bh(&mors_vif->vendor_ie.lock);
 
+exit:
+	spin_unlock_bh(&mors_vif->vendor_ie.lock);
 	return 0;
 }
 
@@ -102,9 +113,15 @@ int morse_vendor_ie_process_rx_ies(struct wireless_dev *wdev, const u8 *ies, u16
 	const u8 *pos = ies;
 	const u8 *const end = ies + length;
 	struct vendor_ie_oui_filter_list_item *item;
+	struct morse_vendor_ie *vie_config;
 	const struct ieee80211_vendor_ie *vie = (const struct ieee80211_vendor_ie *)ies;
 	const u8 min_vendor_ie_length = sizeof(*vie) - sizeof(vie->element_id) - sizeof(vie->len);
 	struct morse_vif *mors_vif = morse_wdev_to_morse_vif(wdev);
+
+	if (!mors_vif)
+		return -ENODEV;
+
+	vie_config = mors_vif->vendor_ie.vie_config;
 
 	while ((pos < end) && (ret == 0)) {
 		pos = cfg80211_find_ie(WLAN_EID_VENDOR_SPECIFIC, pos, length);
@@ -113,9 +130,9 @@ int morse_vendor_ie_process_rx_ies(struct wireless_dev *wdev, const u8 *ies, u16
 
 		vie = (const struct ieee80211_vendor_ie *)pos;
 
-		if (vie->len >= min_vendor_ie_length) {
+		if (vie_config && vie->len >= min_vendor_ie_length) {
 			spin_lock_bh(&mors_vif->vendor_ie.lock);
-			list_for_each_entry(item, &mors_vif->vendor_ie.oui_filter_list, list) {
+			list_for_each_entry(item, &vie_config->oui_filter_list, list) {
 				if ((memcmp(item->oui, vie->oui, sizeof(vie->oui)) == 0) &&
 				    (item->mgmt_type_mask & mgmt_type)) {
 					ret = item->on_vendor_ie_match(wdev, mgmt_type, vie);
@@ -132,18 +149,6 @@ int morse_vendor_ie_process_rx_ies(struct wireless_dev *wdev, const u8 *ies, u16
 }
 
 /**
- * Helper function to get a pointer to the information elements on a received S1G beacon
- *
- * @bcn S1G Beacon frame
- * @return pointer to start of information elements
- */
-static inline u8 *get_elements_from_s1g_beacon(struct ieee80211_ext *bcn)
-{
-	return (ieee80211_is_s1g_short_beacon(bcn->frame_control) ?
-		bcn->u.s1g_short_beacon.variable : bcn->u.s1g_beacon.variable);
-}
-
-/**
  * Find a previously configured OUI in the OUI filter
  *
  * @mors_vif interface containing the OUI filter
@@ -154,8 +159,12 @@ static struct vendor_ie_oui_filter_list_item *oui_filter_find_oui(struct morse_v
 								  u8 *oui)
 {
 	struct vendor_ie_oui_filter_list_item *item;
+	struct morse_vendor_ie *vie_config = mors_vif->vendor_ie.vie_config;
 
-	list_for_each_entry(item, &mors_vif->vendor_ie.oui_filter_list, list) {
+	if (!vie_config)
+		return NULL;
+
+	list_for_each_entry(item, &vie_config->oui_filter_list, list) {
 		if (memcmp(item->oui, oui, sizeof(item->oui)) == 0)
 			return item;
 	}
@@ -173,6 +182,8 @@ static struct vendor_ie_oui_filter_list_item *oui_filter_find_oui(struct morse_v
 static void try_remove_oui(struct morse_vif *mors_vif,
 			   struct vendor_ie_oui_filter_list_item *item, u16 mgmt_type_mask)
 {
+	struct morse_vendor_ie *vie_config = mors_vif->vendor_ie.vie_config;
+
 	if (item->mgmt_type_mask & mgmt_type_mask)
 		item->mgmt_type_mask &= ~mgmt_type_mask;
 
@@ -180,10 +191,13 @@ static void try_remove_oui(struct morse_vif *mors_vif,
 		list_del(&item->list);
 		kfree(item);
 
-		if (mors_vif->vendor_ie.n_oui_filters == 0)
+		if (!vie_config)
+			return;
+
+		if (vie_config->n_oui_filters == 0)
 			MORSE_WARN_ON_ONCE(FEATURE_ID_DEFAULT, 1);
 		else
-			mors_vif->vendor_ie.n_oui_filters--;
+			vie_config->n_oui_filters--;
 	}
 }
 
@@ -206,14 +220,21 @@ static int morse_vendor_ie_add_oui_to_filter(struct morse_vif *mors_vif, u16 mgm
 {
 	int ret = 0;
 	struct vendor_ie_oui_filter_list_item *item;
+	struct morse_vendor_ie *vie_config;
 
 	if (!mors_vif)
 		return -ENODEV;
 
 	spin_lock_bh(&mors_vif->vendor_ie.lock);
+	vie_config = mors_vif->vendor_ie.vie_config;
+	if (!vie_config) {
+		ret = -ENXIO;
+		goto exit;
+	}
+
 	item = oui_filter_find_oui(mors_vif, oui);
 	if (!item) {
-		if (mors_vif->vendor_ie.n_oui_filters >= MAX_NUM_OUI_FILTERS) {
+		if (vie_config->n_oui_filters >= MAX_NUM_OUI_FILTERS) {
 			ret = -ENOSPC;
 			goto exit;
 		}
@@ -232,8 +253,8 @@ static int morse_vendor_ie_add_oui_to_filter(struct morse_vif *mors_vif, u16 mgm
 		memcpy(item->oui, oui, sizeof(item->oui));
 		item->on_vendor_ie_match = on_vendor_ie_match;
 
-		list_add_tail(&item->list, &mors_vif->vendor_ie.oui_filter_list);
-		mors_vif->vendor_ie.n_oui_filters++;
+		list_add_tail(&item->list, &vie_config->oui_filter_list);
+		vie_config->n_oui_filters++;
 	} else {
 		if (item->mgmt_type_mask & mgmt_type_mask)
 			ret = -EEXIST;
@@ -267,6 +288,7 @@ exit:
  */
 static int morse_vendor_ie_clear_oui_filter(struct morse_vif *mors_vif, u16 mgmt_type_mask)
 {
+	struct morse_vendor_ie *vie_config;
 	struct vendor_ie_oui_filter_list_item *item, *tmp;
 	bool empty = false;
 
@@ -275,9 +297,15 @@ static int morse_vendor_ie_clear_oui_filter(struct morse_vif *mors_vif, u16 mgmt
 
 	spin_lock_bh(&mors_vif->vendor_ie.lock);
 
-	empty = list_empty(&mors_vif->vendor_ie.oui_filter_list);
+	vie_config = mors_vif->vendor_ie.vie_config;
+	if (!vie_config) {
+		spin_unlock_bh(&mors_vif->vendor_ie.lock);
+		return -ENXIO;
+	}
 
-	list_for_each_entry_safe(item, tmp, &mors_vif->vendor_ie.oui_filter_list, list)
+	empty = list_empty(&vie_config->oui_filter_list);
+
+	list_for_each_entry_safe(item, tmp, &vie_config->oui_filter_list, list)
 		try_remove_oui(mors_vif, item, mgmt_type_mask);
 
 	spin_unlock_bh(&mors_vif->vendor_ie.lock);
@@ -289,28 +317,66 @@ static int morse_vendor_ie_clear_oui_filter(struct morse_vif *mors_vif, u16 mgmt
 	return 0;
 }
 
-void morse_vendor_ie_init_interface(struct morse_vif *mors_vif)
+void morse_vendor_ie_init_interface(struct morse_vif *mors_vif, bool in_reconfig)
 {
-	INIT_LIST_HEAD(&mors_vif->vendor_ie.ie_list);
-	INIT_LIST_HEAD(&mors_vif->vendor_ie.oui_filter_list);
+	const u8 *addr = NULL;
+	struct morse_persistent_vif_configs *mors_vif_conf;
+	struct morse *mors = morse_vif_to_morse(mors_vif);
+
 	spin_lock_init(&mors_vif->vendor_ie.lock);
+
+	mutex_lock(&mors->persistent_vif_config.lock);
+
+	if (is_fullmac_mode()) {
+		struct net_device *ndev = mors_vif->ndev;
+
+		if (ndev)
+			addr = ndev->dev_addr;
+	} else {
+		struct ieee80211_vif *vif = morse_vif_to_ieee80211_vif(mors_vif);
+
+		addr = vif->addr;
+	}
+
+	mors_vif_conf = morse_get_vif_conf_from_addr(mors, addr);
+	if (!mors_vif_conf)
+		goto exit;
+
+	mors_vif->vendor_ie.vie_config = &mors_vif_conf->vie_config;
+
+	if (in_reconfig)
+		goto exit;
+
+	INIT_LIST_HEAD(&mors_vif->vendor_ie.vie_config->ie_list);
+	INIT_LIST_HEAD(&mors_vif->vendor_ie.vie_config->oui_filter_list);
+
+exit:
+	mutex_unlock(&mors->persistent_vif_config.lock);
 }
 
-void morse_vendor_ie_deinit_interface(struct morse_vif *mors_vif)
+void morse_vendor_ie_deinit_interface(struct morse_vif *mors_vif, bool is_restarting)
 {
-	morse_vendor_ie_clear_ie_list(mors_vif, MORSE_VENDOR_IE_TYPE_ALL);
-	morse_vendor_ie_clear_oui_filter(mors_vif, MORSE_VENDOR_IE_TYPE_ALL);
+	if (!is_restarting) {
+		morse_vendor_ie_clear_ie_list(mors_vif, MORSE_VENDOR_IE_TYPE_ALL);
+		morse_vendor_ie_clear_oui_filter(mors_vif, MORSE_VENDOR_IE_TYPE_ALL);
+	}
+	mors_vif->vendor_ie.vie_config = NULL;
 }
 
 u16 morse_vendor_ie_get_ies_length(struct morse_vif *mors_vif, u16 mgmt_type_mask)
 {
 	struct vendor_ie_list_item *vendor_ie;
+	struct morse_vendor_ie *vie_config;
 	u16 vendor_ie_length = 0;
 
 	if (!mors_vif || !mgmt_type_mask)
 		return 0;
 
-	list_for_each_entry(vendor_ie, &mors_vif->vendor_ie.ie_list, list) {
+	vie_config = mors_vif->vendor_ie.vie_config;
+	if (!vie_config)
+		return 0;
+
+	list_for_each_entry(vendor_ie, &vie_config->ie_list, list) {
 		if (vendor_ie->mgmt_type_mask & mgmt_type_mask) {
 			vendor_ie_length += sizeof(vendor_ie->ie.element_id);
 			vendor_ie_length += sizeof(vendor_ie->ie.len);
@@ -326,11 +392,16 @@ int morse_vendor_ie_add_ies(struct morse_vif *mors_vif,
 {
 	struct vendor_ie_list_item *item;
 	struct ie_element *element;
+	struct morse_vendor_ie *vie_config;
 
 	if (!mors_vif || !mgmt_type_mask || !ies_mask)
 		return 0;
 
-	list_for_each_entry(item, &mors_vif->vendor_ie.ie_list, list) {
+	vie_config = mors_vif->vendor_ie.vie_config;
+	if (!vie_config)
+		return 0;
+
+	list_for_each_entry(item, &vie_config->ie_list, list) {
 		if (item->mgmt_type_mask & mgmt_type_mask) {
 			element = morse_dot11_ies_create_ie_element(ies_mask,
 								    WLAN_EID_VENDOR_SPECIFIC,
@@ -355,12 +426,13 @@ void morse_vendor_ie_process_rx_mgmt(struct ieee80211_vif *vif, const struct sk_
 	const u8 *elements;
 	u16 elem_len;
 
-	if (list_empty(&mors_vif->vendor_ie.oui_filter_list))
+	if (!wdev || !mors_vif->vendor_ie.vie_config ||
+	    list_empty(&mors_vif->vendor_ie.vie_config->oui_filter_list))
 		return;
 
 	if (ieee80211_is_s1g_beacon(mgmt->frame_control)) {
 		type = MORSE_VENDOR_IE_TYPE_BEACON;
-		elements = get_elements_from_s1g_beacon((struct ieee80211_ext *)mgmt);
+		elements = morse_dot11_find_s1g_beacon_ies((struct ieee80211_ext *)mgmt);
 	} else if (ieee80211_is_probe_req(mgmt->frame_control)) {
 		type = MORSE_VENDOR_IE_TYPE_PROBE_REQ;
 		elements = mgmt->u.probe_req.variable;

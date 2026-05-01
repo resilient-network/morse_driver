@@ -23,6 +23,9 @@
 /** As per IEEE-802.11-2020 Table 9-155, default TXOP for S1G is 15.008 msecs */
 #define S1G_WMM_DEFAULT_TXOP_USECS	(15008)
 
+/** The maximum theoretical air time of an S1G MPDU in usecs as per ieee802.11-2020 Table 23-40 */
+#define S1G_MAX_PACKET_AIR_TIME_USECS	(27920)
+
 /* EDCA IE and access category parameters */
 struct __ieee80211_edca_ac_rec {
 	u8 aifsn;
@@ -216,16 +219,6 @@ static inline bool ieee80211_next_tbtt_present(__le16 fc)
 	       fc & cpu_to_le16(IEEE80211_S1G_BCN_NEXT_TBTT);
 }
 
-/**
- * ieee80211_is_s1g_short_beacon - check if next tbtt present bit is set. Only
- * true for S1G beacons when they're short.
- * @fc: frame control bytes in little-endian byteorder
- */
-static inline bool ieee80211_is_s1g_short_beacon(__le16 fc)
-{
-	return ieee80211_is_s1g_beacon(fc) && ieee80211_next_tbtt_present(fc);
-}
-
 #endif
 
 #if KERNEL_VERSION(4, 12, 0) > MAC80211_VERSION_CODE
@@ -286,14 +279,5 @@ void morse_unii4_band_chan_to_op_class(struct cfg80211_chan_def *chandef, u8 *op
  * flag to check if it's a short beacon. For now we will use below function.
  */
 #define IEEE80211_FCTL_COMPR_SSID	0x0200
-/**
- * ieee80211_is_s1g_short_beacon_local - check if type is S1G Beacon is short beacon
- * @fc: frame control bytes in little-endian byteorder
- */
-static inline int ieee80211_is_s1g_short_beacon_local(__le16 fc)
-{
-	return (ieee80211_is_s1g_beacon(fc) &&
-		((fc & cpu_to_le16(IEEE80211_FCTL_COMPR_SSID)) != 0));
-}
 
 #endif  /* !_IEEE80211_H_ */

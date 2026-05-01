@@ -21,6 +21,8 @@
 #include "ipmon.h"
 #include "wiphy.h"
 #include "bus.h"
+#include "trace.h"
+#include "ps.h"
 
 /* Enable/Disable avoid buffer bloating */
 static uint max_txq_len __read_mostly = 32;
@@ -251,6 +253,7 @@ static struct morse_skbq *__morse_skbq_match_tx_status_to_skbq(struct morse *mor
 	switch (tx_sts->channel) {
 	case MORSE_SKB_CHAN_DATA:
 	case MORSE_SKB_CHAN_DATA_NOACK:
+	case MORSE_SKB_CHAN_WIPHY:
 	case MORSE_SKB_CHAN_LOOPBACK:{
 			int aci = dot11_tid_to_ac(tx_sts->tid);
 
@@ -278,10 +281,21 @@ static void morse_skbq_skb_finish_fullmac(struct morse_skbq *mq, struct sk_buff 
 	struct morse_vif *mors_vif = morse_wiphy_get_sta_vif(mors);
 	struct wireless_dev *wdev = &mors_vif->wdev;
 	u32 cookie = le32_to_cpu(tx_sts->pkt_id);
+	bool acked = !(le32_to_cpu(tx_sts->flags) & MORSE_TX_STATUS_FLAGS_NO_ACK);
 
 	__morse_skbq_unlink(mq, &mq->pending, skb);
 
-	cfg80211_mgmt_tx_status(wdev, cookie, skb->data, skb->len, true, GFP_ATOMIC);
+	switch (tx_sts->channel) {
+	case MORSE_SKB_CHAN_MGMT:
+		cfg80211_mgmt_tx_status(wdev, cookie, skb->data, skb->len, acked, GFP_ATOMIC);
+		break;
+	case MORSE_SKB_CHAN_WIPHY:
+		/* No extra handling required. */
+		break;
+	default:
+		MORSE_WARN_ON_ONCE(FEATURE_ID_DEFAULT, 1);
+	}
+
 	morse_mac_skb_free(mors, skb);
 }
 
@@ -475,10 +489,9 @@ static void morse_skbq_tx_status_process(struct morse *mors, struct sk_buff *skb
 		spin_unlock_bh(&mq->lock);
 	}
 
-	if (mors->ps.enable &&
-	    !mors->ps.suspended && (mors->cfg->ops->skbq_get_tx_buffered_count(mors) == 0)) {
-		/* Evaluate ps to check if it was gated on a pending tx status */
-		queue_delayed_work(mors->chip_wq, &mors->ps.delayed_eval_work, 0);
+	if (mors->cfg->ops->skbq_get_tx_buffered_count(mors) == 0) {
+		/* Evaluate ps to check if it was gated on a stale tx status */
+		morse_ps_queue_eval(mors);
 	}
 }
 
@@ -528,6 +541,8 @@ static void morse_skbq_dispatch_work(struct work_struct *dispatch_work)
 			morse_mac_skb_recv(mors, pfirst, &hdr->rx_status);
 			break;
 		}
+
+		trace_rx_processed(channel);
 	}
 
 	/* rerun recv in case skbq was full and we couldn't copy data */
@@ -701,27 +716,6 @@ void morse_skbq_show(const struct morse_skbq *mq, struct seq_file *file)
 		   mq->skbq.qlen, mq->skbq_size, mq->pending.qlen);
 }
 
-void morse_skbq_stop_tx_queues(struct morse *mors)
-{
-	int queue;
-
-	if (!mors->started)
-		return;
-
-	if (is_fullmac_mode())
-		return;
-
-	/* Wake/Stop mac80211 queues is not needed when using pull interface */
-	if (mors->custom_configs.enable_airtime_fairness)
-		return;
-
-	mors->debug.page_stats.queue_stop++;
-	for (queue = IEEE80211_AC_VO; queue <= IEEE80211_AC_BK; queue++)
-		ieee80211_stop_queue(mors->hw, queue);
-
-	set_bit(MORSE_STATE_FLAG_DATA_QS_STOPPED, &mors->state_flags);
-}
-
 /*
  * Wake all Tx queues if all queues are below threshold
  */
@@ -731,16 +725,6 @@ void morse_skbq_may_wake_tx_queues(struct morse *mors)
 	struct morse_skbq *qs;
 	int num_qs;
 	bool could_wake;
-
-	if (!mors->started)
-		return;
-
-	if (is_fullmac_mode())
-		return;
-
-	/* Wake/Stop mac80211 queues is not needed when using pull interface */
-	if (mors->custom_configs.enable_airtime_fairness)
-		return;
 
 	could_wake = true;
 	mors->cfg->ops->skbq_get_tx_qs(mors, &qs, &num_qs);
@@ -758,10 +742,10 @@ void morse_skbq_may_wake_tx_queues(struct morse *mors)
 	if (!could_wake)
 		return;
 
-	for (queue = IEEE80211_AC_VO; queue <= IEEE80211_AC_BK; queue++)
-		ieee80211_wake_queue(mors->hw, queue);
-
-	clear_bit(MORSE_STATE_FLAG_DATA_QS_STOPPED, &mors->state_flags);
+	if (is_fullmac_mode())
+		morse_wiphy_wake_tx_queues(mors);
+	else
+		morse_mac_wake_tx_queues(mors);
 }
 
 static int morse_skbq_tx(struct morse_skbq *mq, struct sk_buff *skb, u8 channel)
@@ -791,7 +775,9 @@ static int morse_skbq_tx(struct morse_skbq *mq, struct sk_buff *skb, u8 channel)
 
 	/* For data packets stop queues */
 	if (channel == MORSE_SKB_CHAN_DATA && mq_over_threshold)
-		morse_skbq_stop_tx_queues(mors);
+		morse_mac_stop_tx_queues(mors);
+	if (channel == MORSE_SKB_CHAN_WIPHY && mq_over_threshold)
+		morse_wiphy_stop_tx_queues(mors);
 
 #ifdef CONFIG_MORSE_IPMON
 	{
@@ -906,9 +892,14 @@ int morse_skbq_tx_complete(struct morse_skbq *mq, struct sk_buff_head *skbq)
 			morse_mac_ecsa_beacon_tx_done(mors, pfirst);
 			fallthrough;
 		case MORSE_SKB_CHAN_LOOPBACK:
-		case MORSE_SKB_CHAN_WIPHY:
 			dev_kfree_skb_any(pfirst);
 			break;
+		case MORSE_SKB_CHAN_WIPHY:
+			if (!(mors->firmware_flags & MORSE_FW_FLAGS_SUPPORT_FULLMAC_REPORT)) {
+				dev_kfree_skb_any(pfirst);
+				break;
+			}
+			fallthrough;
 		default:
 			if (le32_to_cpu(hdr->tx_info.flags) & MORSE_TX_STATUS_FLAGS_NO_REPORT) {
 				dev_kfree_skb_any(pfirst);
@@ -1228,8 +1219,6 @@ static void morse_skbq_tx_status_fill(struct morse *mors,
 		txi->status.ampdu_len = 1;
 		txi->status.ampdu_ack_len = txi->flags & IEEE80211_TX_STAT_ACK ? 1 : 0;
 	}
-
-	MORSE_IEEE80211_TX_STATUS(mors->hw, skb);
 }
 #endif /* CONFIG_MORSE_RC */
 
@@ -1272,12 +1261,13 @@ static int __skbq_data_tx_finish(struct morse_skbq *mq, struct sk_buff *skb,
 			sta = ieee80211_find_sta(vif, hdr->addr1);
 
 		morse_mac_process_tx_finish(mors, skb);
-		morse_bss_stats_update_tx(vif, skb, sta, tx_sts, tx_attempts);
 #ifdef CONFIG_MORSE_RC
 		morse_rc_sta_feedback_rates(mors, skb, sta, tx_sts, tx_attempts);
 #else
 		morse_skbq_tx_status_fill(mors, skb, tx_sts);
 #endif
+		morse_bss_stats_update_tx(vif, skb, sta, tx_sts, tx_attempts);
+		MORSE_IEEE80211_TX_STATUS(mors->hw, skb);
 		rcu_read_unlock();
 	}
 
@@ -1440,9 +1430,14 @@ int morse_skbq_skb_tx(struct morse_skbq *mq, struct sk_buff **skb_orig,
 
 	mors = mq->mors;
 
-	if (test_bit(MORSE_STATE_FLAG_CHIP_UNRESPONSIVE, &mors->state_flags)) {
+	if (!morse_hw_is_on(mors)) {
 		dev_kfree_skb_any(skb);
 		return -ENODEV;
+	}
+
+	if (!morse_hw_headless_is_off(mors)) {
+		dev_kfree_skb_any(skb);
+		return -EPERM;
 	}
 
 	if (channel == MORSE_SKB_CHAN_COMMAND) {

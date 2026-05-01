@@ -8,15 +8,12 @@
 #define _MORSE_CHIP_IF_H_
 
 #include "pageset.h"
-#include "pager_if_hw.h"
-#include "pager_if_sw.h"
+#include "pager_hw.h"
 #include "yaps.h"
-#include "yaps-hw.h"
+#include "yaps_hw.h"
 
-/** Chip IF interrupt mask. We may use any interrupts in this range */
-#define MORSE_CHIP_IF_IRQ_MASK_ALL	(GENMASK(13, 0) | \
-			MORSE_PAGER_IRQ_BYPASS_TX_STATUS_AVAILABLE | \
-			MORSE_PAGER_IRQ_BYPASS_CMD_RESP_AVAILABLE)
+#define MORSE_PAGER_BYPASS_TX_STATUS_FIFO_DEPTH (4)
+#define MORSE_PAGER_BYPASS_CMD_RESP_FIFO_DEPTH (2)
 
 enum morse_chip_if_flags {
 	MORSE_CHIP_IF_FLAGS_DIR_TO_HOST = BIT(0),
@@ -80,11 +77,32 @@ struct chip_if_ops {
 	void (*flush_cmds)(struct morse *mors);
 
 	/**
+	 * Flush all buffers that may have been cached in the chip interface.
+	 *
+	 * @mors: Morse chip struct
+	 */
+	void (*flush_cache)(struct morse *mors);
+
+	/**
 	 * Cleans up chip interface.
 	 *
 	 * @mors: Morse chip struct
 	 */
 	void (*finish)(struct morse *mors);
+
+	/**
+	 * Prepare chip interface for Linux host suspend
+	 *
+	 * @mors: Morse chip struct
+	 */
+	void (*suspend)(struct morse *mors);
+
+	/**
+	 * Linux host has resumed from suspend. Pair with @ref suspend
+	 *
+	 * @mors: Morse chip struct
+	 */
+	void (*resume)(struct morse *mors);
 
 	/**
 	 * Gets a pointer to the tx queue array and the number of items in the array.
@@ -180,6 +198,7 @@ struct morse_chip_if_state {
 				} cmd_resp;
 			} bypass;
 			struct morse_pager_pkt_memory pkt_memory;
+			u32 headless_cfg_addr;
 		};
 		struct {
 			struct morse_yaps *yaps;
@@ -191,16 +210,8 @@ struct morse_chip_if_state {
 };
 
 struct morse_chip_if_host_table {
-	union {
-		struct {
-			u32 rb_count;
-			struct morse_pager_sw_table rb_table[];
-		} __packed;
-		struct {
-			u32 pager_count;
-			struct morse_pager_hw_entry pager_table[];
-		} __packed;
-	};
+	u32 pager_count;
+	struct morse_pager_hw_entry pager_table[];
 } __packed;
 
 #endif /* !_MORSE_CHIP_IF_H_ */

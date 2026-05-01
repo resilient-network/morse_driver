@@ -52,6 +52,7 @@ static const u8 morse_ext_s1g_beacon_ies_order[] = {
 		WLAN_EID_BEACON_TIMING,
 		WLAN_EID_CHAN_SWITCH_PARAM,
 		WLAN_EID_CHANNEL_SWITCH_WRAPPER,
+		WLAN_EID_RSNX,
 		WLAN_EID_EXTENSION,
 		WLAN_EID_VENDOR_SPECIFIC,
 };
@@ -63,6 +64,8 @@ static const u8 morse_ext_s1g_short_beacon_ies_order[] = {
 		WLAN_EID_SUBCHANNEL_SELECTIVE_TRANSMISSION,
 		WLAN_EID_S1G_RELAY,
 		WLAN_EID_SSID,
+		WLAN_EID_RSN,
+		WLAN_EID_RSNX,
 };
 
 /* For probe request the next are not allowed for S1G:
@@ -436,6 +439,24 @@ int morse_dot11ah_parse_ies(u8 *start, size_t len, struct dot11ah_ies_mask *ies_
 }
 EXPORT_SYMBOL(morse_dot11ah_parse_ies);
 
+u8 *morse_dot11_find_s1g_beacon_ies(struct ieee80211_ext *s1g_beacon)
+{
+	u8 *s1g_ies = s1g_beacon->u.s1g_beacon.variable;
+	u16 fc = le16_to_cpu(s1g_beacon->frame_control);
+
+	if (fc & IEEE80211_FC_NEXT_TBTT)
+		s1g_ies += IEEE80211_NEXT_TBTT_SIZE;
+
+	if (fc & IEEE80211_FC_COMPRESS_SSID)
+		s1g_ies += IEEE80211_COMPRESS_SSID_SIZE;
+
+	if (fc & IEEE80211_FC_ANO)
+		s1g_ies += IEEE80211_ANO_SIZE;
+
+	return s1g_ies;
+}
+EXPORT_SYMBOL(morse_dot11_find_s1g_beacon_ies);
+
 const u8 *morse_dot11_find_ie(u8 eid, const u8 *ies, int length)
 {
 	return cfg80211_find_ie(eid, ies, length);
@@ -505,11 +526,14 @@ void morse_dot11ah_mask_ies(struct dot11ah_ies_mask *ies_mask, bool mask_ext_cap
 
 	if (is_beacon) {
 		 /* Remove extra elements to minimise DTIM current draw */
-		morse_dot11_clear_eid_from_ies_mask(ies_mask, WLAN_EID_RSN);
-		morse_dot11_clear_eid_from_ies_mask(ies_mask, WLAN_EID_RSNX);
 		morse_dot11_clear_eid_from_ies_mask(ies_mask,
 						    WLAN_EID_SUPPORTED_REGULATORY_CLASSES);
 	}
+}
+
+static bool is_s1g_beacon_a_short_beacon(struct dot11ah_ies_mask *ies_mask)
+{
+	return !ies_mask->ies[WLAN_EID_S1G_BCN_COMPAT].ptr;
 }
 
 int morse_dot11_insert_ordered_ies_from_ies_mask(struct sk_buff *skb, u8 *pos,
@@ -522,15 +546,16 @@ int morse_dot11_insert_ordered_ies_from_ies_mask(struct sk_buff *skb, u8 *pos,
 	u8 ies_order_table_len = 0;
 	int ies_len = 0;
 	int ampe_len = 0;
+	bool is_beacon = ieee80211_is_s1g_beacon(frame_control);
 
 	if (!ies_mask)
 		return 0;
 
-	if (ieee80211_is_s1g_short_beacon(frame_control) ||
-	    (le16_to_cpu(frame_control) & IEEE80211_FC_COMPRESS_SSID)) {
+	if ((is_beacon && is_s1g_beacon_a_short_beacon(ies_mask)) ||
+	    le16_to_cpu(frame_control) & IEEE80211_FC_COMPRESS_SSID) {
 		ies_order_table = morse_ext_s1g_short_beacon_ies_order;
 		ies_order_table_len = ARRAY_SIZE(morse_ext_s1g_short_beacon_ies_order);
-	} else if (ieee80211_is_s1g_beacon(frame_control)) {
+	} else if (is_beacon) {
 		ies_order_table = morse_ext_s1g_beacon_ies_order;
 		ies_order_table_len = ARRAY_SIZE(morse_ext_s1g_beacon_ies_order);
 	} else if (ieee80211_is_probe_req(frame_control)) {

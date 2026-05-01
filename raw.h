@@ -15,6 +15,7 @@
 #define MAX_NUM_RAWS				(MAX_NUM_RAWS_USER_PRIO + MAX_NUM_RAWS_INTERNAL)
 #define RAW_INTERNAL_ID_OFFSET			(0x8000)
 #define MORSE_RAW_DEFAULT_START_AID		(1)
+#define MORSE_OCS_RAW_IDX			(RAW_INTERNAL_ID_OFFSET + 1)
 
 /* AID mask used for creating the RAW priority groups */
 #define MORSE_RAW_AID_PRIO_MASK			GENMASK(10, 8)
@@ -282,7 +283,7 @@ struct morse_raw {
 	/** An ordered list of AIDs, for use in generating the RPS IE */
 	struct morse_aid_list *aid_list;
 	/** All RAW configs */
-	struct list_head raw_config_list;
+	struct list_head *config_list;
 	/** List for active PRAWs */
 	struct list_head active_praws;
 	/** List for active non-PRAWs */
@@ -438,13 +439,14 @@ void morse_raw_beacon_sent(struct morse_vif *mors_vif);
  *
  * Return: 0 - OK
  */
-int morse_raw_init(struct morse_vif *mors_vif, bool enable);
+int morse_raw_init(struct morse_vif *mors_vif);
 
 /**
  * morse_raw_finish() - Clean up RAW on finish.
  * @mors_vif: Morse VIF structure
+ * @is_restarting: The HW is restarting
  */
-void morse_raw_finish(struct morse_vif *mors_vif);
+void morse_raw_finish(struct morse_vif *mors_vif, bool is_restarting);
 
 /**
  * morse_dynamic_raw_init() - Clean up dynamic RAW and reinitialize.
@@ -475,5 +477,28 @@ void morse_raw_deactivate_config(struct morse_raw *raw, struct morse_raw_config 
  * Return: true if the config is active, otherwise false
  */
 bool morse_raw_is_config_active(struct morse_raw_config *cfg);
+
+/**
+ * morse_raw_config_list_init() - Initialize RAW config list per VIF
+ *
+ * @mors: Global Morse structure
+ */
+void morse_raw_config_list_init(struct morse *mors);
+
+/**
+ * morse_raw_reconfig() - Restore the RAW config from persistent config entry
+ *
+ * @mors: Global Morse structure
+ * @mors_vif: Morse VIF
+ */
+void morse_raw_reconfig(struct morse *mors, struct morse_vif *mors_vif);
+
+/**
+ * morse_raw_config_list_delete() - Delete the RAW config list
+ *
+ * @morse_vif_conf: Pointer to the global morse VIF conf
+ * @vif: mac80211 VIF
+ */
+void morse_raw_config_list_delete(void *morse_vif_conf, struct ieee80211_vif *vif);
 
 #endif

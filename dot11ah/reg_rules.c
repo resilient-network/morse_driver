@@ -11,7 +11,7 @@
 #define _MRR MORSE_REG_RULE
 #define _MRR_KHZ MORSE_REG_RULE_KHZ
 
-struct morse_reg_rule au_reg_rules[] = {
+struct morse_reg_rule au_2020_reg_rules[] = {
 	/* S1G Actual Frequencies */
 	_MRR(915, 916, 1, 0, 30, AUTO_BW, 10000, 10000, false, 0, 0, 0),
 	_MRR(916, 920, 4, 0, 30, AUTO_BW, 10000, 10000, false, 0, 0, 0),
@@ -23,10 +23,47 @@ struct morse_reg_rule au_reg_rules[] = {
 	_MRR(5735, 5895, 160, 0, 30, AUTO_BW, 10000, 10000, false, 0, 0, 0),
 };
 
+static struct morse_regdomain mors_au_2020_regdom = {
+	.n_reg_rules = ARRAY_SIZE(au_2020_reg_rules),
+	.alpha2 = CHANNEL_ALPHA_AU,
+	.reg_rules = au_2020_reg_rules,
+	.channelization_scheme = CHANNELIZATION_SCHEME_IEEE80211_2020
+};
+
+struct morse_reg_rule au_reg_rules[] = {
+	/* S1G Actual Frequencies */
+	_MRR_KHZ(915500, 923500, 8000, 0, 30, AUTO_BW, 10000, 10000, false, 0, 0, 0),
+	_MRR_KHZ(917500, 925500, 8000, 0, 30, AUTO_BW, 10000, 10000, false, 0, 0, 0),
+	_MRR_KHZ(919500, 927500, 8000, 0, 30, AUTO_BW, 10000, 10000, false, 0, 0, 0),
+
+	/* S1G->11ac Mapped Frequencies */
+	_MRR(5170, 5330, 160, 0, 30, AUTO_BW, 10000, 10000, false, 0, 0, 0),
+	_MRR(5735, 5895, 160, 0, 30, AUTO_BW, 10000, 10000, false, 0, 0, 0),
+	_MRR(5490, 5650, 160, 0, 30, AUTO_BW, 10000, 10000, false, 0, 0, 0),
+};
+
 static struct morse_regdomain mors_au_regdom = {
 	.n_reg_rules = ARRAY_SIZE(au_reg_rules),
 	.alpha2 = CHANNEL_ALPHA_AU,
-	.reg_rules = au_reg_rules
+	.reg_rules = au_reg_rules,
+	.channelization_scheme = CHANNELIZATION_SCHEME_IEEE80211_REVMF
+};
+
+struct morse_reg_rule au_2024_reg_rules[] = {
+	/* S1G Actual Frequencies */
+	_MRR_KHZ(915500, 923500, 8000, 0, 30, AUTO_BW, 10000, 10000, false, 0, 0, 0),
+	_MRR_KHZ(919500, 927500, 8000, 0, 30, AUTO_BW, 10000, 10000, false, 0, 0, 0),
+
+	/* S1G->11ac Mapped Frequencies */
+	_MRR(5170, 5330, 160, 0, 30, AUTO_BW, 10000, 10000, false, 0, 0, 0),
+	_MRR(5490, 5650, 160, 0, 30, AUTO_BW, 10000, 10000, false, 0, 0, 0),
+};
+
+static struct morse_regdomain mors_au_2024_regdom = {
+	.n_reg_rules = ARRAY_SIZE(au_2024_reg_rules),
+	.alpha2 = CHANNEL_ALPHA_AU,
+	.reg_rules = au_2024_reg_rules,
+	.channelization_scheme = CHANNELIZATION_SCHEME_IEEE80211_2024
 };
 
 struct morse_reg_rule ca_reg_rules[] = {
@@ -46,45 +83,48 @@ struct morse_reg_rule ca_reg_rules[] = {
 static struct morse_regdomain mors_ca_regdom = {
 	.n_reg_rules = ARRAY_SIZE(ca_reg_rules),
 	.alpha2 = CHANNEL_ALPHA_CA,
-	.reg_rules = ca_reg_rules
+	.reg_rules = ca_reg_rules,
+	.channelization_scheme = CHANNELIZATION_SCHEME_NONE
 };
 
 struct morse_reg_rule eu_reg_rules[] = {
 	/* S1G Actual Frequencies */
-	_MRR(867, 868, 1, 0, 16, AUTO_BW, 10000, 10000, false, 0, 0, 0),
-	_MRR(863, 865, 2, 0, 16, AUTO_BW, 10000, 10000, false, 0, 0, 0),
-	_MRR(865, 867, 2, 0, 16, AUTO_BW, 10000, 10000, false, 0, 0, 0),
+	_MRR(867, 868, 1, 0, 16, AUTO_BW,  1000,   280, false, 0, 0, 0),
+	_MRR(863, 865, 2, 0, 16, AUTO_BW,  1000,   280, false, 0, 0, 0),
+	_MRR(865, 867, 2, 0, 16, AUTO_BW,  1000,   280, false, 0, 0, 0),
 
 	/* S1G->11ac Mapped Frequencies */
-	_MRR(5210, 5230,  20, 0, 16, AUTO_BW, 10000, 10000, false, 0, 0, 0),
-	_MRR(5650, 5690,  40, 0, 16, AUTO_BW, 10000, 10000, false, 0, 0, 0),
-	_MRR(5170, 5210,  40, 0, 16, AUTO_BW, 10000, 10000, false, 0, 0, 0),
+	_MRR(5210, 5230,  20, 0, 16, AUTO_BW,  1000,   280, false, 0, 0, 0),
+	_MRR(5650, 5690,  40, 0, 16, AUTO_BW,  1000,   280, false, 0, 0, 0),
+	_MRR(5170, 5210,  40, 0, 16, AUTO_BW,  1000,   280, false, 0, 0, 0),
 };
 
 static struct morse_regdomain mors_eu_regdom = {
 	.n_reg_rules = ARRAY_SIZE(eu_reg_rules),
 	.alpha2 = CHANNEL_ALPHA_EU,
-	.reg_rules = eu_reg_rules
+	.reg_rules = eu_reg_rules,
+	.channelization_scheme = CHANNELIZATION_SCHEME_NONE
 };
 
 struct morse_reg_rule gb_reg_rules[] = {
 	/* S1G Actual Frequencies */
-	_MRR(867, 868, 1, 0, 16, AUTO_BW, 10000, 10000, false, 0, 0, 0),
+	_MRR(867, 868, 1, 0, 16, AUTO_BW,  1000,   280, false, 0, 0, 0),
 	_MRR_KHZ(917400, 919400, 1000, 0, 16, AUTO_BW,  1000,   280, false, 0, 0, 0),
-	_MRR(863, 865, 2, 0, 16, AUTO_BW, 10000, 10000, false, 0, 0, 0),
-	_MRR(865, 867, 2, 0, 16, AUTO_BW, 10000, 10000, false, 0, 0, 0),
+	_MRR(863, 865, 2, 0, 16, AUTO_BW,  1000,   280, false, 0, 0, 0),
+	_MRR(865, 867, 2, 0, 16, AUTO_BW,  1000,   280, false, 0, 0, 0),
 
 	/* S1G->11ac Mapped Frequencies */
-	_MRR(5210, 5230,  20, 0, 16, AUTO_BW, 10000, 10000, false, 0, 0, 0),
+	_MRR(5210, 5230,  20, 0, 16, AUTO_BW,  1000,   280, false, 0, 0, 0),
 	_MRR(5610, 5650,  20, 0, 16, AUTO_BW,  1000,   280, false, 0, 0, 0),
-	_MRR(5650, 5690,  40, 0, 16, AUTO_BW, 10000, 10000, false, 0, 0, 0),
-	_MRR(5170, 5210,  40, 0, 16, AUTO_BW, 10000, 10000, false, 0, 0, 0),
+	_MRR(5650, 5690,  40, 0, 16, AUTO_BW,  1000,   280, false, 0, 0, 0),
+	_MRR(5170, 5210,  40, 0, 16, AUTO_BW,  1000,   280, false, 0, 0, 0),
 };
 
 static struct morse_regdomain mors_gb_regdom = {
 	.n_reg_rules = ARRAY_SIZE(gb_reg_rules),
 	.alpha2 = CHANNEL_ALPHA_GB,
-	.reg_rules = gb_reg_rules
+	.reg_rules = gb_reg_rules,
+	.channelization_scheme = CHANNELIZATION_SCHEME_NONE
 };
 
 struct morse_reg_rule in_reg_rules[] = {
@@ -98,7 +138,8 @@ struct morse_reg_rule in_reg_rules[] = {
 static struct morse_regdomain mors_in_regdom = {
 	.n_reg_rules = ARRAY_SIZE(in_reg_rules),
 	.alpha2 = CHANNEL_ALPHA_IN,
-	.reg_rules = in_reg_rules
+	.reg_rules = in_reg_rules,
+	.channelization_scheme = CHANNELIZATION_SCHEME_NONE
 };
 
 struct morse_reg_rule jp_reg_rules[] = {
@@ -116,7 +157,8 @@ struct morse_reg_rule jp_reg_rules[] = {
 static struct morse_regdomain mors_jp_regdom = {
 	.n_reg_rules = ARRAY_SIZE(jp_reg_rules),
 	.alpha2 = CHANNEL_ALPHA_JP,
-	.reg_rules = jp_reg_rules
+	.reg_rules = jp_reg_rules,
+	.channelization_scheme = CHANNELIZATION_SCHEME_NONE
 };
 
 struct morse_reg_rule kr_reg_rules[] = {
@@ -124,23 +166,22 @@ struct morse_reg_rule kr_reg_rules[] = {
 	_MRR(926, 927, 1, 0, 17, AUTO_BW, 10000, 10000, false, 0, 220000, 264),
 	_MRR_KHZ(917500, 919500, 2000, 0,  4, AUTO_BW, 10000, 10000, false, 0, 4000000, 50000),
 	_MRR_KHZ(921500, 923500, 2000, 0, 10, AUTO_BW, 10000, 10000, false, 0, 4000000, 50000),
-	_MRR(926, 928, 2, 0, 20, AUTO_BW, 10000, 10000, false, 0, 220000, 264),
-	_MRR(928, 930, 2, 0, 20, AUTO_BW, 10000, 10000, false, 0, 220000, 264),
+	_MRR(926, 930, 2, 0, 20, AUTO_BW, 10000, 10000, false, 0, 220000, 264),
 	_MRR_KHZ(919500, 923500, 4000, 0,  4, AUTO_BW, 10000, 10000, false, 0, 4000000, 50000),
 
 	/* S1G->11ac Mapped Frequencies */
-	_MRR(5300, 5320,  20, 0, 17, AUTO_BW, 10000, 10000, false, 0, 220000, 264),
+	_MRR(5815, 5835,  20, 0, 17, AUTO_BW, 10000, 10000, false, 0, 220000, 264),
 	_MRR(5650, 5690,  40, 0,  4, AUTO_BW, 10000, 10000, false, 0, 4000000, 50000),
 	_MRR(5210, 5250,  40, 0, 10, AUTO_BW, 10000, 10000, false, 0, 4000000, 50000),
-	_MRR(5300, 5340,  40, 0, 20, AUTO_BW, 10000, 10000, false, 0, 220000, 264),
-	_MRR(5500, 5540,  40, 0, 20, AUTO_BW, 10000, 10000, false, 0, 220000, 264),
+	_MRR(5815, 5895,  40, 0, 20, AUTO_BW, 10000, 10000, false, 0, 220000, 264),
 	_MRR(5170, 5250,  80, 0,  4, AUTO_BW, 10000, 10000, false, 0, 4000000, 50000),
 };
 
 static struct morse_regdomain mors_kr_regdom = {
 	.n_reg_rules = ARRAY_SIZE(kr_reg_rules),
 	.alpha2 = CHANNEL_ALPHA_KR,
-	.reg_rules = kr_reg_rules
+	.reg_rules = kr_reg_rules,
+	.channelization_scheme = CHANNELIZATION_SCHEME_NONE
 };
 
 struct morse_reg_rule nz_reg_rules[] = {
@@ -158,7 +199,8 @@ struct morse_reg_rule nz_reg_rules[] = {
 static struct morse_regdomain mors_nz_regdom = {
 	.n_reg_rules = ARRAY_SIZE(nz_reg_rules),
 	.alpha2 = CHANNEL_ALPHA_NZ,
-	.reg_rules = nz_reg_rules
+	.reg_rules = nz_reg_rules,
+	.channelization_scheme = CHANNELIZATION_SCHEME_NONE
 };
 
 struct morse_reg_rule sg_reg_rules[] = {
@@ -176,7 +218,8 @@ struct morse_reg_rule sg_reg_rules[] = {
 static struct morse_regdomain mors_sg_regdom = {
 	.n_reg_rules = ARRAY_SIZE(sg_reg_rules),
 	.alpha2 = CHANNEL_ALPHA_SG,
-	.reg_rules = sg_reg_rules
+	.reg_rules = sg_reg_rules,
+	.channelization_scheme = CHANNELIZATION_SCHEME_NONE
 };
 
 struct morse_reg_rule us_reg_rules[] = {
@@ -196,11 +239,14 @@ struct morse_reg_rule us_reg_rules[] = {
 static struct morse_regdomain mors_us_regdom = {
 	.n_reg_rules = ARRAY_SIZE(us_reg_rules),
 	.alpha2 = CHANNEL_ALPHA_US,
-	.reg_rules = us_reg_rules
+	.reg_rules = us_reg_rules,
+	.channelization_scheme = CHANNELIZATION_SCHEME_NONE
 };
 
 static struct morse_regdomain *mors_regions[] = {
+	&mors_au_2020_regdom,
 	&mors_au_regdom,
+	&mors_au_2024_regdom,
 	&mors_ca_regdom,
 	&mors_eu_regdom,
 	&mors_gb_regdom,
@@ -212,14 +258,47 @@ static struct morse_regdomain *mors_regions[] = {
 	&mors_us_regdom,
 };
 
-const struct morse_regdomain *morse_reg_alpha_lookup(const char *alpha)
+/* Countries with multiple channelization */
+const char *mors_multi_channelization_countries[] = {
+	CHANNEL_ALPHA_AU,
+};
+
+bool morse_dot11ah_is_multi_channelization_country(const char *alpha)
+{
+	size_t i;
+
+	for (i = 0; i < ARRAY_SIZE(mors_multi_channelization_countries); i++) {
+		const char *cc = mors_multi_channelization_countries[i];
+
+		if (!strncmp(cc, alpha, 2))
+			return true;
+	}
+	return false;
+}
+
+const struct morse_regdomain *morse_reg_alpha_lookup(const char *alpha, u32 channelization_scheme)
 {
 	int i;
 
 	if (!alpha)
 		return NULL;
-	for (i = 0; i < ARRAY_SIZE(mors_regions); i++)
-		if (!strncmp(mors_regions[i]->alpha2, alpha, strlen(alpha)))
-			return mors_regions[i];
+
+	for (i = 0; i < ARRAY_SIZE(mors_regions); i++) {
+		const struct morse_regdomain *regdom = mors_regions[i];
+
+		if (strncmp(regdom->alpha2, alpha, strlen(alpha)))
+			continue;
+
+		/*
+		 * Enforce channelization scheme only for countries that have
+		 * multiple channelization. For all others, ignore the
+		 * scheme and return the first alpha match.
+		 */
+		if (morse_dot11ah_is_multi_channelization_country(alpha) &&
+		    regdom->channelization_scheme != channelization_scheme)
+			continue;
+
+		return regdom;
+	}
 	return NULL;
 }

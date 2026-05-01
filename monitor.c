@@ -200,6 +200,7 @@ void morse_mon_rx(struct morse *mors, struct sk_buff *rx_skb,
 	enum dot11_bandwidth bw_idx =
 		morse_ratecode_bw_index_get(hdr_rx_status->morse_ratecode);
 	u32 status_flags = le32_to_cpu(hdr_rx_status->flags);
+	bool is_in_ampdu;
 
 	if (status_flags & MORSE_RX_STATUS_FLAGS_NDP) {
 		/* Null Data Packets contain no data, therefore no
@@ -217,6 +218,10 @@ void morse_mon_rx(struct morse *mors, struct sk_buff *rx_skb,
 
 	if (!netif_running(morse_mon))
 		return;
+
+	/* Do not report S-MPDUs as an A-MPDU */
+	is_in_ampdu = (status_flags & MORSE_RX_STATUS_FLAGS_AMPDU) &&
+		      !(status_flags & MORSE_RX_STATUS_FLAGS_EOF);
 
 	/* There are specific radiotap fields we need
 	 * to append to our skb depending on the packet type
@@ -256,7 +261,7 @@ void morse_mon_rx(struct morse *mors, struct sk_buff *rx_skb,
 
 		morse_mon_add_vendor_tlvs(skb, hdr_rx_status);
 
-		if (status_flags & MORSE_RX_STATUS_FLAGS_AMPDU)
+		if (is_in_ampdu)
 			ampdu_hdr = (struct ampdu_header *)skb_push(skb, sizeof(*ampdu_hdr));
 
 		/* Add padding to keep the radiotap alignment.
@@ -346,14 +351,22 @@ void morse_mon_rx(struct morse *mors, struct sk_buff *rx_skb,
 		memset(s1g_info_hdr->__padding, 0, sizeof(s1g_info_hdr->__padding));
 	}
 
-	if (status_flags & MORSE_RX_STATUS_FLAGS_AMPDU) {
+	if (is_in_ampdu) {
+		static __le64 ampdu_ts;
+		static uint reference;
+
+		/* Individual MPDUs in an AMPDUs are reported with the same timestamp,
+		 * use this to group them.
+		 */
+		if (ampdu_ts != hdr_rx_status->rx_timestamp_us) {
+			reference++; /* New A-MPDU */
+			ampdu_ts = hdr_rx_status->rx_timestamp_us;
+		}
+
+		ampdu_hdr->ref_num = cpu_to_le32(reference);
+		ampdu_hdr->flags = 0;
 		hdr->hdr.it_present |= cpu_to_le32(BIT(IEEE80211_RADIOTAP_AMPDU_STATUS));
-		ampdu_hdr->flags = cpu_to_le16(IEEE80211_RADIOTAP_AMPDU_EOF |
-					       IEEE80211_RADIOTAP_AMPDU_LAST_KNOWN |
-					       IEEE80211_RADIOTAP_AMPDU_IS_LAST);
-		ampdu_hdr->ref_num = cpu_to_le32(1);
-		hdr->hdr.it_len =
-			cpu_to_le16(le16_to_cpu(hdr->hdr.it_len) + sizeof(*ampdu_hdr));
+		hdr->hdr.it_len = cpu_to_le16(le16_to_cpu(hdr->hdr.it_len) + sizeof(*ampdu_hdr));
 	}
 
 	hdr->rt_dbm_antsignal = (s8)le16_to_cpu(hdr_rx_status->rssi);

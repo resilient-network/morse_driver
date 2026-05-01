@@ -24,9 +24,6 @@
 
 #define MAX_FW_BIN_FILE_NAME_LEN 30
 
-/* Maximum wait time (milliseconds) for firmware to boot (for host table pointer to be available) */
-#define MAX_WAIT_FOR_HOST_TABLE_PTR_MS 1200
-
 struct fw_init_params {
 	bool download_fw;
 	bool get_host_table_ptr;
@@ -84,7 +81,7 @@ static int get_file_header(const u8 *data, morse_elf_ehdr *ehdr)
 	return 0;
 }
 
-static void morse_parse_firmware_info(struct morse *mors, const u8 *data, int length)
+static void parse_firmware_info(struct morse *mors, const u8 *data, int length)
 {
 	const struct morse_fw_info_tlv *tlv = (const struct morse_fw_info_tlv *)data;
 
@@ -151,6 +148,41 @@ static int morse_set_boot_addr(struct morse *mors, uint32_t addr)
 	status = morse_reg32_write(mors, MORSE_REG_BOOT_ADDR(mors), addr);
 	morse_release_bus(mors);
 	return status;
+}
+
+static int extract_firmware_info(struct morse *mors, const struct firmware *fw)
+{
+	int i;
+	int ret = 0;
+	morse_elf_ehdr ehdr;
+	morse_elf_shdr shdr;
+	morse_elf_shdr sh_strtab;
+	const char *sh_strs;
+
+	if (get_file_header(fw->data, &ehdr) != 0) {
+		MORSE_ERR(mors, "Wrong file format\n");
+		return -1;
+	}
+
+	if (get_section_header(fw->data, &ehdr, &sh_strtab, ehdr.e_shstrndx) != 0) {
+		MORSE_ERR(mors, "Invalid firmware. Missing string table\n");
+		return -1;
+	}
+
+	sh_strs = (const char *)fw->data + sh_strtab.sh_offset;
+
+	for (i = 0; i < ehdr.e_shnum; i++) {
+		if (get_section_header(fw->data, &ehdr, &shdr, i) != 0)
+			continue;
+
+		/* This is the firmware info. Parse it */
+		if (strncmp(sh_strs + shdr.sh_name, ".fw_info", sizeof(".fw_info")) == 0) {
+			parse_firmware_info(mors, fw->data + shdr.sh_offset, shdr.sh_size);
+			break;
+		}
+	}
+
+	return ret;
 }
 
 static int morse_firmware_load(struct morse *mors, const struct firmware *fw)
@@ -224,10 +256,6 @@ static int morse_firmware_load(struct morse *mors, const struct firmware *fw)
 	for (i = 0; i < ehdr.e_shnum; i++) {
 		if (get_section_header(fw->data, &ehdr, &shdr, i) != 0)
 			continue;
-
-		/* This is the firmware info. Parse it */
-		if (strncmp(sh_strs + shdr.sh_name, ".fw_info", sizeof(".fw_info")) == 0)
-			morse_parse_firmware_info(mors, fw->data + shdr.sh_offset, shdr.sh_size);
 
 	}
 
@@ -489,10 +517,12 @@ static int morse_firmware_invalidate_host_ptr(struct morse *mors)
 int morse_firmware_get_host_table_ptr(struct morse *mors)
 {
 	int ret = 0;
+	u32 wait_time_ms = 0;
 	unsigned long timeout;
 
+	wait_time_ms = mors->cfg->get_cold_boot_time_ms(mors->chip_id);
 	/* Otherwise, wait here (polling) for HT Avail */
-	timeout = jiffies + msecs_to_jiffies(MAX_WAIT_FOR_HOST_TABLE_PTR_MS);
+	timeout = jiffies + msecs_to_jiffies(wait_time_ms);
 	morse_claim_bus(mors);
 	while (1) {
 		ret = morse_reg32_read(mors,
@@ -680,6 +710,16 @@ static void update_pager_bypass_cmd_resp_addr(struct morse *mors,
 		   mors->chip_if->bypass.cmd_resp.location);
 }
 
+static void update_headless_config_addr(struct morse *mors,
+					struct extended_host_table_headless_cfg_addr
+					*headless_cfg)
+
+{
+	mors->chip_if->headless_cfg_addr = le32_to_cpu(headless_cfg->headless_cfg_addr);
+	MORSE_DBG(mors, "Headless configuration addr 0x%08x\n",
+		   mors->chip_if->headless_cfg_addr);
+}
+
 static void update_validate_skb_checksum(struct morse *mors,
 					 struct extended_host_table_insert_skb_checksum
 					 *validate_checksum)
@@ -759,6 +799,10 @@ int morse_firmware_parse_extended_host_table(struct morse *mors)
 		case MORSE_FW_HOST_TABLE_TAG_PAGER_BYPASS_CMD_RESP:
 			update_pager_bypass_cmd_resp_addr(mors,
 					(struct extended_host_table_pager_bypass_cmd_resp *)hdr);
+			break;
+		case MORSE_FW_HOST_TABLE_TAG_HEADLESS_CFG_ADDR:
+			update_headless_config_addr(mors,
+					(struct extended_host_table_headless_cfg_addr *)hdr);
 			break;
 
 		default:
@@ -901,7 +945,9 @@ static uint32_t binary_crc(const struct firmware *fw)
 	return ~crc32_le(~0, (unsigned char const *)fw->data, fw->size) & 0xffffffff;
 }
 
-int morse_firmware_init(struct morse *mors, enum morse_config_test_mode test_mode)
+static int morse_firmware_request(struct morse *mors,
+				  const struct firmware **fw_out,
+				  const struct firmware **bcf_out)
 {
 	int n;
 	int ret = 0;
@@ -921,10 +967,8 @@ int morse_firmware_init(struct morse *mors, enum morse_config_test_mode test_mod
 #endif
 
 	fw_path = morse_firmware_build_fw_path(mors);
-	if (!fw_path) {
-		ret = -ENOMEM;
-		goto exit;
-	}
+	if (!fw_path)
+		return -ENOMEM;
 	fw_name = fw_path;
 
 	if (mors->cfg->get_board_type && enable_otp_check)
@@ -988,7 +1032,7 @@ int morse_firmware_init(struct morse *mors, enum morse_config_test_mode test_mod
 	if (ret != 0) {
 		if (ret == -ENOENT)
 			dev_err(mors->dev, "BCF %s not found\n", bcf_name);
-		goto exit;
+		goto err_release_firmware;
 	}
 	/* Calculate CRC to match the crc32 line command */
 	dev_info(mors->dev, "Loaded BCF from %s, size %zu, crc32 0x%08x\n",
@@ -999,36 +1043,52 @@ int morse_firmware_init(struct morse *mors, enum morse_config_test_mode test_mod
 	/* store the fw binary string used into our coredump */
 	morse_coredump_set_fw_binary_str(mors, fw_name);
 
-	ret = morse_firmware_init_preloaded(mors, fw, bcf, test_mode);
-exit:
+	*fw_out = fw;
+	*bcf_out = bcf;
+
+	goto exit;
+err_release_firmware:
 	release_firmware(fw);
-	release_firmware(bcf);
-
+exit:
 	kfree(fw_path);
-
-	if (ret)
-		MORSE_ERR(mors, "%s failed: %d\n", __func__, ret);
-	else
-		MORSE_INFO(mors, "Firmware initialized\n");
-
 	return ret;
 }
 
-int morse_firmware_prepare_and_init(struct morse *mors, bool reset_hw, bool reattach_hw)
+int morse_firmware_prepare(struct morse *mors, bool reset_hw, bool reattach_hw)
 {
 	int ret = 0;
 	bool is_hw_loaded = false;
+	const struct firmware *fw = NULL;
+	const struct firmware *bcf = NULL;
 
-	if (morse_test_mode_is_interactive(test_mode) && reattach_hw) {
-		is_hw_loaded = morse_hw_is_already_loaded(mors);
-		MORSE_DBG(mors, "HW is %s loaded\n", is_hw_loaded ? "already" : "not yet");
-	}
+	ret = morse_firmware_request(mors, &fw, &bcf);
+	if (ret)
+		return ret;
 
-	if (is_hw_loaded) {
-		if (reattach_hw && !morse_hw_is_stopped(mors))
-			return -EALREADY;
+	ret = extract_firmware_info(mors, fw);
+	if (ret)
+		goto exit;
 
-		reset_hw = true;
+	if (!reset_hw && reattach_hw) {
+		if (morse_test_mode_is_interactive(test_mode)) {
+			is_hw_loaded = morse_hw_is_already_loaded(mors);
+			MORSE_DBG(mors, "HW is %s loaded\n", is_hw_loaded ? "already" : "not yet");
+		}
+
+		if (is_hw_loaded) {
+			bool is_stopped = morse_hw_is_stopped(mors) ||
+				  morse_hw_is_stopped_notification_set(mors);
+			if (is_stopped) {
+				/* Stopped HW requires a full digital reset before downloading
+				 * the firmware
+				 */
+				reset_hw = true;
+			} else {
+				/* Tell caller HW is ready to attach */
+				ret = -EALREADY;
+				goto exit;
+			}
+		}
 	}
 
 	if (reset_hw) {
@@ -1045,22 +1105,21 @@ int morse_firmware_prepare_and_init(struct morse *mors, bool reset_hw, bool reat
 			MORSE_ERR(mors, "%s: Failed to reset: %d\n", __func__, ret);
 	}
 
-	ret = morse_firmware_init(mors, test_mode);
-
-	if (reset_hw) {
-		if (ret)
-			MORSE_ERR(mors, "%s: Failed to reload: %d\n", __func__, ret);
-		ret = mors->cfg->ops->hw_restarted(mors);
-		if (ret)
-			MORSE_ERR(mors, "%s: hw_restarted failed: %d\n", __func__, ret);
-		ret = morse_firmware_parse_extended_host_table(mors);
-		if (ret)
-			MORSE_ERR(mors, "%s: Failed to parse extended host table: %d\n",
-				__func__, ret);
-
-		if (mors->cfg->post_firmware_ndr)
+	ret = morse_firmware_init_preloaded(mors, fw, bcf, test_mode);
+	if (ret == 0) {
+		morse_hw_headless_reset(mors);
+		if (reset_hw && mors->cfg->post_firmware_ndr)
 			mors->cfg->post_firmware_ndr(mors);
 	}
+
+	if (ret)
+		MORSE_ERR(mors, "%s failed: %d\n", __func__, ret);
+	else
+		MORSE_INFO(mors, "Firmware initialized\n");
+
+exit:
+	release_firmware(fw);
+	release_firmware(bcf);
 
 	return ret;
 }

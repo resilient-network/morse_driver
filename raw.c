@@ -5,6 +5,7 @@
  */
 #include "debug.h"
 #include "raw.h"
+#include "mac.h"
 #include "command.h"
 
 #define INVALID_AID_VALUE				(-1)
@@ -683,7 +684,10 @@ static void morse_raw_debug_print_aid_idx(struct morse_vif *mors_vif,
 	struct morse_raw *raw = &mors_vif->ap->raw;
 	struct morse_raw_config *config_ptr;
 
-	list_for_each_entry(config_ptr, &raw->raw_config_list, list) {
+	if (!raw->config_list)
+		return;
+
+	list_for_each_entry(config_ptr, raw->config_list, list) {
 		if (morse_raw_is_config_active(config_ptr)) {
 			MORSE_RAW_DBG(mors,
 				      "Final Start/End AID indices (%d): %d, %d\n",
@@ -1150,7 +1154,10 @@ struct morse_raw_config *morse_raw_find_config_by_id(struct morse_raw *raw, u16 
 {
 	struct morse_raw_config *config;
 
-	list_for_each_entry(config, &raw->raw_config_list, list)
+	if (!raw->config_list)
+		return NULL;
+
+	list_for_each_entry(config, raw->config_list, list)
 		if (config->id == id)
 			return config;
 
@@ -1164,12 +1171,12 @@ struct morse_raw_config *morse_raw_create_or_find_by_id(struct morse_raw *raw, u
 	lockdep_assert_held(&raw->lock);
 
 	/* ID 0 is reserved */
-	if (id == 0) {
+	if (id == 0 || !raw->config_list) {
 		MORSE_WARN_ON(FEATURE_ID_RAW, true);
 		return NULL;
 	}
 
-	list_for_each_entry(config, &raw->raw_config_list, list) {
+	list_for_each_entry(config, raw->config_list, list) {
 		/* already exists, just return */
 		if (config->id == id)
 			return config;
@@ -1188,7 +1195,7 @@ struct morse_raw_config *morse_raw_create_or_find_by_id(struct morse_raw *raw, u
 	if (prev)
 		list_add(&config->list, &prev->list);
 	else
-		list_add_tail(&config->list, &raw->raw_config_list);
+		list_add_tail(&config->list, raw->config_list);
 
 	return config;
 }
@@ -1213,10 +1220,21 @@ static void morse_dump_raw_config(struct morse *mors, struct morse_raw_config *c
 }
 
 /**
+ * morse_raw_can_delete_config() - Check if the RAW config is valid for deleting
+ * @raw: The global RAW context
+ * @config: The RAW config to delete
+ */
+static bool morse_raw_can_delete_config(struct morse_raw *raw,
+		struct morse_raw_config *config)
+{
+	return (config->id == MORSE_OCS_RAW_IDX || morse_raw_cfg_has_bcn_idx(config));
+}
+
+/**
  * morse_raw_delete_config() - Delete a RAW config
  *
  * @raw: The global RAW context
- * @cfg: The RAW config to delete
+ * @config: The RAW config to delete
  */
 static void morse_raw_delete_config(struct morse_raw *raw, struct morse_raw_config *config)
 {
@@ -1351,9 +1369,14 @@ static int morse_raw_process_config_group(struct morse_vif *mors_vif, struct mor
 
 		if (flags & MORSE_CMD_CFG_RAW_FLAG_DELETE) {
 			MORSE_RAW_DBG(mors, "RAW DELETE CMD: %d %x\n", id, flags);
-			list_for_each_entry_safe(config, tmp, &raw->raw_config_list, list)
-				morse_raw_delete_config(raw, config);
+			if (raw->config_list) {
+				list_for_each_entry_safe(config, tmp, raw->config_list, list)
+					morse_raw_delete_config(raw, config);
+			}
 		}
+
+		MORSE_RAW_INFO(mors, "RAW %s\n",
+			morse_raw_is_enabled(mors_vif) ? "enabled" : "disabled");
 		return 0;
 	}
 
@@ -1546,6 +1569,9 @@ int morse_raw_process_cmd(struct morse_vif *mors_vif, struct morse_cmd_req_confi
 		return -ENOTSUPP;
 	}
 
+	if (!mors_vif->ap)
+		return -ENOTSUPP;
+
 	raw = &mors_vif->ap->raw;
 
 	if (is_dynamic_req)
@@ -1585,36 +1611,60 @@ void morse_raw_trigger_update(struct morse_vif *mors_vif, bool refresh_aids)
 	schedule_work(&raw->update_work);
 }
 
+void morse_raw_reconfig(struct morse *mors, struct morse_vif *mors_vif)
+{
+	struct morse_raw *raw;
+	struct morse_raw_config *config, *tmp;
+
+	raw = &mors_vif->ap->raw;
+
+	if (!raw->config_list || list_empty(raw->config_list))
+		return;
+
+	morse_raw_enable(raw);
+
+	list_for_each_entry_safe(config, tmp, raw->config_list, list)
+		morse_raw_activate_config(raw, config);
+}
+
 bool morse_raw_is_enabled(struct morse_vif *mors_vif)
 {
 	return mors_vif && mors_vif->ap && test_bit(RAW_STATE_ENABLED, &mors_vif->ap->raw.flags);
 }
 
-int morse_raw_init(struct morse_vif *mors_vif, bool enable)
+int morse_raw_init(struct morse_vif *mors_vif)
 {
 	struct morse_raw *raw;
 	struct morse *mors;
+	struct ieee80211_vif *vif;
+	struct morse_persistent_vif_configs *mors_vif_conf;
 
 	if (!mors_vif || !mors_vif->ap)
 		return -ENOTSUPP;
 
+	vif = morse_vif_to_ieee80211_vif(mors_vif);
 	mors = morse_vif_to_morse(mors_vif);
 	raw = &mors_vif->ap->raw;
 
 	memset(raw, 0, sizeof(*raw));
 
+	mutex_lock(&mors->persistent_vif_config.lock);
+	mors_vif_conf = morse_get_vif_conf_from_addr(mors, vif->addr);
+	if (!mors_vif_conf) {
+		mutex_unlock(&mors->persistent_vif_config.lock);
+		return -ENXIO;
+	}
+
+	if (!morse_mlme_in_reconfig(mors))
+		INIT_LIST_HEAD(&mors_vif_conf->raw_config_list);
+
+	raw->config_list = &mors_vif_conf->raw_config_list;
+	mutex_unlock(&mors->persistent_vif_config.lock);
+
 	mutex_init(&raw->lock);
 	INIT_WORK(&raw->update_work, morse_raw_update_work);
-	INIT_LIST_HEAD(&raw->raw_config_list);
 	INIT_LIST_HEAD(&raw->active_raws);
 	INIT_LIST_HEAD(&raw->active_praws);
-
-	if (enable)
-		morse_raw_enable(raw);
-	else
-		morse_raw_disable(raw);
-
-	MORSE_RAW_INFO(mors, "RAW %s\n", enable ? "enabled" : "disabled");
 
 	return 0;
 }
@@ -1636,14 +1686,32 @@ void morse_dynamic_raw_init(struct morse_vif *mors_vif)
 	raw->dynamic.num_beacons = 0;
 	raw->dynamic.current_num = 0;
 
+	if (!raw->config_list)
+		return;
+
 	/* Delete any previous active dynamic RAW config */
-	list_for_each_entry_safe(config, tmp, &raw->raw_config_list, list) {
+	list_for_each_entry_safe(config, tmp, raw->config_list, list) {
 		if (morse_raw_cfg_has_bcn_idx(config))
 			morse_raw_delete_config(raw, config);
 	}
 }
 
-void morse_raw_finish(struct morse_vif *mors_vif)
+void morse_raw_config_list_delete(void *conf, struct ieee80211_vif *vif)
+{
+	struct morse_raw_config *config, *tmp;
+	struct morse_persistent_vif_configs *mors_vif_conf =
+				(struct morse_persistent_vif_configs *)conf;
+
+	if (vif->type != NL80211_IFTYPE_AP)
+		return;
+
+	list_for_each_entry_safe(config, tmp, &mors_vif_conf->raw_config_list, list) {
+		list_del(&config->list);
+		kfree(config);
+	}
+}
+
+void morse_raw_finish(struct morse_vif *mors_vif, bool is_restarting)
 {
 	struct morse_raw *raw;
 	struct morse_raw_config *config, *tmp;
@@ -1660,6 +1728,15 @@ void morse_raw_finish(struct morse_vif *mors_vif)
 	kfree(raw->rps_ie);
 	raw->rps_ie = NULL;
 
-	list_for_each_entry_safe(config, tmp, &raw->raw_config_list, list)
-		morse_raw_delete_config(raw, config);
+	if (!raw->config_list)
+		return;
+
+	list_for_each_entry_safe(config, tmp, raw->config_list, list) {
+		if (is_restarting && morse_raw_can_delete_config(raw, config))
+			morse_raw_delete_config(raw, config);
+		else if (morse_raw_is_config_active(config))
+			morse_raw_deactivate_config(raw, config);
+	}
+
+	raw->config_list = NULL;
 }

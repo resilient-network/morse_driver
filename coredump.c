@@ -265,12 +265,16 @@ static void get_stop_info(struct morse *mors)
 		if (read_memory_region(mors, region, info) == 0) {
 			uint hart = le32_to_cpu(info->hart);
 			uint line = le32_to_cpu(info->line);
+			uint info_len = region->len - sizeof(*info);
+			uint info_strlen;
 
-			if (strlen(info->info) > 0 || line > 0) {
-				mors->coredump.crash.information = kasprintf(GFP_KERNEL,
-									     "%s:%d (hart:%d)",
-									     info->info, line,
-									     hart);
+			info->info[info_len + 1] = '\0';
+			info_strlen = strlen(info->info);
+
+			if (info_strlen > 0 || line > 0) {
+				mors->coredump.crash.information =
+					kasprintf(GFP_KERNEL, "%*pEhp:%d (hart:%d)", info_strlen,
+						  info->info, line, hart);
 			}
 		}
 
@@ -513,7 +517,8 @@ int morse_coredump(struct morse *mors)
 		method = COREDUMP_METHOD_USERSPACE_SCRIPT;
 
 	/* Trigger a crash on-chip to force it to stop and save state. Will have
-	 * no affect if chip has already crashed
+	 * no affect if chip has already crashed. May cause a hw stop notification IRQ
+	 * to come back from the chip after this point.
 	 */
 	if (mors->firmware_flags & MORSE_FW_FLAGS_SUPPORT_CHIP_HALT_IRQ) {
 		morse_claim_bus(mors);

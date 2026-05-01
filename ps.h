@@ -9,44 +9,118 @@
  */
 #include "morse.h"
 
-/** This should be nominally <= the dynamic ps timeout */
-#define NETWORK_BUS_TIMEOUT_MS (90)
-#define UAPSD_NETWORK_BUS_TIMEOUT_MS (5)
-/** The default period of time to wait to re-evaluate powersave */
-#define DEFAULT_BUS_TIMEOUT_MS (5)
-
-static inline int morse_network_bus_timeout(struct morse *mors)
-{
-	return mors->uapsd_per_ac ? UAPSD_NETWORK_BUS_TIMEOUT_MS : NETWORK_BUS_TIMEOUT_MS;
-}
-
 /**
- * morse_ps_disable() - Raise the wake line, forcing the chip to wake up from powersave.
+ * mors_ps_get_net_timeout_ms() - Get power save timeout after network activity.
+ *
  * @mors: Morse chip instance
  *
- * Uses a reference counting mechanism for reentrancy.
- * Each call to morse_ps_disable() should be paired with a call to morse_ps_enable()
- * allowing the chip to go back to sleep when the operation is finished.
+ * Return: timeout in milliseconds
  */
-int morse_ps_disable(struct morse *mors);
+int mors_ps_get_net_timeout_ms(struct morse *mors);
 
 /**
- * morse_ps_enable() - Release the wake line, allowing the chip to go to sleep.
+ * mors_ps_set_net_timeout_ms() - Set power save timeout after network activity.
+ *
+ * @mors: Morse chip instance
+ * @timeout_ms: Timeout in milliseconds
+ */
+void mors_ps_set_net_timeout_ms(struct morse *mors, int timeout_ms);
+
+/**
+ * morse_ps_force_eval() - Force an evaluation of power save requirements.
  * @mors: Morse chip instance
  */
-int morse_ps_enable(struct morse *mors);
+void morse_ps_force_eval(struct morse *mors);
 
 /**
- * Call this function when there is activity on the bus that should
- * delay the driver in disabling the bus.
+ * morse_ps_queue_eval() - Queue evaluation of power save requirements to happen
+ *                         at a later time.
+ * @mors: Morse chip instance
+ */
+void morse_ps_queue_eval(struct morse *mors);
+
+/**
+ * morse_ps_wakers_inc() - Increase number of wakers holding the chip awake.
+ * @mors: Morse chip instance
+ *
+ * Invoke this function to keep the chip awake. Calls to inc/dec are typically balanced.
+ *
+ * Return: 0 if success else error code
+ */
+int morse_ps_wakers_inc(struct morse *mors);
+
+/**
+ * morse_ps_wakers_dec() - Decrease number of wakers holding the chip awake.
+ * @mors: Morse chip instance
+ *
+ * Invoke this function to remove chip wake requirement. Calls to inc/dec are typically balanced.
+ *
+ * Return: 0 if success else error code
+ */
+int morse_ps_wakers_dec(struct morse *mors);
+
+/**
+ * morse_ps_bus_activity() - Call this function when there is activity on the
+ *                           bus that should delay the driver in disabling the bus.
  *
  * @mors: Morse chip instance
  * @timeout_ms: The timeout from now to add (ms)
  */
 void morse_ps_bus_activity(struct morse *mors, int timeout_ms);
 
+/**
+ * morse_ps_iface_down_notify() - Notify power save logic that an interface is going down.
+ * @mors: Morse chip instance
+ * @mors_vif: Virtual interface being disabled
+ *
+ * Updates internal state to reflect that the given virtual interface is no
+ * longer active.
+ */
+void morse_ps_iface_down_notify(struct morse *mors, struct morse_vif *mors_vif);
+
+/**
+ * morse_ps_is_interface_enabled() - Check if any interface is currently enabled.
+ * @mors: Morse chip instance
+ *
+ * Return: if the interface associated with the morse_ps object is currently enabled
+ */
+bool morse_ps_is_interface_enabled(struct morse *mors);
+
+/**
+ * morse_ps_is_interface_same() - Compare given interface against current active one.
+ * @mors: Morse chip instance
+ * @mors_vif: Virtual interface to compare
+ *
+ * Return: true if the given virtual interface matches the one currently in use.
+ */
+bool morse_ps_is_interface_same(struct morse *mors, struct morse_vif *mors_vif);
+
+/**
+ * morse_ps_update_interface_state() - Update interface state in power save logic.
+ * @mors: Morse chip instance
+ * @mors_vif: New interface to set as the owner of the ps object
+ * @enabled: New state of power save
+ *
+ * Update the interface and the power save state of the morse_ps object
+ */
+void morse_ps_update_interface_state(struct morse *mors, struct morse_vif *mors_vif, bool enabled);
+
 int morse_ps_init(struct morse *mors, bool enable, bool enable_dynamic_ps);
 
 void morse_ps_finish(struct morse *mors);
+
+/**
+ * morse_ps_suspend() - Invoked on host system suspend
+ *
+ * @mors: Morse chip instance
+ */
+int morse_ps_system_suspend(struct morse *mors);
+
+/**
+ * morse_ps_resume() - Invoked on host system resume
+ *
+ * @mors: Morse chip instance
+ */
+void morse_ps_system_resume(struct morse *mors);
 
 #endif /* !_MORSE_PS_H_ */

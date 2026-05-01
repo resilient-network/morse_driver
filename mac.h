@@ -76,7 +76,7 @@ bool morse_mac_ps_enabled(struct morse *mors);
  */
 enum morse_cmd_slow_clock_mode morse_mac_slow_clock_mode(void);
 
-int morse_mac_watchdog_create(struct morse *mors);
+void morse_mac_watchdog_create(struct morse *mors);
 void morse_mac_mcs0_10_stats_dump(struct morse *mors, struct seq_file *file);
 void morse_mac_fill_tx_info(struct morse *mors, struct morse_skb_tx_info *tx_info,
 				   struct sk_buff *skb, struct ieee80211_vif *vif,
@@ -106,6 +106,9 @@ struct ieee80211_vif *morse_get_vif(struct morse *mors);
 struct ieee80211_vif *morse_get_vif_from_rx_status(struct morse *mors,
 						const struct morse_skb_rx_status *hdr_rx_status);
 
+/* Return the number of vifs populated in the mors->vif array */
+int morse_count_vifs(struct morse *mors);
+
 /* Return a pointer to the AP vif if present otherwise NULL */
 struct ieee80211_vif *morse_get_ap_vif(struct morse *mors);
 
@@ -117,6 +120,10 @@ struct ieee80211_vif *morse_get_ibss_vif(struct morse *mors);
 
 /* Return a pointer to the MESH vif if present otherwise NULL */
 struct ieee80211_vif *morse_get_mesh_vif(struct morse *mors);
+
+/* Return the pointer to persistent VIF config if found for the adress else NULL */
+struct morse_persistent_vif_configs *morse_get_vif_conf_from_addr(struct morse *mors,
+		const uint8_t *addr);
 
 /* Return iface name for the valid vif */
 char *morse_vif_name(struct ieee80211_vif *vif);
@@ -133,6 +140,16 @@ static inline bool morse_mac_is_iface_ap_type(struct ieee80211_vif *vif)
 		(vif->type == NL80211_IFTYPE_AP ||
 		 vif->type == NL80211_IFTYPE_ADHOC ||
 		 ieee80211_vif_is_mesh(vif)));
+}
+
+static inline bool morse_mlme_is_started(const struct morse *mors)
+{
+	return mors->mlme.started;
+}
+
+static inline bool morse_mlme_in_reconfig(const struct morse *mors)
+{
+	return mors->mlme.in_reconfig;
 }
 
 /**
@@ -354,6 +371,16 @@ int morse_cqm_rssi_notify_event(struct morse *mors, struct ieee80211_vif *vif,
 		struct morse_cmd_evt_cqm_rssi_notify *cqm_notify);
 
 /**
+ * morse_mac_stop_tx_queues() - Request mac80211 to stop enqueuing packets for tx.
+ */
+void morse_mac_stop_tx_queues(struct morse *mors);
+
+/**
+ * morse_mac_wake_tx_queues() - Inform mac82011 it may resume enqueuing packets for tx.
+ */
+void morse_mac_wake_tx_queues(struct morse *mors);
+
+/**
  * Function for filling the Tx meta info (rate info) for driver
  * generated management frames.
  */
@@ -429,5 +456,18 @@ bool morse_mac_is_1mhz_probe_req_enabled(void);
 u8 morse_mac_get_mcs10_mode(void);
 u16 morse_mac_get_mcs_mask(void);
 bool morse_mac_is_rts_8mhz_enabled(void);
+bool morse_mac_is_cts_to_self_enabled(void);
+
+/**
+ * morse_mac_update_vif_bss_color - Update BSS color in Morse persistent vif config.
+ *
+ * @mors: pointer to morse struct
+ * @vif: pointer to the virtual interface
+ * @bss_color: BSS color to be set
+ *
+ * Return: 0 on success, else relevant error
+ */
+int morse_mac_update_vif_bss_color(struct morse *mors, struct ieee80211_vif *vif,
+								u8 bss_color);
 
 #endif /* !_MORSE_MAC_H_ */

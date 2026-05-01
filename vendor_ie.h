@@ -64,15 +64,17 @@ struct vendor_ie_oui_filter_list_item {
  * Initialise the structures for vendor IE processing in the interface
  *
  * @mors_vif Interface to initialise
+ * @in_reconfig Flag to check if reconfig is in progress
  */
-void morse_vendor_ie_init_interface(struct morse_vif *mors_vif);
+void morse_vendor_ie_init_interface(struct morse_vif *mors_vif, bool in_reconfig);
 
 /**
  * Uninitialise and free the structures for vendor IE processing in the interface
  *
  * @mors_vif Interface to uninitialise
+ * @is_restarting Flag to check if hw restart is in progress
  */
-void morse_vendor_ie_deinit_interface(struct morse_vif *mors_vif);
+void morse_vendor_ie_deinit_interface(struct morse_vif *mors_vif, bool is_restarting);
 
 /**
  * Get the total length of the currently configured vendor IEs.

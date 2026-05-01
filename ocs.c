@@ -10,7 +10,6 @@
 #include "debug.h"
 
 #define MORSE_OCS_DURATION	(32767)
-#define MORSE_OCS_RAW_IDX	(RAW_INTERNAL_ID_OFFSET + 1)
 
 /* Does needed post processing after sending the OCS command to the FW. For now, this function
  * configures OCS-specific RAW assignment if enabled

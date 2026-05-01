@@ -40,6 +40,7 @@
 #include "pv1.h"
 #include "coredump.h"
 #include "bss_stats.h"
+#include "twt.h"
 
 #ifdef CONFIG_MORSE_USER_ACCESS
 #include "uaccess.h"
@@ -52,11 +53,9 @@
 #define MAC80211_VERSION_CODE LINUX_VERSION_CODE
 #endif
 
-/* Re-Define the IGNORE channel flag, if not defined by the cfg80211 patch.
- * The flag won't be used by MM81xx.
- */
-#if defined(__x86_64__)
-#define IEEE80211_CHAN_IGNORE	IEEE80211_CHAN_DISABLED
+/* Redefine IEEE80211_CHAN_IGNORE as a NOOP if it wasn't defined by a Morse Micro cfg80211 patch */
+#ifndef HAS_IEEE80211_CHAN_IGNORE
+#define IEEE80211_CHAN_IGNORE	0
 #endif
 
 #define MORSE_SEMVER_GET_MAJOR(x) (((x) >> 22) & 0x3FF)
@@ -170,6 +169,8 @@ extern u8 macaddr[ETH_ALEN];
 extern bool enable_ibss_probe_filtering;
 extern uint ocs_type;
 extern uint sdio_reset_time;
+extern enum morse_cmd_duty_cycle_mode duty_cycle_mode;
+extern bool enable_secureboot;
 
 /**
  * enum morse_mac_subbands_mode - flags to describe sub-bands handling
@@ -185,52 +186,6 @@ enum morse_mac_subbands_mode {
 	SUBBANDS_MODE_MANAGEMENT = 0x01,
 	SUBBANDS_MODE_ENABLED = 0x02,
 	SUBBANDS_MODE_UNKNOWN = 0xFF
-};
-
-/**
- * struct morse_twt_sta_vif - contains STA VIF's specific TWT state information
- *
- * @active_agreement_bitmap Bitmap of active TWT agreement for each of flow ids
- * @cmd_work    Work queue struct to defer install/uninstall of twt agreementss.
- * @to_install_uninstall    A queue of TWT agreements to install/uninstall to the chip.
- */
-struct morse_twt_sta_vif {
-	unsigned long active_agreement_bitmap;
-	struct work_struct cmd_work;
-	struct list_head to_install_uninstall;
-};
-
-/**
- * struct morse_twt - contains TWT state and configuration information
- *
- * @stas		List of structures containing a agreements for a STA.
- * @wake_intervals	List of structures used as heads for lists of agreements with the same
- *			wake interval. These are arranged in order from the smallest to largest wake
- *			intervals.
- * @events		A queue of TWT events to be processed.
- * @tx			A queue of TWT data to be sent.
- * @req_event_tx	A TWT request event to be sent in the (re)assoc request frame.
- * @work		Work queue struct to defer processing of events.
- * @lock		Spinlock used to control access to lists/memory.
- * @requester		Whether or not the VIF is a TWT Requester.
- * @responder		Whether or not the VIF is a TWT Responder.
- * @dialog_token	Dialog token of Tx action frames.
- * @sta_vif		STA VIF specific data
- */
-struct morse_twt {
-	struct list_head stas;
-	struct list_head wake_intervals;
-	struct list_head events;
-	struct list_head tx;
-	u8 *req_event_tx;
-	struct work_struct work;
-	/* Protect TWT operations */
-	spinlock_t lock;
-	bool requester;
-	bool responder;
-	u8 dialog_token;
-	/* STA VIF specific data */
-	struct morse_twt_sta_vif sta_vif;
 };
 
 struct morse_mbssid_info {
@@ -261,9 +216,16 @@ struct morse_custom_configs {
 struct morse_ps {
 	/* Number of clients requesting to talk to chip */
 	u32 wakers;
-	bool enable;
+	/* Is the driver permitted to signal power save to the chip */
+	bool is_drv_ps_allowed;
+
+	/* The interface in control of power save decisions. NULL if not enabled */
+	struct morse_vif *mors_vif;
+
 	bool suspended;
 	bool dynamic_ps_en;
+	/* Host enforced remain awake time after network activity (ms) */
+	int ps_net_timeout_ms;
 	unsigned long bus_ps_timeout;
 	/* Serialise access to the PS structure */
 	struct mutex lock;
@@ -484,65 +446,52 @@ struct morse_mbca_config {
 struct morse_mesh {
 	/** back pointer */
 	struct morse_vif *mors_vif;
-	/** Mesh active */
-	bool is_mesh_active;
-	/** mesh beaconless mode */
-	bool mesh_beaconless_mode;
-	/** mesh id */
-	u8 mesh_id[IEEE80211_MAX_SSID_LEN];
-	/** mesh id length */
-	u8 mesh_id_len;
-	/** maximum number of peer links */
-	u8 max_plinks;
 	/** mesh periodic probe timer */
 	struct timer_list mesh_probe_timer;
 	/** rx status of probe req */
 	struct ieee80211_rx_status probe_rx_status;
-	/** dynamic peering mode */
-	bool dynamic_peering;
-	/** RSSI margin to consider while selecting a peer to kick out */
-	u8 rssi_margin;
-	/** Duration in seconds, a blacklisted peer is not allowed peering */
-	u32 blacklist_timeout;
 	/** address of the peer kicked out */
 	u8 kickout_peer_addr[ETH_ALEN];
 	/** Timestamp when peer is kicked out */
 	u32 kickout_ts;
-
-	/* Mesh Beacon Collision Avoidance state */
-	struct morse_mbca_config mbca;
+	/** Duration in seconds, a blacklisted peer is not allowed peering */
+	u32 blacklist_timeout;
+	/** Mesh configuration */
+	struct morse_mesh_config *conf;
 };
 
 struct morse_mesh_config {
-	/** Length of the Mesh ID */
-	u8 mesh_id_len;
-
 	/** Mesh ID of the network */
 	u8 mesh_id[IEEE80211_MAX_SSID_LEN];
-
-	/** Mode of mesh beaconless operation */
-	u8 mesh_beaconless_mode;
-
-	/** Maximum number of peer links */
-	u8 max_plinks;
-} __packed;
-
-struct morse_mesh_config_list {
-	struct list_head list;
-	/** VIF mac address */
-	u8 addr[ETH_ALEN];
 	/** dynamic peering mode */
 	bool dynamic_peering;
+	/** Mesh active */
+	bool is_mesh_active;
 	/** RSSI margin to consider while selecting a peer to kick out */
 	u8 rssi_margin;
+	/** Length of the Mesh ID */
+	u8 mesh_id_len;
+	/** Mode of mesh beaconless operation */
+	u8 mesh_beaconless_mode;
+	/** Maximum number of peer links */
+	u8 max_plinks;
 	/** Duration in seconds, a blacklisted peer is not allowed peering */
 	u32 blacklist_timeout;
-	/** Mesh specific information */
-	struct morse_mesh_config mesh_conf;
 	/** Mesh Beacon Collision Avoidance state */
 	struct morse_mbca_config mbca;
-	/** Protect Mesh config updates */
-	spinlock_t lock;
+} __packed;
+
+struct morse_vendor_ie {
+	/** List of run-time configurable vendor IEs to insert into management frames */
+	struct list_head ie_list;
+
+	/** List of vendor IE OUIs for which to generate a netlink event if seen in a mgmt
+	 * frame.
+	 */
+	struct list_head oui_filter_list;
+
+	/** Number of elements in the OUI filter list */
+	u8 n_oui_filters;
 };
 
 /**
@@ -568,6 +517,9 @@ enum morse_sme_state_flags {
 struct morse_vif {
 	u16 id;			/* interface ID from chip */
 	u16 dtim_count;
+
+	/* Is power save enabled for this interface */
+	bool is_ps_enabled;
 
 	/**
 	 * Used to keep track of time for beacons
@@ -608,12 +560,6 @@ struct morse_vif {
 	struct morse_cac cac;
 
 	/**
-	 * Configured BSS color.
-	 * Only valid after association response is received for STAs
-	 */
-	u8 bss_color;
-
-	/**
 	 * AP's required Minimum MPDU start spacing as communicated by S1G
 	 * capabilities field. Only valid after association response
 	 * is received for STAs.
@@ -637,16 +583,10 @@ struct morse_vif {
 	struct morse_mesh *mesh;
 
 	struct {
-		/** List of run-time configurable vendor IEs to insert into management frames */
-		struct list_head ie_list;
-
-		/** List of vendor IE OUIs for which to generate a netlink event if seen in a mgmt
-		 * frame.
+		/** List of run-time configurable vendor IEs to insert into or filter
+		 * from management frames - stored in persistent vif config
 		 */
-		struct list_head oui_filter_list;
-
-		/** Number of elements in the OUI filter list */
-		u8 n_oui_filters;
+		struct morse_vendor_ie *vie_config;
 
 		/** Spinlock to protect access to these fields */
 		spinlock_t lock;
@@ -802,6 +742,11 @@ struct morse_vif {
 	 * Flag to keep track of beaconing enabled
 	 */
 	bool beaconing_enabled;
+
+	/**
+	 * Flag to indicate beacon generation has been offloaded to the chip
+	 */
+	bool beacon_offload_enabled;
 
 	/**
 	 * Flag to check if multicast rate control is not enabled or not.
@@ -1003,8 +948,6 @@ struct mcast_filter {
 
 /** State flags for managing state of mors object */
 enum morse_state_flags {
-	/** Morse chip is unresponsive */
-	MORSE_STATE_FLAG_CHIP_UNRESPONSIVE,
 	/** Pushing/Pulling from the mac80211 DATA Qs have been stopped */
 	MORSE_STATE_FLAG_DATA_QS_STOPPED,
 	/** Sending TX data to the chip has been stopped */
@@ -1021,6 +964,8 @@ enum morse_state_flags {
 	MORSE_STATE_FLAG_HOST_TO_CHIP_TX_BLOCKED,
 	/** TX CMD from host to firmware is blocked */
 	MORSE_STATE_FLAG_HOST_TO_CHIP_CMD_BLOCKED,
+	/** Host system is in, or in the process of, entering suspend */
+	MORSE_STATE_FLAG_SYSTEM_IN_SUSPEND,
 };
 
 /**
@@ -1031,6 +976,38 @@ enum morse_state_flags {
 #define MORSE_MAX_IF (2)
 #define MORSE_COUNTRY_LEN (3)
 #define INVALID_VIF_INDEX 0xFF
+
+struct morse_persistent_vif_configs {
+	/** VIF mac address */
+	u8 addr[ETH_ALEN];
+	/** BSS stats config */
+	struct morse_bss_stats_config bss_stats_conf;
+	/** TWT config with active agreement */
+	struct morse_twt_config twt_conf;
+	/** CAC configuration and rules */
+	struct morse_cac_config cac_conf;
+	/** Mesh configs */
+	struct morse_mesh_config mesh_conf;
+	/** List of RAW configs */
+	struct list_head raw_config_list;
+	/** Vendor IEs list */
+	struct morse_vendor_ie vie_config;
+	/**
+	 * The Max Away Duration field indicates the maximum duration that the AP
+	 * can be out of reach for the STA (operating in other channels, enter
+	 * power save mode, or operating in other RAWs).
+	 *
+	 * The value of the Max Away Duration field is expressed in units of TU. (AP iface only)
+	 */
+	u16 bss_max_away_duration;
+	/** mlme allows power save for AP interfaces (AP iface only) */
+	bool ap_ps_enabled;
+	/**
+	 * Configured BSS color.
+	 * Only valid after association response is received for STAs
+	 */
+	u8 bss_color;
+};
 
 struct morse {
 	u32 chip_id;
@@ -1049,8 +1026,8 @@ struct morse {
 	/* mask of type \enum host_table_firmware_flags */
 	u32 firmware_flags;
 	struct morse_caps capabilities;
+	enum morse_hw_state hw_state;
 
-	bool started;
 	/** @in_scan: whether the chip has been configured for scan mode (softmac only). */
 	bool in_scan;
 	bool reset_required;
@@ -1061,6 +1038,9 @@ struct morse {
 
 	/** @workqueue: Workqueue for fullmac work items. */
 	struct workqueue_struct *wiphy_wq;
+
+	/** true when wiphy has started */
+	bool wiphy_started;
 
 	/** @scan_req: pointer to the current scan request which is in progress,
 	 * or NULL if no scan is in progress (fullmac only).
@@ -1094,6 +1074,14 @@ struct morse {
 	struct morse_channel_survey *channel_survey;
 
 	struct ieee80211_hw *hw;
+
+	/** softmac state tracking of mlme */
+	struct {
+		/** Has the MLME started? */
+		bool started;
+		/** Is the MLME reconfiguring the HW? */
+		bool in_reconfig;
+	} mlme;
 
 	/* Array of vif pointers, indexed by vif ID. Allocated based on max interfaces supported.
 	 * Do not access directly. Use morse_get_vif_* functions.
@@ -1161,12 +1149,7 @@ struct morse {
 	struct uaccess_device udev;
 #endif
 
-	/* power saving */
-	bool config_ps;
 	struct morse_ps ps;
-
-	/** Mesh config list stored locally */
-	struct morse_mesh_config_list mesh_config;
 
 	/* U-APSD status per Access Category (bitfield) */
 	u8 uapsd_per_ac;
@@ -1212,6 +1195,14 @@ struct morse {
 
 	/* Stored Channel Information, sta_type, enc_mode, RAW */
 	struct morse_custom_configs custom_configs;
+
+	/* Stored configurations per VIF */
+	struct {
+		/* Persistent configurations for different features */
+		struct morse_persistent_vif_configs configs[MORSE_MAX_IF];
+		/* Lock held for the VIF config array */
+		struct mutex lock;
+	} persistent_vif_config;
 
 	/* watchdog */
 	struct morse_watchdog watchdog;
@@ -1272,8 +1263,24 @@ struct morse {
 		struct morse_hw_clock __rcu *clock;
 	} hw_clock;
 
-	/* Used to wait for firmware attach */
-	struct completion *attach_done;
+	struct {
+		enum headless_state {
+			HEADLESS_OFF,
+			HEADLESS_ON_REQUEST,
+			HEADLESS_ON_PENDING,
+			HEADLESS_ON,
+			HEADLESS_OFF_REQUEST,
+			HEADLESS_OFF_PENDING
+		} state;
+		/* Pending configuration to write into hw upon detach */
+		u32 pending_cfg;
+		/* Completion to signal headless attach / detach (from cmd_q context) */
+		struct completion *wait;
+		/* Work items are executed on the Chip WQ context */
+		struct work_struct work;
+		/* Used to protect headless state update */
+		struct mutex lock;
+	} headless;
 
 	/* must be last */
 	u8 drv_priv[] __aligned(sizeof(void *));
@@ -1360,6 +1367,12 @@ static inline struct morse *morse_vif_to_morse(struct morse_vif *mors_vif)
 static inline struct ieee80211_sta *morse_sta_to_ieee80211_sta(struct morse_sta *msta)
 {
 	return container_of((void *)msta, struct ieee80211_sta, drv_priv);
+}
+
+static inline struct morse_persistent_vif_configs *morse_get_vif_conf_from_id(struct morse *mors,
+		int vif_id)
+{
+	return &mors->persistent_vif_config.configs[vif_id];
 }
 
 static inline bool morse_test_mode_is_interactive(uint test_mode)

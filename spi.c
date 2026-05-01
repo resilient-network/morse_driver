@@ -141,8 +141,8 @@ struct uaccess *morse_spi_uaccess;
 #define SPI_MAX_TRANSACTION_SIZE	(8192)
 /** Maximum number of bytes per SPI read/write */
 #define SPI_MAX_TRANSFER_SIZE		(64 * 1024)
-/* We need to set this value to get 50 MHz */
-#define MAX_SPI_CLK_SPEED		(50000000)
+
+#define MAX_SUPPORTED_SPI_CLK_SPEED	(50000000)
 #define SPI_CLK_PERIOD_NANO_S(clk_mhz)	(1000000000 / (clk_mhz))
 
 #define SPI_DEFAULT_MAX_INTER_BLOCK_DELAY_BYTES	250
@@ -156,10 +156,15 @@ static const bool is_rk3288 = true;
 static const bool is_rk3288;
 #endif
 
-/* SPI clock speed */
-static uint spi_clock_speed = MAX_SPI_CLK_SPEED;
+/* SPI clock speed - to override the value provided by the device tree */
+static uint spi_clock_speed;
 module_param(spi_clock_speed, uint, 0644);
 MODULE_PARM_DESC(spi_clock_speed, "SPI clock speed in Hz");
+
+/* SPI inter block delay */
+static uint spi_inter_block_delay_bytes;
+module_param(spi_inter_block_delay_bytes, uint, 0644);
+MODULE_PARM_DESC(spi_inter_block_delay_bytes, "SPI inter block delay in number of bytes");
 
 /* SPI bus edge IRQ compatibility mode */
 static bool spi_use_edge_irq;
@@ -188,11 +193,17 @@ static int morse_spi_setup(struct spi_device *spi, u32 max_speed_hz)
 
 	spi->mode = SPI_MODE_0;
 	spi->bits_per_word = 8;
-	spi->max_speed_hz = max_speed_hz;
 
-	if (spi->max_speed_hz > MAX_SPI_CLK_SPEED) {
-		dev_err(&spi->dev, "SPI clocks above 50MHz are not supported by Morse chip\n");
-		return -EPERM;
+	if (max_speed_hz) {
+		pr_info("Overriding the device tree MaxClockSpeed=%d(MHz) with the provided MaxClockSpeed=%d(MHz)\n",
+			spi->max_speed_hz / 1000000, max_speed_hz / 1000000);
+		spi->max_speed_hz = max_speed_hz;
+	}
+
+	if (spi->max_speed_hz > MAX_SUPPORTED_SPI_CLK_SPEED) {
+		dev_warn(&spi->dev, "SPI clock %d MHz is not supported by this chip, clipping to %d MHz\n",
+			 spi->max_speed_hz / 1000000, MAX_SUPPORTED_SPI_CLK_SPEED / 1000000);
+		spi->max_speed_hz = MAX_SUPPORTED_SPI_CLK_SPEED;
 	}
 
 	ret = spi_setup(spi);
@@ -1199,6 +1210,9 @@ static void morse_spi_set_irq(struct morse *mors, bool enable)
 static void morse_spi_reset(int reset_pin, struct spi_device *spi)
 {
 	morse_hw_reset(reset_pin);
+
+	/* Introduce a short delay to make sure the chip/SPI controller is fully reset */
+	mdelay(50);
 }
 
 #if KERNEL_VERSION(5, 18, 0) > LINUX_VERSION_CODE
@@ -1225,9 +1239,18 @@ static void morse_spi_remove(struct spi_device *spi)
 			flush_workqueue(mors->net_wq);
 			destroy_workqueue(mors->net_wq);
 			if (reattach_hw) {
-				ret = morse_hw_detach(mors);
-				if (ret)
+				/* Trigger detach interrupt but don't wait for it since
+				 * we are removing the driver anyway
+				 */
+				ret = morse_hw_trigger_detach(mors);
+				if (ret) {
 					is_hw_detached = false;
+					MORSE_ERR(mors,
+						"%s: failed to detach from hardware (ret:%d)\n",
+						__func__, ret);
+				} else {
+					MORSE_INFO(mors, "%s: Detached from hardware\n", __func__);
+				}
 			}
 		} else {
 			morse_spi_disable_irq(mspi);
@@ -1238,6 +1261,7 @@ static void morse_spi_remove(struct spi_device *spi)
 #ifdef CONFIG_MORSE_USER_ACCESS
 		uaccess_device_unregister(mors);
 		uaccess_cleanup(morse_spi_uaccess);
+		morse_spi_uaccess = NULL;
 #endif
 		morse_mac_destroy(mors);
 		dev_set_drvdata(&spi->dev, NULL);
@@ -1304,17 +1328,26 @@ static void morse_spi_config_burst_mode(struct morse *mors, bool enable_burst)
 		return;
 
 	inter_block_delay_nano_s = mors->cfg->enable_sdio_burst_mode(mors, burst_mode);
-	if (inter_block_delay_nano_s > 0) {
-		/* No Errors detected, therefore, the value returned can be used to
-		 * set the inter block delay.
+
+	if (spi_inter_block_delay_bytes) {
+		/*
+		 * Set the inter block delay bytes based on
+		 * the mod param specified value
+		 */
+		mspi->inter_block_delay_bytes = spi_inter_block_delay_bytes;
+	} else if (inter_block_delay_nano_s > 0) {
+		/*
+		 * No Errors detected, therefore, the value returned
+		 * can be used to set the inter block delay
 		 */
 		mspi->inter_block_delay_bytes =
 			inter_block_delay_nano_s /
-				(SPI_CLK_PERIOD_NANO_S(spi_clock_speed) * 8);
-		mspi->max_block_count =
-			SPI_MAX_TRANSACTION_SIZE / (MMC_SPI_BLOCKSIZE +
-						mspi->inter_block_delay_bytes);
+			((SPI_CLK_PERIOD_NANO_S(mspi->spi->max_speed_hz) * 8));
 	}
+
+	mspi->max_block_count =
+		SPI_MAX_TRANSACTION_SIZE /
+		(MMC_SPI_BLOCKSIZE + mspi->inter_block_delay_bytes);
 }
 
 static const struct morse_bus_ops morse_spi_ops = {
@@ -1342,6 +1375,7 @@ static int morse_spi_probe(struct spi_device *spi)
 	bool if_initiated = false;
 	bool mspi_data_allocated = false;
 	bool uaccess_allocated = false;
+	bool uaccess_registered = false;
 	const bool reset_hw = false;
 	bool attach = false;
 
@@ -1351,6 +1385,7 @@ static int morse_spi_probe(struct spi_device *spi)
 	else
 		mors_chip_series = (struct morse_chip_series *)spi_get_device_id(spi)->driver_data;
 
+	/* if spi_clock_speed is provided, it will override the device tree value */
 	ret = morse_spi_setup(spi, spi_clock_speed);
 	if (ret < 0) {
 		pr_err("morse_spi_setup failed\n");
@@ -1362,6 +1397,8 @@ static int morse_spi_probe(struct spi_device *spi)
 		dev_err(&spi->dev, "morse_mac_create failed\n");
 		return -ENOMEM;
 	}
+
+	morse_hw_headless_init(mors);
 
 	/* update chip configuration */
 	mors->bus_ops = &morse_spi_ops;
@@ -1491,18 +1528,20 @@ static int morse_spi_probe(struct spi_device *spi)
 	}
 
 	ret = uaccess_device_register(mors, morse_spi_uaccess, &spi->dev);
+	uaccess_registered = true;
 	if (ret) {
 		MORSE_SPI_ERR(mors, "uaccess_device_register() failed: %d\n", ret);
 		goto err_exit;
 	}
 #endif
 
-	ret = morse_firmware_prepare_and_init(mors, reset_hw, morse_hw_should_reattach());
+	ret = morse_firmware_prepare(mors, reset_hw, morse_hw_should_reattach());
 	if (ret == -EALREADY)
 		attach = true;
 	else if (ret)
 		goto err_exit;
 
+	morse_hw_set_state(mors, MORSE_HW_STATE_ON);
 	/*
 	 * Now that a valid chip id has been found, let's enable burst mode.
 	 * The function below will check if burst mode is supported and if so, enable it.
@@ -1512,8 +1551,9 @@ static int morse_spi_probe(struct spi_device *spi)
 	morse_spi_config_burst_mode(mors, true);
 
 	MORSE_SPI_INFO(mors, "clock=%d MHz, delay bytes=%d, max block count=%d\n",
-			 spi_clock_speed / 1000000, mspi->inter_block_delay_bytes,
-			 mspi->max_block_count);
+		       spi->max_speed_hz / 1000000,
+		       mspi->inter_block_delay_bytes,
+		       mspi->max_block_count);
 
 	if (morse_test_mode_is_interactive(test_mode)) {
 		mors->chip_wq = create_singlethread_workqueue("MorseChipIfWorkQ");
@@ -1552,6 +1592,12 @@ static int morse_spi_probe(struct spi_device *spi)
 		goto err_exit;
 	}
 
+	if (attach) {
+		ret = morse_hw_attach(mors, 0);
+		if (ret)
+			goto err_exit;
+	}
+
 	if (morse_test_mode_is_interactive(test_mode)) {
 		ret = morse_mac_register(mors);
 		if (ret) {
@@ -1559,12 +1605,6 @@ static int morse_spi_probe(struct spi_device *spi)
 			goto err_exit;
 		}
 	}
-
-	if (attach)
-		ret = morse_hw_attach(mors);
-
-	if (ret)
-		goto err_exit;
 
 #ifdef CONFIG_MORSE_ENABLE_TEST_MODES
 	if (test_mode == MORSE_CONFIG_TEST_MODE_BUS)
@@ -1592,9 +1632,12 @@ err_exit:
 		destroy_workqueue(mors->chip_wq);
 	}
 #ifdef CONFIG_MORSE_USER_ACCESS
+	if (uaccess_registered)
+		uaccess_device_unregister(mors);
 	if (uaccess_allocated) {
 		morse_spi_disable_irq(mspi);
 		uaccess_cleanup(morse_spi_uaccess);
+		morse_spi_uaccess = NULL;
 	}
 #endif
 	if (mspi_data_allocated)

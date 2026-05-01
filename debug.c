@@ -51,6 +51,9 @@ static const char * const morse_log_features[] = {
 	[FEATURE_ID_YAPS] = "yaps",
 	[FEATURE_ID_USB] = "usb",
 	[FEATURE_ID_HWCLOCK] = "hwclock",
+	[FEATURE_ID_APF] = "apf",
+	[FEATURE_ID_HEADLESS] = "headless",
+	[FEATURE_ID_WOWLAN] = "wowlan",
 };
 
 /*
@@ -63,7 +66,7 @@ static const char * const morse_log_features[] = {
  * Note: %pV is used for printing a struct va_format structure.
  */
 #define __generate_log_fn(fn, lvl)							\
-void morse_ ## fn(u32 id, const struct morse *mors, const char *fmt, ...)			\
+void morse_ ## fn(u32 id, const struct morse *mors, const char *fmt, ...)		\
 {											\
 	struct va_format vaf = {							\
 		.fmt = fmt,								\
@@ -368,7 +371,10 @@ static int dump_raw_configs(struct seq_file *file, void *data)
 
 		raw = &mors_vif->ap->raw;
 
-		list_for_each_entry(config, &raw->raw_config_list, list) {
+		if (!raw->config_list)
+			continue;
+
+		list_for_each_entry(config, raw->config_list, list) {
 			seq_printf(file, "RAW ID: %d (enabled: %d)\n", config->id,
 				morse_raw_is_config_active(config));
 			seq_printf(file, "  start_time_us=%u", config->start_time_us);
@@ -485,15 +491,19 @@ static int read_vendor_ies(struct seq_file *file, void *data)
 	for (vif_id = 0; vif_id < mors->max_vifs; vif_id++) {
 		struct ieee80211_vif *vif = morse_get_vif_from_vif_id(mors, vif_id);
 		struct morse_vif *mors_vif;
+		struct morse_vendor_ie *vie_config;
 
 		if (!vif)
 			continue;
 
 		mors_vif = ieee80211_vif_to_morse_vif(vif);
+		vie_config = mors_vif->vendor_ie.vie_config;
+		if (!vie_config)
+			return -ENXIO;
 
 		seq_printf(file, "%s: VIF [%d]:\n", morse_vif_name(vif), mors_vif->id);
 		spin_lock_bh(&mors_vif->vendor_ie.lock);
-		list_for_each_entry(item, &mors_vif->vendor_ie.ie_list, list) {
+		list_for_each_entry(item, &vie_config->ie_list, list) {
 			ie = (u8 *)item->ie.oui;
 			seq_printf(file, "Vendor IE: (mask 0x%04x)", item->mgmt_type_mask);
 
@@ -520,15 +530,19 @@ static int read_vendor_ie_oui_filter(struct seq_file *file, void *data)
 	for (vif_id = 0; vif_id < mors->max_vifs; vif_id++) {
 		struct ieee80211_vif *vif = morse_get_vif_from_vif_id(mors, vif_id);
 		struct morse_vif *mors_vif;
+		struct morse_vendor_ie *vie_config;
 
 		if (!vif)
 			continue;
 
 		mors_vif = ieee80211_vif_to_morse_vif(vif);
+		vie_config = mors_vif->vendor_ie.vie_config;
+		if (!vie_config)
+			continue;
 
 		seq_printf(file, "%s: VIF [%d]:\n", morse_vif_name(vif), mors_vif->id);
 		spin_lock_bh(&mors_vif->vendor_ie.lock);
-		list_for_each_entry(item, &mors_vif->vendor_ie.oui_filter_list, list) {
+		list_for_each_entry(item, &vie_config->oui_filter_list, list) {
 			seq_printf(file, "\t%02X:%02X:%02X - mask: 0x%04x\n",
 				   item->oui[0], item->oui[1], item->oui[2], item->mgmt_type_mask);
 		}

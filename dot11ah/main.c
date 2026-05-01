@@ -30,9 +30,19 @@ static LIST_HEAD(cssid_list);
 static int __init morse_dot11ah_init(void)
 {
 	int ret = 0;
+	u32 scheme = morse_dot11ah_get_channelization_scheme();
 
 	spin_lock_init(&cssid_list_lock);
 	pr_info("Morse Micro Dot11ah driver registration. Version %s\n", DOT11AH_VERSION);
+
+	if (scheme > CHANNELIZATION_SCHEME_IEEE80211_REVMF) {
+		pr_info("Invalid value for channelization_scheme %u, setting to default value %u\n",
+			 scheme, CHANNELIZATION_SCHEME_DEFAULT);
+		scheme = CHANNELIZATION_SCHEME_DEFAULT;
+		morse_dot11ah_set_channelization_scheme(scheme);
+	}
+	pr_info("channelization_scheme = %d (%s)\n", scheme,
+		 morse_dot11ah_channelization_scheme_to_str(scheme));
 	return ret;
 }
 
@@ -116,6 +126,7 @@ void morse_dot11ah_store_cssid(struct dot11ah_ies_mask *ies_mask, u16 capab_info
 	int length;
 	const u8 *ssid;
 	u8 network_id_eid;
+	u16 mad = 0;
 
 	if (WARN_ON(!bssid))
 		return;
@@ -125,6 +136,13 @@ void morse_dot11ah_store_cssid(struct dot11ah_ies_mask *ies_mask, u16 capab_info
 		ies_mask->ies[network_id_eid].len);
 	ssid = ies_mask->ies[network_id_eid].ptr;
 	length = ies_mask->ies[network_id_eid].len;
+
+	/* Derive MAD if set (only present in probe response frames) */
+	if (ies_mask->ies[WLAN_EID_S1G_MAX_AWAY_DURATION].ptr) {
+		const struct dot11ah_mad_ie *mad_ie = (const struct dot11ah_mad_ie *)
+			ies_mask->ies[WLAN_EID_S1G_MAX_AWAY_DURATION].ptr;
+		mad = le16_to_cpu(mad_ie->max_away_duration);
+	}
 
 	spin_lock_bh(&cssid_list_lock);
 	stored = morse_dot11ah_find_cssid_item_for_bssid(bssid);
@@ -180,6 +198,8 @@ void morse_dot11ah_store_cssid(struct dot11ah_ies_mask *ies_mask, u16 capab_info
 			kfree(s1g_ies_updated);
 		}
 
+		/* Update MAD */
+		stored->max_away_duration = max(stored->max_away_duration, mad);
 		memcpy(stored->bssid, bssid, ETH_ALEN);
 		goto exit;
 	}
@@ -194,6 +214,7 @@ void morse_dot11ah_store_cssid(struct dot11ah_ies_mask *ies_mask, u16 capab_info
 	item->capab_info = capab_info;
 	item->fc_bss_bw_subfield = MORSE_FC_BSS_BW_INVALID;
 	item->mesh_beacon = (network_id_eid == WLAN_EID_MESH_ID);
+	item->max_away_duration = mad;
 	memcpy(item->ssid, ssid, length);
 
 	item->ies = kmalloc(s1g_ies_len, GFP_ATOMIC);
@@ -336,6 +357,23 @@ bool morse_dot11ah_find_bss_bw(u8 *bssid, u8 *fc_bss_bw_subfield)
 	return found;
 }
 EXPORT_SYMBOL(morse_dot11ah_find_bss_bw);
+
+bool morse_dot11ah_find_bss_mad(const u8 *bssid, u16 *mad)
+{
+	struct morse_dot11ah_cssid_item *item = NULL;
+	bool found = false;
+
+	spin_lock_bh(&cssid_list_lock);
+	item = morse_dot11ah_find_bssid(bssid);
+	if (item) {
+		*mad = item->max_away_duration;
+		found = true;
+	}
+	spin_unlock_bh(&cssid_list_lock);
+
+	return found;
+}
+EXPORT_SYMBOL(morse_dot11ah_find_bss_mad);
 
 bool morse_dot11ah_is_mesh_peer_known(const u8 *peer_mac_addr)
 {

@@ -148,4 +148,11 @@ config MORSE_DEBUGFS
 	help
 	  Enable for debugging support.
 
+config DISABLE_MORSE_FULLMAC
+	bool "Disable FullMAC support"
+	default n
+	help
+	  Disable FullMAC support at build time. This may be necessary to build against
+	  older unpatched kernel that lacks some features required for FullMAC.
+
 endif # WLAN_VENDOR_MORSE

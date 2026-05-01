@@ -6,8 +6,14 @@
  */
 
 #include <linux/string.h>
+#include "dot11ah.h"
 #include "reg_rules.h"
 #include "debug.h"
+
+/* Channelization scheme to use */
+static u32 channelization_scheme = CHANNELIZATION_SCHEME_DEFAULT;
+module_param(channelization_scheme, uint, 0444);
+MODULE_PARM_DESC(channelization_scheme, "Channelization scheme, affects AU regdom only");
 
 /**
  * DOC: How To Modify Regulatory (`reg.c`, `reg_rules.c`) and Channel Mapping
@@ -38,26 +44,15 @@
  * For information on how to update this information refer to the `regdb/README.md`.
  */
 
-/**
- * morse_reg_set_alpha - Set the regulatory domain rules for a given country
- * @alpha: The desired ISO/IEC Alpha2 Country to apply regulatory rules in
- *
- * Finds a set of regulatory rules based on a given alpha code, looking through
- * the internally-defined domains.
- *
- * Return: A pointer to the matching regdomain, defaults to MM.
- *
- */
-
 const struct morse_regdomain *morse_reg_set_alpha(const char *alpha)
 {
 	const struct morse_regdomain *regdom;
 
-	regdom = morse_reg_alpha_lookup(alpha);
+	regdom = morse_reg_alpha_lookup(alpha, channelization_scheme);
 	if (!(regdom) || !alpha)
 		return NULL;
 
-	morse_dot11ah_channel_set_map(regdom->alpha2);
+	morse_dot11ah_channel_set_map(regdom->alpha2, channelization_scheme);
 
 	return regdom;
 }
@@ -85,7 +80,7 @@ EXPORT_SYMBOL(morse_regdom_to_ieee80211);
 
 const struct morse_reg_rule *morse_regdom_get_rule_for_freq(const char *alpha, int frequency)
 {
-	const struct morse_regdomain *regdom = morse_reg_alpha_lookup(alpha);
+	const struct morse_regdomain *regdom = morse_reg_alpha_lookup(alpha, channelization_scheme);
 	int i;
 
 	for (i = 0; i < regdom->n_reg_rules; i++) {
@@ -150,3 +145,32 @@ int morse_mac_set_country_info_from_regdom(const struct morse_regdomain *morse_d
 	return 0;
 }
 EXPORT_SYMBOL(morse_mac_set_country_info_from_regdom);
+
+u32 morse_dot11ah_get_channelization_scheme(void)
+{
+	return channelization_scheme;
+}
+EXPORT_SYMBOL(morse_dot11ah_get_channelization_scheme);
+
+void morse_dot11ah_set_channelization_scheme(u32 value)
+{
+	channelization_scheme = value;
+}
+EXPORT_SYMBOL(morse_dot11ah_set_channelization_scheme);
+
+const char *morse_dot11ah_channelization_scheme_to_str(u32 value)
+{
+	switch (value) {
+	case CHANNELIZATION_SCHEME_NONE:
+		return "None";
+	case CHANNELIZATION_SCHEME_IEEE80211_2020:
+		return "IEEE802.11-2020";
+	case CHANNELIZATION_SCHEME_IEEE80211_2024:
+		return "IEEE802.11-2024";
+	case CHANNELIZATION_SCHEME_IEEE80211_REVMF:
+		return "IEEE802.11-REVmf";
+	default:
+		return "Unknown";
+	}
+}
+EXPORT_SYMBOL(morse_dot11ah_channelization_scheme_to_str);

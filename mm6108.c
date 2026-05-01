@@ -108,13 +108,18 @@ static char *mm610x_get_fw_path(u32 chip_id)
 	return kasprintf(GFP_KERNEL, MORSE_FW_DIR "/" MM6108_FW_BASE "%s" MORSE_FW_EXT, fw_variant);
 }
 
-static u8 mm610x_get_wakeup_delay_ms(u32 chip_id)
+static u8 mm610x_get_warm_boot_time_ms(u32 chip_id)
 {
 	/* MM6108A0 takes < 7ms to be active */
 	if (chip_id == MM6108A0_ID || chip_id == MM6108A1_ID)
 		return 10;
 	else
 		return 20;
+}
+
+static u32 mm610x_get_cold_boot_time_ms(u32 chip_id)
+{
+	return 1000;
 }
 
 static int mm610x_enable_burst_mode(struct morse *mors, const u8 burst_mode)
@@ -319,8 +324,9 @@ static const struct morse_hw_regs mm6108_regs = {
 struct morse_hw_cfg mm6108_cfg = {
 	.regs = &mm6108_regs,
 	.chip_id_address = MM6108_REG_CHIP_ID,
-	.ops = &morse_pageset_hw_ops,
-	.get_ps_wakeup_delay_ms = mm610x_get_wakeup_delay_ms,
+	.ops = &morse_pageset_ops,
+	.get_warm_boot_time_ms = mm610x_get_warm_boot_time_ms,
+	.get_cold_boot_time_ms = mm610x_get_cold_boot_time_ms,
 	.enable_sdio_burst_mode = mm610x_enable_burst_mode,
 	.get_board_type = mm610x_read_board_type,
 	.get_encoded_country = mm610x_read_encoded_country,

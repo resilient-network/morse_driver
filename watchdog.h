@@ -15,10 +15,8 @@ typedef int (*watchdog_callback_t)(struct morse *);
  * @mors: The global morse config object
  * @interval_s: The parameter holds the timeout interval in seconds
  * @ping: The pointer to ping callback function
- *
- * Return 0 if success else error code
  */
-int morse_watchdog_init(struct morse *mors, uint interval_s,
+void morse_watchdog_init(struct morse *mors, uint interval_s,
 	watchdog_callback_t ping);
 
 /**

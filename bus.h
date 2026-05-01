@@ -31,6 +31,7 @@ struct morse_bus_ops {
 	int (*reg32_write)(struct morse *mors, u32 addr, u32 data);
 	int (*skb_tx)(struct morse *mors, struct sk_buff *skb, u8 channel);
 	int (*reset)(struct morse *mors);
+	int (*config_pm_flags)(struct morse *mors);
 	void (*set_bus_enable)(struct morse *mors, bool enable);
 	void (*config_burst_mode)(struct morse *mors, bool enable_burst);
 	void (*claim)(struct morse *mors);
@@ -70,6 +71,12 @@ static inline void morse_set_bus_enable(struct morse *mors, bool enable)
 	mors->bus_ops->set_bus_enable(mors, enable);
 }
 
+/**
+ * morse_claim_bus() - Claim the underlying bus (SDIO/SPI/USB).
+ * @mors: Global morse struct
+ *
+ * DO NOT perform recursive locking as underlying implementation disallows this.
+ */
 static inline void morse_claim_bus(struct morse *mors)
 {
 	mors->bus_ops->claim(mors);

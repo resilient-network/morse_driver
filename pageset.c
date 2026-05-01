@@ -4,19 +4,17 @@
  * SPDX-License-Identifier: GPL-2.0-or-later
  *
  */
-
+#include <linux/gpio.h>
 #include "morse.h"
 #include "debug.h"
 #include "pageset.h"
-#include "pager_if.h"
 #include "skb_header.h"
 #include "ps.h"
 #include "hw.h"
 #include "bus.h"
 #include "ipmon.h"
-#include <linux/gpio.h>
-#include "pager_if_hw.h"
-#include "pager_if_sw.h"
+#include "pager_hw.h"
+#include "trace.h"
 
 /* Defined as the most number of MPDUs per AMPDU */
 #ifndef MAX_PAGES_PER_TX_TXN
@@ -35,6 +33,33 @@
 
 /* Time in milliseconds to wait for the beacon tasklet to queue the beacon to skbq */
 #define BEACON_TASKLET_WAITQ_TIMEOUT 1
+
+/* Value to use when ACI is not applicable to queue lookup */
+#define TX_Q_NO_ACI (-1)
+
+static void pageset_tx_status_irq_enable(struct morse *mors, bool enable)
+{
+	int ret = morse_hw_irq_enable(mors, MORSE_PAGER_BYPASS_TX_STATUS_IRQ_NUM, enable);
+
+	if (ret)
+		MORSE_ERR(mors, "%s: failed (ret:%d)\n", __func__, ret);
+}
+
+static void pageset_cmd_resp_irq_enable(struct morse *mors, bool enable)
+{
+	int ret = morse_hw_irq_enable(mors, MORSE_PAGER_BYPASS_CMD_RESP_IRQ_NUM, enable);
+
+	if (ret)
+		MORSE_ERR(mors, "%s: failed (ret:%d)\n", __func__, ret);
+}
+
+static void pageset_pager_irq_enable(const struct morse_pager *pager, bool enable)
+{
+	int ret = morse_hw_irq_enable(pager->mors, pager->id, enable);
+
+	if (ret)
+		MORSE_ERR(pager->mors, "%s: [%d] failed (ret:%d)\n", __func__, pager->id, ret);
+}
 
 static int is_pageset_locked(struct morse_pageset *pageset)
 {
@@ -61,7 +86,10 @@ static inline struct morse_skbq *skbq_pageset_tc_q_from_aci(struct morse *mors, 
 	if (!pageset)
 		return NULL;
 
-	if (aci >= ARRAY_SIZE(pageset->data_qs))
+	if (aci == TX_Q_NO_ACI)
+		return NULL;
+
+	if (aci < 0 || aci >= ARRAY_SIZE(pageset->data_qs))
 		return NULL;
 
 	return &pageset->data_qs[aci];
@@ -85,6 +113,28 @@ static struct morse_skbq *skbq_pageset_bcn_tc_q(struct morse *mors)
 static struct morse_skbq *skbq_pageset_mgmt_tc_q(struct morse *mors)
 {
 	return (mors->chip_if->to_chip_pageset) ? &mors->chip_if->to_chip_pageset->mgmt_q : NULL;
+}
+
+static struct morse_skbq *skbq_pageset_get_q(struct morse *mors,
+					     enum morse_skb_channel channel,
+					     int aci)
+{
+	switch (channel) {
+	case MORSE_SKB_CHAN_DATA:
+	case MORSE_SKB_CHAN_WIPHY:
+	case MORSE_SKB_CHAN_LOOPBACK:
+	case MORSE_SKB_CHAN_DATA_NOACK:
+		return skbq_pageset_tc_q_from_aci(mors, aci);
+	case MORSE_SKB_CHAN_MGMT:
+		return skbq_pageset_mgmt_tc_q(mors);
+	case MORSE_SKB_CHAN_BEACON:
+		return skbq_pageset_bcn_tc_q(mors);
+	case MORSE_SKB_CHAN_COMMAND:
+		return mors->chip_if->to_chip_pageset ?
+		       pageset2cmdq(mors->chip_if->to_chip_pageset) : NULL;
+	default:
+		return NULL;
+	}
 }
 
 static void skbq_pageset_get_tx_qs(struct morse *mors, struct morse_skbq **qs, int *num_qs)
@@ -113,34 +163,90 @@ static int morse_pageset_get_rx_buffered_count(struct morse *mors)
 	return skbq->skbq.qlen;
 }
 
-const struct chip_if_ops morse_pageset_hw_ops = {
-	.init = morse_pager_hw_pagesets_init,
-	.hw_restarted = morse_pager_hw_pagesets_init,
-	.flush_tx_data = morse_pager_hw_pagesets_flush_tx_data,
-	.skbq_get_tx_status_pending_count = morse_pagesets_get_tx_status_pending_count,
-	.skbq_get_tx_buffered_count = morse_pagesets_get_tx_buffered_count,
-	.finish = morse_pager_hw_pagesets_finish,
-	.skbq_get_tx_qs = skbq_pageset_get_tx_qs,
-	.skbq_bcn_tc_q = skbq_pageset_bcn_tc_q,
-	.skbq_mgmt_tc_q = skbq_pageset_mgmt_tc_q,
-	.skbq_cmd_tc_q = skbq_pageset_cmd_tc_q,
-	.skbq_tc_q_from_aci = skbq_pageset_tc_q_from_aci,
-	.chip_if_handle_irq = morse_pager_irq_handler
-};
+static void morse_pageset_flush_cache(struct morse *mors, struct morse_pageset *pageset)
+{
+	if (pageset_lock(pageset)) {
+		/* Failed to acquire pageset lock - bail */
+		MORSE_WARN(mors, "%s: failed to lock pageset\n", __func__);
+		return;
+	}
 
-const struct chip_if_ops morse_pageset_sw_ops = {
-	.init = morse_pager_sw_pagesets_init,
-	.flush_tx_data = morse_pager_sw_pagesets_flush_tx_data,
-	.skbq_get_tx_status_pending_count = morse_pagesets_get_tx_status_pending_count,
-	.skbq_get_tx_buffered_count = morse_pagesets_get_tx_buffered_count,
-	.finish = morse_pager_sw_pagesets_finish,
-	.skbq_get_tx_qs = skbq_pageset_get_tx_qs,
-	.skbq_bcn_tc_q = skbq_pageset_bcn_tc_q,
-	.skbq_mgmt_tc_q = skbq_pageset_mgmt_tc_q,
-	.skbq_cmd_tc_q = skbq_pageset_cmd_tc_q,
-	.skbq_tc_q_from_aci = skbq_pageset_tc_q_from_aci,
-	.chip_if_handle_irq = morse_pager_irq_handler
-};
+	kfifo_reset(&pageset->cached_pages);
+	kfifo_reset(&pageset->reserved_pages);
+
+	morse_pager_hw_flush_cache(pageset->populated_pager);
+	morse_pager_hw_flush_cache(pageset->return_pager);
+
+	pageset_unlock(pageset);
+}
+
+static void pagesets_flush_all_caches(struct morse *mors)
+{
+	morse_pageset_flush_cache(mors, mors->chip_if->to_chip_pageset);
+	morse_pageset_flush_cache(mors, mors->chip_if->from_chip_pageset);
+}
+
+static int morse_pageset_irq_handler(struct morse *mors, u32 status)
+{
+	int count;
+	int ret;
+	struct morse_pager *pager;
+	struct morse_chip_if_state *chip_if = mors->chip_if;
+	bool rx_pend = false;
+	bool tx_buffer_return_pend = false;
+	bool is_tx_status_bypass = false;
+	bool is_cmd_resp_bypass = false;
+
+	for (count = 0; count < chip_if->pager_count; count++) {
+		if (!(status & MORSE_PAGER_IRQ_MASK(count)))
+			continue;
+
+		pager = &chip_if->pagers[count];
+
+		if (pager->flags & MORSE_PAGER_FLAGS_POPULATED)
+			rx_pend = true;
+		else
+			tx_buffer_return_pend = true;
+	}
+
+	/* Check the bypass locations for 'RX' pending */
+	is_tx_status_bypass = !!(status & MORSE_PAGER_IRQ_BYPASS_TX_STATUS_AVAILABLE);
+	is_cmd_resp_bypass = !!(status & MORSE_PAGER_IRQ_BYPASS_CMD_RESP_AVAILABLE);
+
+	if (is_tx_status_bypass && chip_if->bypass.tx_sts.location) {
+		u32 page;
+
+		ret = morse_reg32_read(mors, chip_if->bypass.tx_sts.location, &page);
+		if (ret == 0) {
+			ret = kfifo_put(&chip_if->bypass.tx_sts.to_process, page);
+			MORSE_WARN_ON(FEATURE_ID_DEFAULT, ret == 0);
+			rx_pend = true;
+		}
+	}
+
+	if (is_cmd_resp_bypass && chip_if->bypass.cmd_resp.location) {
+		u32 page;
+
+		ret = morse_reg32_read(mors, chip_if->bypass.cmd_resp.location, &page);
+		if (ret == 0) {
+			ret = kfifo_put(&chip_if->bypass.cmd_resp.to_process, page);
+			MORSE_WARN_ON(FEATURE_ID_DEFAULT, ret == 0);
+			rx_pend = true;
+		}
+	}
+
+	if (rx_pend || tx_buffer_return_pend) {
+		if (rx_pend)
+			set_bit(MORSE_RX_PEND, &chip_if->event_flags);
+
+		if (tx_buffer_return_pend)
+			set_bit(MORSE_PAGE_RETURN_PEND, &chip_if->event_flags);
+
+		queue_work(mors->chip_wq, &mors->chip_if_work);
+	}
+
+	return 0;
+}
 
 static bool morse_pageset_page_is_cached(struct morse_pageset *pageset, struct morse_page *page)
 {
@@ -185,7 +291,7 @@ static void morse_pageset_to_chip_return_handler_no_lock(struct morse *mors)
 	MORSE_WARN_ON(FEATURE_ID_PAGER, !is_pageset_locked(pageset));
 
 	while (kfifo_len(&pageset->reserved_pages) < CMD_RSVED_PAGES_MAX) {
-		if (pager->ops->pop(pager, &page)) {
+		if (morse_pager_hw_pop(pager, &page)) {
 			pager_empty = true;
 			break;
 		}
@@ -202,7 +308,7 @@ static void morse_pageset_to_chip_return_handler_no_lock(struct morse *mors)
 		goto exit;
 
 	while (popped < max_expected_pops) {
-		if (pager->ops->pop(pager, &page))
+		if (morse_pager_hw_pop(pager, &page))
 			break;
 
 		popped++;
@@ -216,8 +322,9 @@ static void morse_pageset_to_chip_return_handler_no_lock(struct morse *mors)
 	MORSE_WARN_ON(FEATURE_ID_PAGER, popped >= max_expected_pops);
 
 exit:
+	trace_pagesets_tx_buffers_avail(popped);
 	if (popped)
-		pager->ops->notify(pager);
+		morse_pager_hw_notify(pager);
 }
 
 static void morse_pageset_to_chip_return_handler(struct morse *mors, bool have_lock)
@@ -260,7 +367,8 @@ static void morse_pageset_bcn_loss_monitor(struct morse *mors)
 	bcn_page_fail = 0;
 }
 
-static bool morse_pageset_rsved_page_is_avail(struct morse_pageset *pageset, u8 channel,
+static bool morse_pageset_rsved_page_is_avail(struct morse_pageset *pageset,
+					      enum morse_skb_channel channel,
 					      bool have_lock)
 {
 	struct morse *mors = pageset->mors;
@@ -297,9 +405,9 @@ static bool morse_pageset_rsved_page_is_avail(struct morse_pageset *pageset, u8 
 			}
 		}
 		return (kfifo_len(&pageset->reserved_pages) > 0);
+	default:
+		return false;
 	}
-
-	return 0;
 }
 
 static int morse_pageset_write(struct morse_pageset *pageset, struct sk_buff *skb)
@@ -348,7 +456,7 @@ static int morse_pageset_write(struct morse_pageset *pageset, struct sk_buff *sk
 
 	morse_debug_fw_hostif_log_record(mors, true, skb, hdr);
 
-	ret = populated_pager->ops->write_page(populated_pager, &page, 0, skb->data, write_len);
+	ret = morse_pager_hw_page_write(populated_pager, &page, 0, skb->data, write_len);
 	if (ret) {
 		MORSE_ERR(mors, "%s failed to write page: %d\n", __func__, ret);
 		/* Put the page back into the cache */
@@ -361,7 +469,7 @@ static int morse_pageset_write(struct morse_pageset *pageset, struct sk_buff *sk
 	}
 
 	/* Put the filled page to send it to the chip */
-	ret = populated_pager->ops->put(populated_pager, &page);
+	ret = morse_pager_hw_put(populated_pager, &page);
 	if (ret) {
 		MORSE_ERR(mors, "%s failed to return page: %d\n", __func__, ret);
 		/* Return page to avoid page leak.
@@ -371,9 +479,12 @@ static int morse_pageset_write(struct morse_pageset *pageset, struct sk_buff *sk
 		 * additional synchronisation.
 		 */
 		hdr->sync = 0;
-		populated_pager->ops->write_page(populated_pager, &page, 0,
-						 (const char *)hdr, sizeof(*hdr));
-		populated_pager->ops->put(populated_pager, &page);
+		morse_pager_hw_page_write(populated_pager,
+					  &page,
+					  0,
+					  (const char *)hdr,
+					  sizeof(*hdr));
+		morse_pager_hw_put(populated_pager, &page);
 		goto exit;
 	}
 
@@ -413,7 +524,7 @@ static int morse_pageset_read(struct morse_pageset *pageset)
 		page.size_bytes = populated_pager->page_size_bytes;
 	} else {
 		/* Pop one page from pager */
-		ret = populated_pager->ops->pop(populated_pager, &page);
+		ret = morse_pager_hw_pop(populated_pager, &page);
 		if (ret) {
 			/* No pages left */
 			page.addr = 0;
@@ -433,7 +544,7 @@ static int morse_pageset_read(struct morse_pageset *pageset)
 	skb_put(skb, skb_len);
 
 	/* Read page data */
-	ret = populated_pager->ops->read_page(populated_pager, &page, 0, skb->data, skb_len);
+	ret = morse_pager_hw_page_read(populated_pager, &page, 0, skb->data, skb_len);
 
 	if (ret) {
 		MORSE_ERR(mors, "%s failed to read page: %d\n", __func__, ret);
@@ -480,8 +591,7 @@ static int morse_pageset_read(struct morse_pageset *pageset)
 		 */
 		if (hdr->channel != MORSE_SKB_CHAN_TX_STATUS)
 			break;
-		ret =
-		    populated_pager->ops->read_page(populated_pager, &page, 0, skb->data, skb_len);
+		ret = morse_pager_hw_page_read(populated_pager, &page, 0, skb->data, skb_len);
 		if (ret)
 			break;
 		count++;
@@ -581,7 +691,7 @@ exit:
 
 	if (page.addr) {
 		/* Put the emptied page to send it back to the chip */
-		ret = return_pager->ops->put(return_pager, &page);
+		ret = morse_pager_hw_put(return_pager, &page);
 		if (ret)
 			MORSE_ERR(mors, "%s: return page failed: %d\n", __func__, ret);
 	}
@@ -595,17 +705,16 @@ exit:
  *   time and there is a reserved page for it. If anything goes wrong the command will
  *   be dropped.
  */
-static int morse_pageset_num_pages(struct morse_pageset *pageset, struct sk_buff *skb)
+static int morse_pageset_num_pages(struct morse_pageset *pageset, enum morse_skb_channel channel)
 {
-	struct morse_buff_skb_header *hdr = (struct morse_buff_skb_header *)skb->data;
 	int num_pages = 0;
 
-	if (hdr->channel == MORSE_SKB_CHAN_COMMAND) {
+	if (channel == MORSE_SKB_CHAN_COMMAND) {
 		num_pages = min(CMD_RSVED_CMD_PAGES_MAX,
 				(int)kfifo_len(&pageset->reserved_pages) +
 				(int)kfifo_len(&pageset->cached_pages));
 	} else {
-		if (morse_pageset_rsved_page_is_avail(pageset, hdr->channel, false))
+		if (morse_pageset_rsved_page_is_avail(pageset, channel, false))
 			num_pages = (CMD_RSVED_PAGES_MAX - CMD_RSVED_CMD_PAGES_MAX);
 
 		num_pages = min(MAX_PAGES_PER_TX_TXN,
@@ -615,50 +724,58 @@ static int morse_pageset_num_pages(struct morse_pageset *pageset, struct sk_buff
 	return num_pages;
 }
 
-static void morse_pageset_tx(struct morse_pageset *pageset, struct morse_skbq *mq)
+/* Returns: less than zero (error), 0 (all tx transmitted), greater than zero (more to tx) */
+static int morse_pageset_tx(struct morse_pageset *pageset, enum morse_skb_channel channel, int aci)
 {
-	int ret = 0;
-	int num_pages;
-	int num_items = 0;
-	struct sk_buff *skb;
+	int n_pages_avail;
+	int n_to_tx;
+	int n_to_dequeue_and_tx;
 	struct sk_buff_head skbq_to_send;
 	struct sk_buff_head skbq_sent;
 	struct sk_buff_head skbq_failed;
 	struct sk_buff *pfirst, *pnext;
 	struct morse *mors = pageset->mors;
 	struct morse_buff_skb_header *hdr;
+	struct morse_skbq *mq;
+	uint count = 0;
 
-	spin_lock_bh(&mq->lock);
-	skb = skb_peek(&mq->skbq);
-	if (skb)
-		num_pages = morse_pageset_num_pages(pageset, skb);
-	spin_unlock_bh(&mq->lock);
+	mq = skbq_pageset_get_q(mors, channel, aci);
+	if (!mq)
+		return -EPERM;
 
-	if (!skb)
-		return;
+	n_to_tx = morse_skbq_count(mq);
+	if (!n_to_tx)
+		return 0; /* Nothing to transmit from this mq */
+
+	n_pages_avail = morse_pageset_num_pages(pageset, channel);
+	if (!n_pages_avail && n_to_tx)
+		return -ENOMEM; /* No pages to transmit at all! */
 
 	__skb_queue_head_init(&skbq_to_send);
 	__skb_queue_head_init(&skbq_sent);
 	__skb_queue_head_init(&skbq_failed);
 
-	if (mq == &pageset->cmd_q)
+	if (channel == MORSE_SKB_CHAN_COMMAND) {
 		/* Purge timed-out commands (this should not happen) */
 		morse_skbq_purge(mq, &mq->pending);
-	else if (mq == &pageset->mgmt_q && mq->skbq.qlen > 0)
+	} else if (channel == MORSE_SKB_CHAN_MGMT && n_to_tx) {
 		/* Purge old mgmt frames that have not been sent due to congestion */
 		morse_skbq_purge_aged(mors, mq);
+	}
 
-	if (num_pages > 0)
-		num_items = morse_skbq_deq_num_items(mq, &skbq_to_send, num_pages);
-
+	/* Dequeue */
+	n_to_dequeue_and_tx = morse_skbq_deq_num_items(mq, &skbq_to_send, n_pages_avail);
 	skb_queue_walk_safe(&skbq_to_send, pfirst, pnext) {
-		if (num_pages) {
+		int ret;
+
+		if (n_pages_avail) {
 			ret = morse_pageset_write(pageset, pfirst);
 		} else {
 			mors->debug.page_stats.no_page++;
 			MORSE_ERR(mors, "%s no pages available\n", __func__);
-			ret = -ENOSPC;
+			ret = -ENOMEM;
 		}
+
 		if (ret == 0) {
 			hdr = (struct morse_buff_skb_header *)pfirst->data;
 			switch (hdr->channel) {
@@ -675,9 +792,10 @@ static void morse_pageset_tx(struct morse_pageset *pageset, struct morse_skbq *m
 				mors->debug.page_stats.data_tx++;
 				break;
 			}
-			num_pages--;
+			n_pages_avail--;
 			__skb_unlink(pfirst, &skbq_to_send);
 			__skb_queue_tail(&skbq_sent, pfirst);
+			count++;
 		} else {
 			__skb_unlink(pfirst, &skbq_to_send);
 			__skb_queue_tail(&skbq_failed, pfirst);
@@ -686,37 +804,42 @@ static void morse_pageset_tx(struct morse_pageset *pageset, struct morse_skbq *m
 
 	if (skbq_failed.qlen > 0) {
 		mors->debug.page_stats.write_fail += skbq_failed.qlen;
-		MORSE_ERR(mors, "%s could not write %d pkts - rc=%d items=%d pages=%d",
-			  __func__, skbq_failed.qlen, ret, num_items, num_pages);
+		MORSE_ERR(mors,
+			  "%s: could not write %d pkts - dequeued=%d transmitted=%d remaining=%d\n",
+			  __func__, skbq_failed.qlen, n_to_dequeue_and_tx, count, n_pages_avail);
 		morse_skbq_purge(NULL, &skbq_failed);
 	}
 
 	if (skbq_sent.qlen > 0) {
 		morse_skbq_tx_complete(mq, &skbq_sent);
-		pageset->populated_pager->ops->notify(pageset->populated_pager);
+		morse_pager_hw_notify(pageset->populated_pager);
 	}
+
+	trace_pagesets_tx(channel, count);
+	return (n_to_tx - n_to_dequeue_and_tx);
 }
 
 /* Returns true if there are TX data pages waiting to be sent */
-static bool morse_pageset_tx_data_handler(struct morse_pageset *pageset)
+static bool pageset_tx_from_data_qs(struct morse *mors)
 {
 	s16 aci;
-	u32 count = 0;
-	struct morse *mors = pageset->mors;
+	uint remaining = 0;
+	struct morse_pageset *pageset = mors->chip_if->to_chip_pageset;
 
 	for (aci = MORSE_ACI_VO; aci >= 0; aci--) {
-		struct morse_skbq *data_q = skbq_pageset_tc_q_from_aci(mors, aci);
+		int ret;
 
 		if (!morse_is_data_tx_allowed(mors))
 			break;
 
-		morse_pageset_tx(pageset, data_q);
-
-		count += morse_skbq_count(data_q);
-
-		if (aci == MORSE_ACI_BE)
-			break;
+		ret = morse_pageset_tx(pageset, MORSE_SKB_CHAN_DATA, aci);
+		if (ret > 0)
+			remaining += ret;
+		else if (ret == -ENOMEM)
+			remaining += 1;
 	}
+
+	trace_pagesets_tx_remaining(MORSE_SKB_CHAN_DATA, remaining);
 
 	/* Data has potentially been transmitted from the data SKBQs.
 	 * If the mac80211 TX data Qs were previously stopped,
@@ -727,35 +850,33 @@ static bool morse_pageset_tx_data_handler(struct morse_pageset *pageset)
 	    !test_bit(MORSE_STATE_FLAG_DATA_QS_STOPPED, &mors->state_flags))
 		tasklet_schedule(&mors->tasklet_txq);
 
-	return (count > 0) && morse_is_data_tx_allowed(mors);
+	return (remaining > 0) && morse_is_data_tx_allowed(mors);
 }
 
-/* Returns true if there are commands waiting to be sent */
-static bool morse_pageset_tx_cmd_handler(struct morse_pageset *pageset)
+/* Returns true if there is more of this channel type pending after transmit */
+static bool pageset_tx_from_skb_channel(struct morse *mors, enum morse_skb_channel channel)
 {
-	struct morse_skbq *cmd_q = pageset2cmdq(pageset);
+	bool more_tx;
 
-	morse_pageset_tx(pageset, cmd_q);
+	if (channel == MORSE_SKB_CHAN_DATA) {
+		/* data channel is handled differently to other cases */
+		more_tx = pageset_tx_from_data_qs(mors);
+	} else {
+		int ret;
+		uint remaining = 0;
+		struct morse_pageset *pageset = mors->chip_if->to_chip_pageset;
 
-	return (morse_skbq_count(cmd_q) > 0);
-}
+		ret = morse_pageset_tx(pageset, channel, TX_Q_NO_ACI);
+		if (ret > 0)
+			remaining += ret;
+		else if (ret == -ENOMEM)
+			remaining += 1;
 
-static bool morse_pageset_tx_beacon_handler(struct morse_pageset *pageset)
-{
-	struct morse_skbq *beacon_q = &pageset->beacon_q;
+		trace_pagesets_tx_remaining(channel, remaining);
+		more_tx = (remaining > 0);
+	}
 
-	morse_pageset_tx(pageset, beacon_q);
-
-	return (morse_skbq_count(beacon_q) > 0);
-}
-
-static bool morse_pageset_tx_mgmt_handler(struct morse_pageset *pageset)
-{
-	struct morse_skbq *mgmt_q = &pageset->mgmt_q;
-
-	morse_pageset_tx(pageset, mgmt_q);
-
-	return (morse_skbq_count(mgmt_q) > 0);
+	return more_tx;
 }
 
 /**
@@ -794,26 +915,28 @@ static bool morse_pageset_rx_handler(struct morse_pageset *pageset,
 		count++;
 		return_notify_req = true;
 		if ((count % PAGE_RETURN_NOTIFY_INT) == 0) {
-			pageset->return_pager->ops->notify(pageset->return_pager);
+			morse_pager_hw_notify(pageset->return_pager);
 			return_notify_req = false;
 
 			if (do_beacon_irq_check &&
 			    (morse_is_beacon_request_interrupt_set(pageset->mors))) {
 				*is_beacon_pending = true;
+				trace_pagesets_stopped_rx_for_beacon_tx(count);
 				break;
 			}
 		}
 	} while ((count < MAX_PAGES_PER_RX_TXN) && (ret == 0));
 
+	trace_pagesets_rx(count);
 	MORSE_WARN_ON(FEATURE_ID_PAGER,
 		      kfifo_len(&pageset->mors->chip_if->bypass.tx_sts.to_process) > 0);
 	MORSE_WARN_ON(FEATURE_ID_PAGER,
 		      kfifo_len(&pageset->mors->chip_if->bypass.cmd_resp.to_process) > 0);
 
 	if (return_notify_req)
-		pageset->return_pager->ops->notify(pageset->return_pager);
+		morse_pager_hw_notify(pageset->return_pager);
 
-	pageset->populated_pager->ops->notify(pageset->populated_pager);
+	morse_pager_hw_notify(pageset->populated_pager);
 
 	if (ret == -ENOMEM || count == MAX_PAGES_PER_RX_TXN ||
 	    (do_beacon_irq_check && *is_beacon_pending))
@@ -822,7 +945,33 @@ static bool morse_pageset_rx_handler(struct morse_pageset *pageset,
 		return false;
 }
 
-void morse_pagesets_stale_tx_work(struct work_struct *work)
+static int pagesets_get_tx_buffered_count(struct morse *mors)
+{
+	int i = 0;
+	int count = 0;
+	struct morse_pageset *tx_pageset;
+
+	if (!mors->chip_if || !mors->chip_if->to_chip_pageset)
+		return 0;
+
+	tx_pageset = mors->chip_if->to_chip_pageset;
+	if (!(tx_pageset->flags & MORSE_CHIP_IF_FLAGS_DIR_TO_CHIP)) {
+		MORSE_WARN_ON_ONCE(FEATURE_ID_PAGER, 1);
+		return 0;
+	}
+
+	count += tx_pageset->beacon_q.skbq.qlen + tx_pageset->beacon_q.pending.qlen;
+	count += tx_pageset->mgmt_q.skbq.qlen + tx_pageset->mgmt_q.pending.qlen;
+	count += tx_pageset->cmd_q.skbq.qlen + tx_pageset->cmd_q.pending.qlen;
+
+	for (i = 0; i < ARRAY_SIZE(tx_pageset->data_qs); i++)
+		count += morse_skbq_count_tx_ready(&tx_pageset->data_qs[i]) +
+		    tx_pageset->data_qs[i].pending.qlen;
+
+	return count;
+}
+
+static void morse_pagesets_stale_tx_work(struct work_struct *work)
 {
 	int i;
 	int flushed = 0;
@@ -840,40 +989,46 @@ void morse_pagesets_stale_tx_work(struct work_struct *work)
 		flushed += morse_skbq_check_for_stale_tx(mors, &tx_pageset->data_qs[i]);
 
 	if (flushed) {
+		trace_pagesets_stale_tx_flushed(flushed);
 		MORSE_DBG(mors, "%s: Flushed %d stale TX SKBs\n", __func__, flushed);
 
-		if (mors->ps.enable &&
-		    !mors->ps.suspended && (morse_pagesets_get_tx_buffered_count(mors) == 0)) {
+		if (pagesets_get_tx_buffered_count(mors) == 0) {
 			/* Evaluate ps to check if it was gated on a stale tx status */
-			queue_delayed_work(mors->chip_wq, &mors->ps.delayed_eval_work, 0);
+			morse_ps_queue_eval(mors);
 		}
 	}
 }
 
-void morse_pagesets_work(struct work_struct *work)
+static void morse_pagesets_work(struct work_struct *work)
 {
-	struct morse *mors = container_of(work,
-					  struct morse, chip_if_work);
+	struct morse *mors = container_of(work, struct morse, chip_if_work);
 	int ps_bus_timeout_ms = 0;
-	unsigned long flags_on_entry = mors->chip_if->event_flags;
+	unsigned long flags_on_entry;
 	unsigned long *flags = &mors->chip_if->event_flags;
 	int rx_buffered_on_entry = morse_pageset_get_rx_buffered_count(mors);
 	bool is_beacon_pending = false;
 
+	flags_on_entry = READ_ONCE(mors->chip_if->event_flags);
+	trace_pagesets_work_enter(flags_on_entry);
 	if (!flags_on_entry)
-		return;
+		goto exit;
 
 	/* Don't attempt to interact with device once it becomes unresponsive */
-	if (test_bit(MORSE_STATE_FLAG_CHIP_UNRESPONSIVE, &mors->state_flags))
-		return;
+	if (!morse_hw_is_on(mors))
+		goto exit;
 
-	/* Disable power save in case it is running */
-	morse_ps_disable(mors);
+	/* Once the system starts suspend process, prevent chip communication */
+	if (test_bit(MORSE_STATE_FLAG_SYSTEM_IN_SUSPEND, &mors->state_flags))
+		goto exit;
+
+	/* Ensure chip is awake while communicating with it */
+	morse_ps_wakers_inc(mors);
+	morse_ps_force_eval(mors);
 	morse_claim_bus(mors);
 
 	/* Tx beacons first */
 	if (test_and_clear_bit(MORSE_TX_BEACON_PEND, flags)) {
-		if (morse_pageset_tx_beacon_handler(mors->chip_if->to_chip_pageset))
+		if (pageset_tx_from_skb_channel(mors, MORSE_SKB_CHAN_BEACON))
 			set_bit(MORSE_TX_BEACON_PEND, flags);
 	}
 
@@ -903,13 +1058,13 @@ void morse_pagesets_work(struct work_struct *work)
 
 	/* TX any commands before anything else */
 	if (test_and_clear_bit(MORSE_TX_COMMAND_PEND, flags)) {
-		if (morse_pageset_tx_cmd_handler(mors->chip_if->to_chip_pageset))
+		if (pageset_tx_from_skb_channel(mors, MORSE_SKB_CHAN_COMMAND))
 			set_bit(MORSE_TX_COMMAND_PEND, flags);
 	}
 
 	/* TX beacons before considering mgmt/data */
 	if (test_and_clear_bit(MORSE_TX_BEACON_PEND, flags)) {
-		if (morse_pageset_tx_beacon_handler(mors->chip_if->to_chip_pageset))
+		if (pageset_tx_from_skb_channel(mors, MORSE_SKB_CHAN_BEACON))
 			set_bit(MORSE_TX_BEACON_PEND, flags);
 	}
 
@@ -921,7 +1076,7 @@ void morse_pagesets_work(struct work_struct *work)
 
 	/* TX mgmt before considering data */
 	if (test_and_clear_bit(MORSE_TX_MGMT_PEND, flags)) {
-		if (morse_pageset_tx_mgmt_handler(mors->chip_if->to_chip_pageset))
+		if (pageset_tx_from_skb_channel(mors, MORSE_SKB_CHAN_MGMT))
 			set_bit(MORSE_TX_MGMT_PEND, flags);
 	}
 
@@ -945,7 +1100,7 @@ void morse_pagesets_work(struct work_struct *work)
 
 	/* Finally TX any data */
 	if (test_and_clear_bit(MORSE_TX_DATA_PEND, flags)) {
-		if (morse_pageset_tx_data_handler(mors->chip_if->to_chip_pageset))
+		if (pageset_tx_from_skb_channel(mors, MORSE_SKB_CHAN_DATA))
 			set_bit(MORSE_TX_DATA_PEND, flags);
 	}
 
@@ -956,7 +1111,7 @@ void morse_pagesets_work(struct work_struct *work)
 	if (test_bit(MORSE_TX_DATA_PEND, &flags_on_entry) ||
 	    test_bit(MORSE_TX_MGMT_PEND, &flags_on_entry) ||
 	    morse_pageset_get_rx_buffered_count(mors) > rx_buffered_on_entry)
-		ps_bus_timeout_ms = max(ps_bus_timeout_ms, morse_network_bus_timeout(mors));
+		ps_bus_timeout_ms = max(ps_bus_timeout_ms, mors_ps_get_net_timeout_ms(mors));
 
 	if (test_and_clear_bit(MORSE_UPDATE_HW_CLOCK_REFERENCE, flags))
 		morse_hw_clock_update(mors);
@@ -964,9 +1119,9 @@ void morse_pagesets_work(struct work_struct *work)
 	if (ps_bus_timeout_ms)
 		morse_ps_bus_activity(mors, ps_bus_timeout_ms);
 
-	/* Disable power save in case it is running */
 	morse_release_bus(mors);
-	morse_ps_enable(mors);
+	morse_ps_wakers_dec(mors);
+	morse_ps_force_eval(mors);
 
 	/* A single RX event may represent the reception
 	 * of many pages. We might not be able to process all these pages
@@ -978,6 +1133,9 @@ void morse_pagesets_work(struct work_struct *work)
 	 */
 	if (test_bit(MORSE_RX_PEND, flags))
 		queue_work(mors->chip_wq, &mors->chip_if_work);
+
+exit:
+	trace_pagesets_work_exit((READ_ONCE(mors->chip_if->event_flags)));
 }
 
 void morse_pageset_show(struct morse *mors, struct morse_pageset *pageset, struct seq_file *file)
@@ -987,9 +1145,9 @@ void morse_pageset_show(struct morse *mors, struct morse_pageset *pageset, struc
 	seq_printf(file, "flags:0x%01x reserved=%d cached=%d\n",
 		   pageset->flags,
 		   kfifo_len(&pageset->reserved_pages), kfifo_len(&pageset->cached_pages));
+	seq_printf(file, "flags:0x%01x\n", pageset->populated_pager->flags);
+	seq_printf(file, "flags:0x%01x\n", pageset->return_pager->flags);
 
-	morse_pager_show(pageset->mors, pageset->populated_pager, file);
-	morse_pager_show(pageset->mors, pageset->return_pager, file);
 	for (i = 0; i < ARRAY_SIZE(pageset->data_qs); i++)
 		morse_skbq_show(&pageset->data_qs[i], file);
 	morse_skbq_show(&pageset->mgmt_q, file);
@@ -997,9 +1155,11 @@ void morse_pageset_show(struct morse *mors, struct morse_pageset *pageset, struc
 	morse_skbq_show(&pageset->cmd_q, file);
 }
 
-int morse_pageset_init(struct morse *mors, struct morse_pageset *pageset,
-		       u8 flags,
-		       struct morse_pager *populated_pager, struct morse_pager *return_pager)
+static int pageset_init(struct morse *mors,
+			struct morse_pageset *pageset,
+			u8 flags,
+			struct morse_pager *populated_pager,
+			struct morse_pager *return_pager)
 {
 	int i;
 	u16 chip_if_direction_flag;
@@ -1039,14 +1199,10 @@ int morse_pageset_init(struct morse *mors, struct morse_pageset *pageset,
 
 	populated_pager->parent = pageset;
 	return_pager->parent = pageset;
-
-	pageset_trace_init(pageset);
-	pageset_trace_log(populated_pager, PAGESET_TRACE_EVENT_ID_INIT, 0);
-	pageset_trace_log(return_pager, PAGESET_TRACE_EVENT_ID_INIT, 0);
 	return 0;
 }
 
-void morse_pageset_finish(struct morse_pageset *pageset)
+static void pageset_finish(struct morse_pageset *pageset)
 {
 	int i;
 
@@ -1064,23 +1220,7 @@ void morse_pageset_finish(struct morse_pageset *pageset)
 		morse_skbq_finish(&pageset->cmd_q);
 }
 
-void morse_pageset_flush_tx_data(struct morse_pageset *pageset)
-{
-	int i;
-
-	if (!(pageset->flags & (MORSE_CHIP_IF_FLAGS_DATA | MORSE_CHIP_IF_FLAGS_BEACON)) ||
-			!(pageset->flags & MORSE_CHIP_IF_FLAGS_DIR_TO_CHIP)) {
-		MORSE_WARN_ON_ONCE(FEATURE_ID_PAGER, 1);
-		return;
-	}
-
-	morse_skbq_tx_flush(&pageset->beacon_q);
-	morse_skbq_tx_flush(&pageset->mgmt_q);
-	for (i = 0; i < ARRAY_SIZE(pageset->data_qs); i++)
-		morse_skbq_tx_flush(&pageset->data_qs[i]);
-}
-
-int morse_pagesets_get_tx_status_pending_count(struct morse *mors)
+static int pagesets_get_tx_status_pending_count(struct morse *mors)
 {
 	int i = 0;
 	int count = 0;
@@ -1105,28 +1245,233 @@ int morse_pagesets_get_tx_status_pending_count(struct morse *mors)
 	return count;
 }
 
-int morse_pagesets_get_tx_buffered_count(struct morse *mors)
+static void pagesets_flush_tx_data(struct morse *mors)
 {
-	int i = 0;
-	int count = 0;
-	struct morse_pageset *tx_pageset;
+	int aci;
+	struct morse_skbq *q;
 
-	if (!mors->chip_if || !mors->chip_if->to_chip_pageset)
-		return 0;
+	q = skbq_pageset_get_q(mors, MORSE_SKB_CHAN_BEACON, TX_Q_NO_ACI);
+	if (q)
+		morse_skbq_tx_flush(q);
 
-	tx_pageset = mors->chip_if->to_chip_pageset;
-	if (!(tx_pageset->flags & MORSE_CHIP_IF_FLAGS_DIR_TO_CHIP)) {
-		MORSE_WARN_ON_ONCE(FEATURE_ID_PAGER, 1);
-		return 0;
+	q = skbq_pageset_get_q(mors, MORSE_SKB_CHAN_MGMT, TX_Q_NO_ACI);
+	if (q)
+		morse_skbq_tx_flush(q);
+
+	for (aci = MORSE_ACI_BE; aci <= MORSE_ACI_VO; aci++) {
+		q = skbq_pageset_get_q(mors, MORSE_SKB_CHAN_DATA, aci);
+		if (q)
+			morse_skbq_tx_flush(q);
+	}
+}
+
+static void pagesets_flush_cmds(struct morse *mors)
+{
+	struct morse_skbq *q = skbq_pageset_get_q(mors, MORSE_SKB_CHAN_COMMAND, TX_Q_NO_ACI);
+
+	if (!q)
+		return;
+
+	morse_skbq_tx_flush(q);
+}
+
+static void pagesets_interrupts_set(struct morse *mors, bool is_init)
+{
+	struct morse_pager *rx_data = mors->chip_if->from_chip_pageset->populated_pager;
+	struct morse_pager *tx_return = mors->chip_if->to_chip_pageset->return_pager;
+
+	pageset_pager_irq_enable(tx_return, is_init);
+	pageset_pager_irq_enable(rx_data, is_init);
+	pageset_tx_status_irq_enable(mors, is_init);
+	pageset_cmd_resp_irq_enable(mors, is_init);
+	morse_hw_enable_stop_notifications(mors, is_init);
+
+	/* Always initialise headless interrupt to false (init or finish flow) */
+	morse_hw_headless_done_irq_enable(mors, false);
+}
+
+static void pagesets_interrupts_suspend(struct morse *mors, bool suspend)
+{
+	struct morse_pager *rx_data = mors->chip_if->from_chip_pageset->populated_pager;
+	struct morse_pager *tx_return = mors->chip_if->to_chip_pageset->return_pager;
+
+	/* Unlike init/finish - not all interrupts are disabled while
+	 * quiescing HW to enter suspend
+	 */
+	pageset_pager_irq_enable(tx_return, !suspend);
+	pageset_pager_irq_enable(rx_data, !suspend);
+	pageset_tx_status_irq_enable(mors, !suspend);
+	pageset_cmd_resp_irq_enable(mors, !suspend);
+}
+
+static void pagesets_free(struct morse *mors)
+{
+	int i;
+	struct morse_pageset *pageset;
+
+	if (!mors->chip_if || !mors->chip_if->pagesets)
+		return;
+
+	for (pageset = mors->chip_if->pagesets, i = 0;
+	     i < mors->chip_if->pageset_count; pageset++, i++)
+		pageset_finish(pageset);
+
+	kfree(mors->chip_if->pagesets);
+	mors->chip_if->pagesets = NULL;
+	mors->chip_if->to_chip_pageset = NULL;
+	mors->chip_if->from_chip_pageset = NULL;
+}
+
+static int pagesets_init(struct morse *mors)
+{
+	int i;
+	int ret;
+	struct morse_pager *pager;
+	struct morse_pager *rx_data = NULL;
+	struct morse_pager *rx_return = NULL;
+	struct morse_pager *tx_data = NULL;
+	struct morse_pager *tx_return = NULL;
+
+	ret = morse_pager_hw_pagers_init(mors);
+	if (ret)
+		return ret;
+
+	mors->chip_if->pagesets = NULL;
+	mors->chip_if->pageset_count = 0;
+
+	/* Tie pagers to the pageset */
+	for (pager = mors->chip_if->pagers, i = 0; i < mors->chip_if->pager_count; pager++, i++) {
+		if ((pager->flags & MORSE_PAGER_FLAGS_DIR_TO_HOST) &&
+		    (pager->flags & MORSE_PAGER_FLAGS_POPULATED)) {
+			rx_data = pager;
+		} else if ((pager->flags & MORSE_PAGER_FLAGS_DIR_TO_HOST) &&
+			   (pager->flags & MORSE_PAGER_FLAGS_FREE)) {
+			rx_return = pager;
+		} else if ((pager->flags & MORSE_PAGER_FLAGS_DIR_TO_CHIP) &&
+			   (pager->flags & MORSE_PAGER_FLAGS_POPULATED)) {
+			tx_data = pager;
+		} else if ((pager->flags & MORSE_PAGER_FLAGS_DIR_TO_CHIP) &&
+			   (pager->flags & MORSE_PAGER_FLAGS_FREE)) {
+			tx_return = pager;
+		} else {
+			MORSE_WARN(mors, "%s: unknown pager flags 0x%x\n", __func__, pager->flags);
+		}
 	}
 
-	count += tx_pageset->beacon_q.skbq.qlen + tx_pageset->beacon_q.pending.qlen;
-	count += tx_pageset->mgmt_q.skbq.qlen + tx_pageset->mgmt_q.pending.qlen;
-	count += tx_pageset->cmd_q.skbq.qlen + tx_pageset->cmd_q.pending.qlen;
+	if (!rx_data || !rx_return || !tx_data || !tx_return) {
+		MORSE_ERR(mors, "%s: insufficient pagers available\n", __func__);
+		ret = -EFAULT;
+		goto err_exit;
+	}
 
-	for (i = 0; i < ARRAY_SIZE(tx_pageset->data_qs); i++)
-		count += morse_skbq_count_tx_ready(&tx_pageset->data_qs[i]) +
-		    tx_pageset->data_qs[i].pending.qlen;
+	/* Setup pagesets */
+	mors->chip_if->pageset_count = 2;
+	mors->chip_if->pagesets = kcalloc(mors->chip_if->pageset_count,
+					  sizeof(struct morse_pageset),
+					  GFP_KERNEL);
 
-	return count;
+	ret = pageset_init(mors, &mors->chip_if->pagesets[0],
+			   (MORSE_CHIP_IF_FLAGS_DIR_TO_CHIP |
+			    MORSE_CHIP_IF_FLAGS_COMMAND |
+			    MORSE_CHIP_IF_FLAGS_DATA), tx_data, tx_return);
+	if (ret)
+		goto err_exit;
+
+	ret = pageset_init(mors, &mors->chip_if->pagesets[1],
+			   (MORSE_CHIP_IF_FLAGS_DIR_TO_HOST |
+			    MORSE_CHIP_IF_FLAGS_COMMAND |
+			    MORSE_CHIP_IF_FLAGS_DATA), rx_data, rx_return);
+	if (ret)
+		goto err_exit;
+
+	/* Only valid while we only have 2 pagesets */
+	mors->chip_if->to_chip_pageset = &mors->chip_if->pagesets[0];
+	mors->chip_if->from_chip_pageset = &mors->chip_if->pagesets[1];
+	INIT_WORK(&mors->chip_if_work, morse_pagesets_work);
+	INIT_WORK(&mors->tx_stale_work, morse_pagesets_stale_tx_work);
+	INIT_KFIFO(mors->chip_if->bypass.tx_sts.to_process);
+	INIT_KFIFO(mors->chip_if->bypass.cmd_resp.to_process);
+
+	/* Set page return flag now to force eval on chip wq eval */
+	set_bit(MORSE_PAGE_RETURN_PEND, &mors->chip_if->event_flags);
+	pagesets_interrupts_set(mors, true);
+	return 0;
+
+err_exit:
+	pagesets_free(mors);
+	morse_pager_hw_pagers_finish(mors);
+	return ret;
 }
+
+static int pagesets_hw_restarted(struct morse *mors)
+{
+	set_bit(MORSE_PAGE_RETURN_PEND, &mors->chip_if->event_flags);
+	pagesets_flush_all_caches(mors);
+	pagesets_interrupts_set(mors, true);
+	return 0;
+}
+
+static void pagesets_finish(struct morse *mors)
+{
+	/* Disable all interrupts */
+	pagesets_interrupts_set(mors, false);
+
+	/* Ordering of cancelling work and freeing the pageset matters */
+	cancel_work_sync(&mors->chip_if_work);
+	pagesets_free(mors);
+	cancel_work_sync(&mors->tx_stale_work);
+
+	/* Free underlying pager hw */
+	morse_pager_hw_pagers_finish(mors);
+}
+
+static void pagesets_suspend(struct morse *mors)
+{
+	const bool is_suspend = true;
+
+	/* Disable pageset specific interrupts while quiescing */
+	pagesets_interrupts_suspend(mors, is_suspend);
+
+	/* Temporarily disable global hw irq to flush work */
+	morse_bus_set_irq(mors, false);
+	morse_hw_irq_clear(mors);
+
+	/* Cancel pending chip work and flush all in-flight data/cmds */
+	cancel_work_sync(&mors->chip_if_work);
+	mors->cfg->ops->flush_tx_data(mors);
+	mors->cfg->ops->flush_cmds(mors);
+
+	/* Enable global interrupts again */
+	morse_bus_set_irq(mors, true);
+}
+
+static void pagesets_resume(struct morse *mors)
+{
+	const bool is_suspend = false;
+
+	/* Set page return flag now to force eval on chip wq */
+	set_bit(MORSE_PAGE_RETURN_PEND, &mors->chip_if->event_flags);
+	queue_work(mors->chip_wq, &mors->chip_if_work);
+
+	/* Enable pageset specific interrupts upon resume */
+	pagesets_interrupts_suspend(mors, is_suspend);
+}
+
+const struct chip_if_ops morse_pageset_ops = {
+	.init = pagesets_init,
+	.hw_restarted = pagesets_hw_restarted,
+	.flush_cache = pagesets_flush_all_caches,
+	.flush_tx_data = pagesets_flush_tx_data,
+	.flush_cmds = pagesets_flush_cmds,
+	.skbq_get_tx_status_pending_count = pagesets_get_tx_status_pending_count,
+	.skbq_get_tx_buffered_count = pagesets_get_tx_buffered_count,
+	.finish = pagesets_finish,
+	.suspend = pagesets_suspend,
+	.resume = pagesets_resume,
+	.skbq_get_tx_qs = skbq_pageset_get_tx_qs,
+	.skbq_bcn_tc_q = skbq_pageset_bcn_tc_q,
+	.skbq_mgmt_tc_q = skbq_pageset_mgmt_tc_q,
+	.skbq_cmd_tc_q = skbq_pageset_cmd_tc_q,
+	.skbq_tc_q_from_aci = skbq_pageset_tc_q_from_aci,
+	.chip_if_handle_irq = morse_pageset_irq_handler
+};

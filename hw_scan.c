@@ -157,6 +157,11 @@ struct hw_scan_tlv_scheduled_scan_info {
 	__sle32 min_rssi_thold;
 } __packed;
 
+static uint hw_scan_prim_deconstruct __read_mostly;
+module_param(hw_scan_prim_deconstruct, uint, 0444);
+MODULE_PARM_DESC(hw_scan_prim_deconstruct,
+	"Limit HW scan channel deconstruction to primary width (0 for both, 1, or 2)");
+
 /**
  * morse_hw_scan_pack_tlv_hdr - Generate a TLV header from a given tag and length
  *
@@ -199,6 +204,23 @@ bool hw_scan_is_idle(struct morse *mors)
 	lockdep_assert_held(&mors->lock);
 
 	return (hw_scan->state == HW_SCAN_STATE_IDLE);
+}
+
+/**
+ * hw_scan_is_sched_scan - Check if the scan is scheduled scanning or in the process of stopping
+ *
+ * @mors: Global morse struct
+ *
+ * Return: true on success, false on failure
+ */
+static bool hw_scan_is_sched_scan(struct morse *mors)
+{
+	struct morse_hw_scan *hw_scan = &mors->hw_scan;
+
+	lockdep_assert_held(&mors->lock);
+
+	return (hw_scan->state == HW_SCAN_STATE_SCHED ||
+		hw_scan->state == HW_SCAN_STATE_SCHED_STOPPING);
 }
 
 /**
@@ -643,6 +665,9 @@ static int deconstruct_scan_channel_into_scan_list(struct morse_hw_scan_params *
 			if (prim_chan < 0)
 				continue;
 
+			if (hw_scan_prim_deconstruct && hw_scan_prim_deconstruct != prim_bw)
+				continue;
+
 			prim_freq_khz = morse_dot11ah_channel_to_freq_khz(prim_chan);
 
 			s1g_chan = morse_dot11ah_s1g_freq_to_s1g(KHZ_TO_HZ(prim_freq_khz), prim_bw);
@@ -1051,6 +1076,21 @@ static u32 morse_hw_scan_get_dwell_on_home(struct morse *mors, struct ieee80211_
 	return 0;
 }
 
+void morse_hw_scan_set_default_active_scan_dwell(struct morse *mors, u32 dwell_ms)
+{
+	mors->hw_scan.default_active_dwell_ms = dwell_ms;
+	MORSE_INFO(mors, "Set default active scan channel dwell to %u ms\n",
+		mors->hw_scan.default_active_dwell_ms);
+	/* Stop any running scheduled scans so they become aware of the new default
+	 * active dwell time
+	 */
+	if (hw_scan_is_sched_scan(mors)) {
+		mutex_unlock(&mors->lock);
+		morse_hw_stop_sched_scan(mors, false);
+		mutex_lock(&mors->lock);
+	}
+}
+
 static int morse_init_hw_scan_params(struct morse *mors, struct ieee80211_hw *hw,
 				     struct ieee80211_vif *vif)
 {
@@ -1091,7 +1131,7 @@ int morse_ops_hw_scan(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
 
 	MORSE_HWSCAN_DBG(mors, "%s: state %d\n", __func__, mors->hw_scan.state);
 
-	if (!mors->started) {
+	if (!morse_mlme_is_started(mors) || morse_mlme_in_reconfig(mors)) {
 		MORSE_HWSCAN_WARN(mors, "%s: device not ready\n", __func__);
 		ret = -ENODEV;
 		goto exit;
@@ -1132,7 +1172,7 @@ int morse_ops_hw_scan(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
 	else if (req->n_ssids == 0)
 		params->dwell_time_ms = MORSE_HWSCAN_DEFAULT_PASSIVE_DWELL_TIME_MS;
 	else
-		params->dwell_time_ms = MORSE_HWSCAN_DEFAULT_DWELL_TIME_MS;
+		params->dwell_time_ms = mors->hw_scan.default_active_dwell_ms;
 
 	params->operation = MORSE_HW_SCAN_OP_START;
 
@@ -1142,6 +1182,8 @@ int morse_ops_hw_scan(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
 	params->dwell_on_home_ms = morse_hw_scan_get_dwell_on_home(mors, vif);
 
 	params->use_1mhz_probes = morse_mac_is_1mhz_probe_req_enabled();
+	if (hw_scan_prim_deconstruct)
+		params->use_1mhz_probes &= (hw_scan_prim_deconstruct == 1);
 
 	hw_scan_initialise_channel_and_power_lists(params, chans, hw_req->req.n_channels);
 
@@ -1208,7 +1250,8 @@ static void cancel_hw_scan(struct morse *mors)
 	mutex_unlock(&mors->lock);
 
 	if (ret ||
-	    !mors->started ||
+	    !morse_mlme_is_started(mors) ||
+	    morse_mlme_in_reconfig(mors) ||
 	    !wait_for_completion_timeout(&mors->hw_scan.scan_done, 1 * HZ)) {
 		/* We may have lost the event on the bus, the chip could be wedged, or the cmd
 		 * failed for another reason.
@@ -1284,6 +1327,7 @@ void morse_hw_scan_init(struct morse *mors)
 {
 	mors->hw_scan.state = HW_SCAN_STATE_IDLE;
 	mors->hw_scan.params = NULL;
+	mors->hw_scan.default_active_dwell_ms = MORSE_HWSCAN_DEFAULT_DWELL_TIME_MS;
 	mors->hw_scan.home_dwell_ms = MORSE_HWSCAN_DEFAULT_DWELL_ON_HOME_MS;
 
 	init_completion(&mors->hw_scan.scan_done);
@@ -1299,17 +1343,6 @@ void morse_hw_scan_destroy(struct morse *mors)
 	mors->hw_scan.params = NULL;
 }
 
-void morse_hw_sched_scan_finish(struct morse *mors)
-{
-	lockdep_assert_held(&mors->lock);
-	if (mors->hw_scan.state != HW_SCAN_STATE_SCHED)
-		return;
-
-	ieee80211_sched_scan_stopped(mors->hw);
-	complete(&mors->hw_scan.scan_done);
-	mors->hw_scan.state = HW_SCAN_STATE_IDLE;
-}
-
 void morse_hw_scan_finish(struct morse *mors)
 {
 	struct cfg80211_scan_info info = {
@@ -1317,10 +1350,14 @@ void morse_hw_scan_finish(struct morse *mors)
 	};
 	lockdep_assert_held(&mors->lock);
 
-	if (mors->hw_scan.state == HW_SCAN_STATE_IDLE || mors->hw_scan.state == HW_SCAN_STATE_SCHED)
+	if (mors->hw_scan.state == HW_SCAN_STATE_IDLE)
 		return;
 
-	ieee80211_scan_completed(mors->hw, &info);
+	if (hw_scan_is_sched_scan(mors))
+		ieee80211_sched_scan_stopped(mors->hw);
+	else
+		ieee80211_scan_completed(mors->hw, &info);
+
 	complete(&mors->hw_scan.scan_done);
 	mors->hw_scan.state = HW_SCAN_STATE_IDLE;
 	cancel_delayed_work_sync(&mors->hw_scan.timeout);
@@ -1347,7 +1384,7 @@ int morse_ops_sched_scan_start(struct ieee80211_hw *hw, struct ieee80211_vif *vi
 
 	MORSE_HWSCAN_DBG(mors, "%s: state %d\n", __func__, mors->hw_scan.state);
 
-	if (!mors->started) {
+	if (!morse_mlme_is_started(mors) || morse_mlme_in_reconfig(mors)) {
 		MORSE_HWSCAN_WARN(mors, "%s: device not ready\n", __func__);
 		ret = -ENODEV;
 		goto exit;
@@ -1379,7 +1416,7 @@ int morse_ops_sched_scan_start(struct ieee80211_hw *hw, struct ieee80211_vif *vi
 	if (req->n_ssids == 0)
 		params->dwell_time_ms = MORSE_HWSCAN_DEFAULT_PASSIVE_DWELL_TIME_MS;
 	else
-		params->dwell_time_ms = MORSE_HWSCAN_DEFAULT_DWELL_TIME_MS;
+		params->dwell_time_ms = mors->hw_scan.default_active_dwell_ms;
 
 	params->operation = MORSE_HW_SCAN_OP_SCHED_START;
 
@@ -1389,6 +1426,8 @@ int morse_ops_sched_scan_start(struct ieee80211_hw *hw, struct ieee80211_vif *vi
 	params->dwell_on_home_ms = morse_hw_scan_get_dwell_on_home(mors, vif);
 
 	params->use_1mhz_probes = morse_mac_is_1mhz_probe_req_enabled();
+	if (hw_scan_prim_deconstruct)
+		params->use_1mhz_probes &= (hw_scan_prim_deconstruct == 1);
 
 	hw_scan_initialise_channel_and_power_lists(params, chans, req->n_channels);
 
@@ -1443,7 +1482,8 @@ void morse_hw_stop_sched_scan(struct morse *mors, bool requested)
 	mutex_unlock(&mors->lock);
 
 	if (ret ||
-	    !mors->started ||
+	    !morse_mlme_is_started(mors) ||
+	    morse_mlme_in_reconfig(mors) ||
 	    !wait_for_completion_timeout(&mors->hw_scan.scan_done, 1 * HZ)) {
 		/* We may have lost the event on the bus, the chip could be wedged, or the cmd
 		 * failed for another reason.

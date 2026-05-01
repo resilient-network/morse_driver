@@ -37,6 +37,52 @@ enum morse_twt_state {
 	MORSE_TWT_STATE_AGREEMENT,
 };
 
+/**
+ * struct morse_twt_sta_vif - contains STA VIF's specific TWT state information
+ *
+ * @active_agreement_bitmap Bitmap of active TWT agreement for each of flow ids
+ * @cmd_work    Work queue struct to defer install/uninstall of twt agreementss.
+ * @to_install_uninstall    A queue of TWT agreements to install/uninstall to the chip.
+ */
+struct morse_twt_sta_vif {
+	unsigned long active_agreement_bitmap;
+	struct work_struct cmd_work;
+	struct list_head to_install_uninstall;
+};
+
+/**
+ * struct morse_twt - TWT state and configuration information
+ *
+ * @stas	List of structures containing agreements for STA.
+ * @wake_intervals	List of structures used as heads for lists of agreements with the same
+ *			wake interval. These are arranged in order from the smallest to largest wake
+ *			intervals.
+ * @events		A queue of TWT events to be processed.
+ * @tx			A queue of TWT data to be sent.
+ * @req_event_tx	A TWT request event to be sent in the (re)assoc request frame.
+ * @work		Work queue struct to defer processing of events.
+ * @lock		Spinlock used to control access to lists/memory.
+ * @requester		Whether or not the VIF is a TWT Requester.
+ * @responder		Whether or not the VIF is a TWT Responder.
+ * @dialog_token	Dialog token of Tx action frames.
+ * @sta_vif		STA VIF specific data
+ */
+struct morse_twt {
+	struct list_head stas;
+	struct list_head wake_intervals;
+	struct list_head events;
+	struct list_head tx;
+	u8 *req_event_tx;
+	struct work_struct work;
+	/* Protect TWT operations */
+	spinlock_t lock;
+	bool requester;
+	bool responder;
+	u8 dialog_token;
+	/* STA VIF specific data */
+	struct morse_twt_sta_vif sta_vif;
+};
+
 /* This structure is packed as control and params form the TWT IE. This allows the use of memcpy. */
 struct morse_twt_agreement_data {
 	/** First wakeup time in us with reference to the TSF */
@@ -55,6 +101,15 @@ struct morse_twt_agreement {
 	struct list_head list;
 	enum morse_twt_state state;
 	struct morse_twt_agreement_data data;
+};
+
+struct morse_twt_config {
+	/** Operation code */
+	u8 opcode;
+	/** The flow (TWT) identifier for this agreement */
+	u8 flow_id;
+	/** TWT agreement data of the Requestor */
+	struct morse_twt_agreement_data agreement;
 };
 
 enum morse_twt_event_type {
@@ -118,11 +173,6 @@ struct morse_twt_wake_interval {
 	struct list_head list;
 	struct list_head agreements;
 };
-
-static inline struct morse_vif *morse_twt_to_morse_vif(struct morse_twt *twt)
-{
-	return container_of(twt, struct morse_vif, twt);
-}
 
 /**
  * @morse_twt_is_enabled() - Check if TWT is enabled on a VIF
@@ -316,16 +366,12 @@ void morse_twt_finish_vif(struct morse *mors, struct morse_vif *mors_vif);
 int morse_twt_initialise_agreement(struct morse_twt_agreement_data *twt_data, u8 *agreement);
 
 /**
- * morse_process_twt_cmd() - Process TWT message triggered by morsectrl
+ * morse_twt_reconfig() - Restore TWT configuration after HW assert
  *
- * @mors        Morse device
- * @morse_vif   Morse virtual interface
- * @cmd         Incoming twt conf command parameters
- *
- * @return 0 on success, else error code
+ * @mors Global morse structure
+ * @mors_vif Morse VIF
  */
-int morse_process_twt_cmd(struct morse *mors, struct morse_vif *mors_vif,
-			  struct morse_cmd_req *cmd);
+void morse_twt_reconfig(struct morse *mors, struct morse_vif *mors_vif);
 
  /**
   * morse_dot11_is_twt_setup_action_frame() - Checks if TWT setup action frame
