@@ -313,7 +313,8 @@ morse_vendor_find_vendor_ie(struct dot11ah_ies_mask *ies_mask)
 
 	while (cur && cur->ptr) {
 		ie = (struct dot11_morse_vendor_caps_ops_ie *)cur->ptr;
-		if (memcmp(ie->oui, morse_oui, sizeof(ie->oui)) == 0 &&
+		if (cur->len >= sizeof(*ie) &&
+		    memcmp(ie->oui, morse_oui, sizeof(ie->oui)) == 0 &&
 		    ie->oui_type == MORSE_VENDOR_IE_CAPS_OPS_OUI_TYPE) {
 			found = true;
 			break;

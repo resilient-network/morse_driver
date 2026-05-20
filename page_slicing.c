@@ -249,6 +249,18 @@ void morse_page_slicing_process_tim_element(struct ieee80211_vif *vif,
 	u8 tim_bitmap_ctrl_offset;
 	struct ie_element *element;
 	u8 remaining_tim_map_len;
+	u8 tim_header_len = offsetof(struct ieee80211_tim_ie, virtual_map);
+
+	/* Reject TIM IEs with length outside the valid range:
+	 * Minimum: the fixed header (DTIM count, period, bitmap ctrl = 3 octets)
+	 * Maximum: must fit in tim_virtual_map[DOT11_MAX_TIM_VIRTUAL_MAP_LENGTH]
+	 */
+	if (ies_mask->ies[WLAN_EID_TIM].len < tim_header_len ||
+	    ies_mask->ies[WLAN_EID_TIM].len > tim_header_len + DOT11_MAX_TIM_VIRTUAL_MAP_LENGTH) {
+		MORSE_DBG_RATELIMITED(mors, "%s: Invalid TIM IE length %u\n",
+			__func__, ies_mask->ies[WLAN_EID_TIM].len);
+		return;
+	}
 
 	/* Calculate partial virtual bitmap length. 11n TIM contains minimum of 4 octets
 	 * i.e dtim count(1 octet), dtim period(1 octet), bitmap ctrl(1 octet) and PVB[1].
@@ -256,7 +268,7 @@ void morse_page_slicing_process_tim_element(struct ieee80211_vif *vif,
 	 * for STAs. Otherwise the actual PVB size is IE length - 3.
 	 */
 	virtual_map_len = (ies_mask->ies[WLAN_EID_TIM].len == 4) ? tim_ie->virtual_map[0] != 0 :
-						(ies_mask->ies[WLAN_EID_TIM].len - 3);
+						(ies_mask->ies[WLAN_EID_TIM].len - tim_header_len);
 
 	/* Check if it is a DTIM or TIM beacon:
 	 * DTIM Beacon: Save the partial virtual bitmap (PVB) and schedule the TIM into different

@@ -329,9 +329,12 @@ bool morse_dot11ah_find_s1g_caps_for_bssid(u8 *bssid, struct ieee80211_s1g_cap *
 	item = morse_dot11ah_find_bssid(bssid);
 	if (item) {
 		ie = (u8 *)morse_dot11_find_ie(WLAN_EID_S1G_CAPABILITIES, item->ies, item->ies_len);
-		if (ie) {
+		/* The capabilities IE should have a fixed size. Reject anything that does not match
+		 * the expected size to prevent a heap overflow into the caller's fixed-size buffer.
+		 */
+		if (ie && ie[1] == sizeof(*s1g_caps)) {
 			found = true;
-			memcpy((u8 *)s1g_caps, (ie + 2), *(ie + 1));
+			memcpy(s1g_caps, ie + 2, sizeof(*s1g_caps));
 		}
 	}
 
@@ -478,7 +481,7 @@ bool morse_dot11ah_is_page_slicing_enabled_on_bss(u8 *bssid)
 	item = morse_dot11ah_find_bssid(bssid);
 	if (item) {
 		ie = (u8 *)morse_dot11_find_ie(WLAN_EID_S1G_CAPABILITIES, item->ies, item->ies_len);
-		if (ie) {
+		if (ie && ie[1] == sizeof(*s1g_caps)) {
 			s1g_caps = (struct ieee80211_s1g_cap *)(ie + 2);
 			enabled = s1g_caps->capab_info[6] & S1G_CAP6_PAGE_SLICING;
 		}
