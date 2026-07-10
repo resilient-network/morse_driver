@@ -77,6 +77,11 @@ static struct morse_skbq *skbq_yaps_cmd_q(struct morse *mors)
 	return &mors->chip_if->yaps->cmd_q;
 }
 
+static struct morse_skbq *skbq_yaps_rx_data_q(struct morse *mors)
+{
+	return &mors->chip_if->yaps->data_rx_q;
+}
+
 static int yaps_irq_handler(struct morse *mors, u32 status)
 {
 	if (test_bit(MORSE_INT_YAPS_FC_PKT_WAITING_IRQN, (unsigned long *)&status))
@@ -160,6 +165,7 @@ const struct chip_if_ops morse_yaps_ops = {
 	.skbq_bcn_tc_q = skbq_yaps_bcn_q,
 	.skbq_mgmt_tc_q = skbq_yaps_mgmt_q,
 	.skbq_cmd_tc_q = skbq_yaps_cmd_q,
+	.skbq_rx_data_q = skbq_yaps_rx_data_q,
 	.skbq_tc_q_from_aci = skbq_yaps_tc_q_from_aci,
 	.chip_if_handle_irq = yaps_irq_handler
 };
@@ -332,11 +338,6 @@ static int morse_yaps_tx(struct morse_yaps *yaps, struct morse_skbq *mq)
 		tc_pkt_idx++;
 	}
 
-	/* Send queued packets to chip */
-	ret = yaps->ops->update_status(yaps);
-	if (ret)
-		return ret;
-
 	ret = yaps->ops->write_pkts(yaps, to_chip_pkts, tc_pkt_idx, &num_pkts_sent);
 
 	/* Move sent packets to done queue and update stats */
@@ -457,10 +458,6 @@ static bool morse_yaps_rx_handler(struct morse_yaps *yaps)
 	int i;
 	int num_pks_received;
 
-	ret = yaps->ops->update_status(yaps);
-	if (ret)
-		goto exit;
-
 	ret =
 	    yaps->ops->read_pkts(yaps, from_chip_pkts, ARRAY_SIZE(from_chip_pkts),
 				 &num_pks_received);
@@ -509,6 +506,17 @@ void morse_yaps_stale_tx_work(struct work_struct *work)
 			morse_ps_queue_eval(mors);
 		}
 	}
+
+	/* Re-arm if frames still pending - the timer was not re-armed by tx_complete because it
+	 * was already running when those frames arrived, so we must schedule the next check here.
+	 */
+	if (mors->cfg->ops->skbq_get_tx_status_pending_count(mors) > 0) {
+		spin_lock_bh(&mors->stale_status.lock);
+		if (mors->stale_status.enabled)
+			mod_timer(&mors->stale_status.timer,
+				  jiffies + msecs_to_jiffies(morse_skbq_tx_status_lifetime_ms()));
+		spin_unlock_bh(&mors->stale_status.lock);
+	}
 }
 
 void morse_yaps_work(struct work_struct *work)
@@ -517,6 +525,7 @@ void morse_yaps_work(struct work_struct *work)
 					  struct morse, chip_if_work);
 	int ps_bus_timeout_ms = 0;
 	unsigned long *flags = &mors->chip_if->event_flags;
+	unsigned long tmp_flags;
 	struct morse_yaps *yaps = mors->chip_if->yaps;
 
 	/* Don't attempt to interact with device once it becomes unresponsive */
@@ -534,6 +543,9 @@ void morse_yaps_work(struct work_struct *work)
 	morse_ps_wakers_inc(mors);
 	morse_ps_force_eval(mors);
 	morse_claim_bus(mors);
+
+	if (yaps->ops->update_status(yaps))
+		goto exit;
 
 	/* Handle any populated RX pages from chip first to
 	 * avoid dropping pkts due to full on-chip buffers.
@@ -596,7 +608,7 @@ void morse_yaps_work(struct work_struct *work)
 	 */
 	if (yaps->chip_queue_full.is_full &&
 	    time_before(jiffies, yaps->chip_queue_full.retry_expiry))
-		goto exit;
+		goto check_requeue;
 
 	/* Finally TX any data */
 	if (test_and_clear_bit(MORSE_TX_DATA_PEND, flags)) {
@@ -614,23 +626,33 @@ void morse_yaps_work(struct work_struct *work)
 	if (test_and_clear_bit(MORSE_UPDATE_HW_CLOCK_REFERENCE, flags))
 		morse_hw_clock_update(mors);
 
-exit:
+check_requeue:
 	if (ps_bus_timeout_ms)
 		morse_ps_bus_activity(mors, ps_bus_timeout_ms);
 
+	/* Don't requeue work if we are shutting down. */
+	if (yaps->finish)
+		goto exit;
+
+	/* Evaluate all events except MORSE_TX_DATA_PEND in case data tx queue is full */
+	tmp_flags = yaps->chip_queue_full.is_full ? *flags & ~BIT(MORSE_TX_DATA_PEND) : *flags;
+	if (tmp_flags) {
+		queue_work(mors->chip_wq, &mors->chip_if_work);
+		goto exit;
+	}
+
+	yaps->ops->update_status(yaps);
+
+	/* Evaluate all events except MORSE_TX_DATA_PEND in case data tx queue is full */
+	tmp_flags = yaps->chip_queue_full.is_full ? *flags & ~BIT(MORSE_TX_DATA_PEND) : *flags;
+	if (tmp_flags) {
+		queue_work(mors->chip_wq, &mors->chip_if_work);
+		goto exit;
+	}
+exit:
 	morse_release_bus(mors);
 	morse_ps_wakers_dec(mors);
 	morse_ps_force_eval(mors);
-
-	/* Don't requeue work if we are shutting down. */
-	if (yaps->finish)
-		return;
-	/* Evaluate all events except MORSE_TX_DATA_PEND in case data tx queue is full */
-	if ((*flags) & ~(1 << MORSE_TX_DATA_PEND))
-		queue_work(mors->chip_wq, &mors->chip_if_work);
-	/* if data tx queue is not full and the work hasn't been queued let's queue it */
-	else if (!yaps->chip_queue_full.is_full && *flags)
-		queue_work(mors->chip_wq, &mors->chip_if_work);
 }
 
 int morse_yaps_get_tx_status_pending_count(struct morse *mors)
@@ -674,7 +696,7 @@ int morse_yaps_get_tx_buffered_count(struct morse *mors)
 	return count;
 }
 
-#if KERNEL_VERSION(4, 14, 0) > LINUX_VERSION_CODE
+#if KERNEL_VERSION(4, 15, 0) > LINUX_VERSION_CODE
 static void morse_tx_chip_full_timer(unsigned long addr)
 {
 	struct morse_yaps *yaps = (struct morse_yaps *)addr;
@@ -693,7 +715,7 @@ static void morse_tx_chip_full_timer(struct timer_list *t)
 
 static int morse_tx_chip_full_timer_init(struct morse_yaps *yaps)
 {
-#if KERNEL_VERSION(4, 14, 0) > LINUX_VERSION_CODE
+#if KERNEL_VERSION(4, 15, 0) > LINUX_VERSION_CODE
 	init_timer(&yaps->chip_queue_full.timer);
 	yaps->chip_queue_full.timer.data = (unsigned long)yaps;
 	yaps->chip_queue_full.timer.function = morse_tx_chip_full_timer;

@@ -146,6 +146,15 @@ struct chip_if_ops {
 	struct morse_skbq *(*skbq_tc_q_from_aci)(struct morse *mors, int aci);
 
 	/**
+	 * skbq_rx_data_q() - Retrieve queue used for storing RX data from HW.
+	 *
+	 * @mors: Morse object
+	 *
+	 * Return: RX morse skbq if found
+	 */
+	struct morse_skbq *(*skbq_rx_data_q)(struct morse *mors);
+
+	/**
 	 * A callback that is called when a hostsync interrupt is raised
 	 * @mors: Morse object
 	 * @status: Hostsync interrupt register (bitmask of hostsync IRQs)

@@ -11,6 +11,35 @@
 
 #include "dot11ah/s1g_ieee80211.h"
 #pragma once
+#include <linux/version.h>
+#include <linux/random.h>
+#if KERNEL_VERSION(4, 11, 0) <= LINUX_VERSION_CODE
+#include <linux/refcount.h>
+#else
+#include <linux/atomic.h>
+typedef atomic_t refcount_t;
+static inline void refcount_set(refcount_t *r, int v)
+{
+	atomic_set(r, v);
+}
+static inline void refcount_inc(refcount_t *r)
+{
+	atomic_inc(r);
+}
+static inline bool refcount_dec_and_test(refcount_t *r)
+{
+	return atomic_dec_and_test(r);
+}
+#endif
+
+static inline u32 morse_random_u32_max(u32 max)
+{
+#if KERNEL_VERSION(6, 2, 0) > LINUX_VERSION_CODE
+	return prandom_u32_max(max);
+#else
+	return get_random_u32_below(max);
+#endif
+}
 
 /* Checkpatch does not like Camel Case */
 #define morse_elf_ehdr Elf32_Ehdr
@@ -85,4 +114,11 @@ static inline u8 ieee80211_get_tid(struct ieee80211_hdr *hdr)
 	return qc[0] & IEEE80211_QOS_CTL_TID_MASK;
 }
 #endif
+
+#if KERNEL_VERSION(6, 18, 0) <= LINUX_VERSION_CODE
+typedef const struct bin_attribute morse_bin_attr_t;
+#else
+typedef struct bin_attribute morse_bin_attr_t;
+#endif
+
 #define MORSE_IEEE80211_GET_TID(_hdr) ieee80211_get_tid(_hdr)

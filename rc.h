@@ -21,7 +21,7 @@ struct morse_rc {
 	spinlock_t lock;
 	struct list_head stas;
 	struct timer_list timer;
-	struct work_struct work;
+	struct delayed_work dwork;
 	struct morse *mors;
 };
 
@@ -58,8 +58,7 @@ void morse_rc_sta_fill_tx_rates(struct morse *mors,
 				struct ieee80211_sta *sta, int tx_bw, bool rts_allowed);
 
 void morse_rc_sta_feedback_rates(struct morse *mors, struct sk_buff *skb,
-				 struct ieee80211_sta *sta, struct morse_skb_tx_status *tx_sts,
-				 int tx_attempts);
+				 struct ieee80211_sta *sta, struct morse_skb_tx_status *tx_sts);
 
 void morse_rc_sta_state_check(struct morse *mors,
 			      struct ieee80211_vif *vif, struct ieee80211_sta *sta,

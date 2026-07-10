@@ -29,6 +29,7 @@ struct morse_bus_ops {
 	int (*dm_write)(struct morse *mors, u32 addr, const u8 *data, int len);
 	int (*reg32_read)(struct morse *mors, u32 addr, u32 *data);
 	int (*reg32_write)(struct morse *mors, u32 addr, u32 data);
+	int (*request_mem_access)(struct morse *mors, u32 addr, int len);
 	int (*skb_tx)(struct morse *mors, struct sk_buff *skb, u8 channel);
 	int (*reset)(struct morse *mors);
 	int (*config_pm_flags)(struct morse *mors);
@@ -47,22 +48,42 @@ struct morse_bus_ops {
 
 static inline int morse_dm_write(struct morse *mors, u32 addr, const u8 *data, int len)
 {
+	int ret = mors->bus_ops->request_mem_access(mors, addr, len);
+
+	if (ret)
+		return ret;
+
 	return mors->bus_ops->dm_write(mors, addr, data, len);
 }
 
 /* morse_dm_read - len must be rounded up to the nearest 4-byte boundary */
 static inline int morse_dm_read(struct morse *mors, u32 addr, u8 *data, int len)
 {
+	int ret = mors->bus_ops->request_mem_access(mors, addr, len);
+
+	if (ret)
+		return ret;
+
 	return mors->bus_ops->dm_read(mors, addr, data, len);
 }
 
 static inline int morse_reg32_write(struct morse *mors, u32 addr, u32 data)
 {
+	int ret = mors->bus_ops->request_mem_access(mors, addr, 4);
+
+	if (ret)
+		return ret;
+
 	return mors->bus_ops->reg32_write(mors, addr, data);
 }
 
 static inline int morse_reg32_read(struct morse *mors, u32 addr, u32 *data)
 {
+	int ret = mors->bus_ops->request_mem_access(mors, addr, 4);
+
+	if (ret)
+		return ret;
+
 	return mors->bus_ops->reg32_read(mors, addr, data);
 }
 

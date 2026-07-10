@@ -15,6 +15,7 @@
 #include "bus.h"
 #include "debug.h"
 #include "yaps.h"
+#include "mem_access.h"
 
 #define MM8108_REG_HOST_MAGIC_VALUE		0xDEADBEEF
 #define MM8108_REG_RESET_VALUE			0xDEAD
@@ -29,10 +30,15 @@
 
 /* Generates IRQ to the target */
 #define MM8108_REG_TRGR_BASE			0x00003c00 /* HostSync addr */
-#define MM8108_REG_INT_BASE			0x00003c50 /* Hostsync reg*/
+#define MM8108_REG_TRGR_END			0x00003c6c /* HostSync end */
+#define MM8108_REG_INT_BASE			0x00003c50 /* Hostsync reg */
+#define MM8108_MEM_ACCESS_REQ_BASE		0x00003c20
 #define MM8108_REG_MSI				0x00004100 /* Clint */
 
 #define MM8108_REG_MANIFEST_PTR_ADDRESS		0x00002d40 /* SW Manifest Pointer */
+#define MM8108_SECURITY_MANIFEST_PTR_ADDR	0x0011fffc /* Security Manifest Pointer */
+#define MM8108_SECURE_BOOT_STATUS_REG_ADDR	0x0011fff8 /* Secure boot status reg */
+#define MM8108_SECURE_BOOT_STATUS_MASK		GENMASK(7, 0)
 #define MM8108_REG_APPS_BOOT_ADDR		0x00002084 /* APPS core boot address */
 #define MM8108_REG_RESET			0x000020AC /* Digital Reset */
 #define MM8108_REG_AON_ADDR			0x00002114 /* system_ao_mem_in */
@@ -75,7 +81,30 @@
 #define MM8108_REG_OTPCTRL_ACTION_AUTO_RD_START	0x0000400c
 #define MM8108_REG_OTPCTRL_PDOUT		0x00004040
 
+/* Memory access:
+ * Region 0 is dedicated to digital reset
+ */
+#define CONSTANT_REGION_0_START_ADDRESS	(MM8108_REG_RESET)
+#define CONSTANT_REGION_0_END_ADDRESS	(MM8108_REG_RESET + 4)
+
+/* Region 1 is dedicated to hostsync */
+#define CONSTANT_REGION_1_START_ADDRESS	(MM8108_REG_TRGR_BASE)
+#define CONSTANT_REGION_1_END_ADDRESS	(MM8108_REG_TRGR_END + 4)
+
+/* Yaps region is chosen to be expandable */
+#define EXPANDABLE_ACCESS_START_ADDRESS	(0x00170000)
+#define EXPANDABLE_ACCESS_END_ADDRESS	(0x00180000 - 64)
+
 /* MM810x OTP defines */
+/* OTP config cached in memory */
+#define MM810x_OTP_CONFIG_BASE			(0x2AC000 - 44)
+#define MM810x_OTP_CONFIG_COUNTRY_CODE_OFFSET	(16)
+#define MM810x_OTP_CONFIG_COUNTRY_CODE_ADDRESS	(MM810x_OTP_CONFIG_BASE + \
+						 MM810x_OTP_CONFIG_COUNTRY_CODE_OFFSET)
+#define MM810x_OTP_CONFIG_BOARD_TYPE_OFFSET	(20)
+#define MM810x_OTP_CONFIG_BOARD_TYPE_ADDRESS	(MM810x_OTP_CONFIG_BASE + \
+						 MM810x_OTP_CONFIG_BOARD_TYPE_OFFSET)
+/* Physical OTP */
 #define MM810x_OTP_BOARD_TYPE_BANK_NUM		26
 #define MM810x_OTP_BOARD_TYPE_MASK		GENMASK(15, 0)
 #define MM810x_OTP_COUNTRY_CODE_BANK_NUM	25
@@ -85,10 +114,13 @@
 #define MM810x_BOARD_TYPE_MAX_VALUE		(MM810x_OTP_BOARD_TYPE_MASK - 1)
 
 #define MM8108_FW_BASE				"mm8108"
+
 /* Maximum wait time (milliseconds) for firmware to boot (for host table pointer to be available) */
-#define FIRMWARE_BOOT_TIMEOUT_MS 1200
-/* Maximum wait time (milliseconds) for secureboot to complete */
-#define FIRMWARE_SECURE_BOOT_TIMEOUT_MS 4000
+#define FIRMWARE_BOOT_TIMEOUT_MS 550
+
+
+/* Initial delay for memory access to work */
+#define MEM_ACCESS_INITIAL_DELAY_MS 60
 
 static void mm810x_otp_power_up(struct morse *mors)
 {
@@ -168,13 +200,17 @@ static int mm810x_get_board_type(struct morse *mors)
 	int ret;
 
 	morse_claim_bus(mors);
-	mm810x_otp_power_up(mors);
-	mm810x_otp_read_enable(mors);
+	if (mem_access_is_restriction_enforced(mors)) {
+		ret = morse_reg32_read(mors, MM810x_OTP_CONFIG_BOARD_TYPE_ADDRESS, &otp_word);
+	} else {
+		mm810x_otp_power_up(mors);
+		mm810x_otp_read_enable(mors);
 
-	ret = mm810x_otp_read(mors, MM810x_OTP_BOARD_TYPE_BANK_NUM, &otp_word, 1);
+		ret = mm810x_otp_read(mors, MM810x_OTP_BOARD_TYPE_BANK_NUM, &otp_word, 1);
 
-	mm810x_otp_read_disable(mors);
-	mm810x_otp_power_down(mors);
+		mm810x_otp_read_disable(mors);
+		mm810x_otp_power_down(mors);
+	}
 	morse_release_bus(mors);
 
 	if (ret)
@@ -200,6 +236,10 @@ static const char *mm810x_get_hw_version(u32 chip_id)
 		return "MM8108B2-FPGA";
 	case MM8108B2_ID:
 		return "MM8108B2";
+	case MM8108B3_FPGA_ID:
+		return "MM8108B3-FPGA";
+	case MM8108B3_ID:
+		return "MM8108B3";
 	}
 	return "unknown";
 }
@@ -215,6 +255,8 @@ static char *mm810x_get_revision_string(u32 chip_id)
 		return MM8108B1_REV_STRING;
 	case MM8108B2_REV:
 		return MM8108B2_REV_STRING;
+	case MM8108B3_REV:
+		return MM8108B3_REV_STRING;
 	default:
 		return "??";
 	}
@@ -260,40 +302,43 @@ static u32 mm810x_get_cold_boot_time_ms(u32 chip_id)
 	return wait_time_ms;
 }
 
-static u32 mm810x_get_burst_mode_inter_block_delay_ns(const u8 burst_mode)
+static u32 mm810x_get_firmware_trigger_delay_ms(u32 chip_id)
 {
-	int ret;
+	u32 trigger_delay = MEM_ACCESS_INITIAL_DELAY_MS;
 
-	switch (burst_mode) {
-	case SDIO_WORD_BURST_SIZE_16:
-		ret = MM8108_SPI_INTER_BLOCK_DELAY_BURST16_NS;
-		break;
-	case SDIO_WORD_BURST_SIZE_8:
-		ret = MM8108_SPI_INTER_BLOCK_DELAY_BURST8_NS;
-		break;
-	case SDIO_WORD_BURST_SIZE_4:
-		ret = MM8108_SPI_INTER_BLOCK_DELAY_BURST4_NS;
-		break;
-	case SDIO_WORD_BURST_SIZE_2:
-		ret = MM8108_SPI_INTER_BLOCK_DELAY_BURST2_NS;
-		break;
-	default:
-		ret = MM8108_SPI_INTER_BLOCK_DELAY_BURST0_NS;
-		break;
-	}
+	if (MORSE_DEVICE_TYPE_IS_FPGA(chip_id))
+		trigger_delay = trigger_delay * 12;
 
-	return ret;
+
+	return trigger_delay;
 }
 
-static int mm810x_enable_burst_mode(struct morse *mors, const u8 burst_mode)
+static u32 mm810x_get_spi_inter_block_delay_ns(bool burst_enabled)
 {
+	return burst_enabled ? MM8108_SPI_INTER_BLOCK_DELAY_BURST16_NS :
+				MM8108_SPI_INTER_BLOCK_DELAY_BURST0_NS;
+}
+
+static int mm810x_enable_burst_mode(struct morse *mors, bool enable)
+{
+	int ret = 0;
 	u32 reg32_value;
-	int ret = mm810x_get_burst_mode_inter_block_delay_ns(burst_mode);
+	const u8 burst_mode = enable ? SDIO_WORD_BURST_SIZE_16 : SDIO_WORD_BURST_DISABLE;
 
 	MORSE_WARN_ON(FEATURE_ID_DEFAULT, !mors);
 
 	/* We should perform a read, modify & write here, since it is the safest option. */
 	morse_claim_bus(mors);
+
+	if (mem_access_is_restriction_enforced(mors)) {
+		/* Burst mode is handled by the chip when restriction is enforced */
+		MORSE_DBG(mors,
+			  "Memory access restriction is enabled. %s not permitted\n",
+			  __func__);
+		ret = 0;
+		goto exit;
+	}
+
 	if (morse_reg32_read(mors, MM8108_REG_SDIO_DEVICE_ADDR, &reg32_value)) {
 		ret = -EPERM;
 		goto exit;
@@ -324,6 +369,15 @@ static int mm810x_enable_internal_slow_clock(struct morse *mors)
 	u32 rc_clock_reg_value;
 	int ret = 0;
 
+	if (mem_access_is_restriction_enforced(mors)) {
+		/* This WAR is handled by the chip when restriction is enforced */
+		MORSE_DBG(mors,
+			  "Memory access restriction is enabled. %s not permitted\n",
+			  __func__);
+		ret = 0;
+		goto exit;
+	}
+
 	MORSE_INFO(mors, "Enabling internal slow clock\n");
 
 	/* We should perform a read, clear the power off bit and write it back */
@@ -353,6 +407,15 @@ static int mm810x_disable_pmu_ctrl_cpu(struct morse *mors)
 {
 	u32 aon_reg_value;
 	int ret = 0;
+
+	if (mem_access_is_restriction_enforced(mors)) {
+		/* This WAR is handled by the chip when restriction is enforced */
+		MORSE_DBG(mors,
+			  "Memory access restriction is enabled. %s not permitted\n",
+			  __func__);
+		ret = 0;
+		goto exit;
+	}
 
 	MORSE_INFO(mors, "Disabling PMU contol to CPU\n");
 
@@ -448,13 +511,17 @@ static int mm810x_read_encoded_country(struct morse *mors)
 	int ret;
 
 	morse_claim_bus(mors);
-	mm810x_otp_power_up(mors);
-	mm810x_otp_read_enable(mors);
+	if (mem_access_is_restriction_enforced(mors)) {
+		ret = morse_reg32_read(mors, MM810x_OTP_CONFIG_COUNTRY_CODE_ADDRESS, &otp_word);
+	} else {
+		mm810x_otp_power_up(mors);
+		mm810x_otp_read_enable(mors);
 
-	ret = mm810x_otp_read(mors, MM810x_OTP_COUNTRY_CODE_BANK_NUM, &otp_word, 1);
+		ret = mm810x_otp_read(mors, MM810x_OTP_COUNTRY_CODE_BANK_NUM, &otp_word, 1);
 
-	mm810x_otp_read_disable(mors);
-	mm810x_otp_power_down(mors);
+		mm810x_otp_read_disable(mors);
+		mm810x_otp_power_down(mors);
+	}
 	morse_release_bus(mors);
 
 	if (ret)
@@ -545,10 +612,59 @@ static void mm810x_gpio_write_output(struct morse *mors, int pin_num, bool activ
 	morse_release_bus(mors);
 }
 
+static bool mm810x_chip_id_matches(u32 chip_id)
+{
+	return chip_id == MM8108B0_ID ||
+	       chip_id == MM8108B1_ID ||
+	       chip_id == MM8108B2_ID ||
+	       chip_id == MM8108B3_ID ||
+	       chip_id == MM8108B0_FPGA_ID ||
+	       chip_id == MM8108B1_FPGA_ID ||
+	       chip_id == MM8108B2_FPGA_ID ||
+	       chip_id == MM8108B3_FPGA_ID;
+}
+
+static int mm810x_set_security_manifest_ptr(struct morse *mors, uint32_t addr)
+{
+	int ret;
+
+	morse_claim_bus(mors);
+	ret = morse_reg32_write(mors, MM8108_SECURITY_MANIFEST_PTR_ADDR, addr);
+	morse_release_bus(mors);
+
+	if (ret < 0)
+		MORSE_ERR(mors, "Error Setting Security Manifest Pointer :%d\n", ret);
+	return ret;
+}
+
+static int mm810x_get_secureboot_status(struct morse *mors, uint32_t *status)
+{
+	int ret = 0;
+	bool secureboot_supported;
+
+	secureboot_supported = mors->chip_id == MM8108B3_ID || mors->chip_id == MM8108B3_FPGA_ID;
+
+
+	if (!secureboot_supported)
+		return -EOPNOTSUPP;
+
+	morse_claim_bus(mors);
+	ret = morse_reg32_read(mors, MM8108_SECURE_BOOT_STATUS_REG_ADDR, status);
+	morse_release_bus(mors);
+	*status = *status & MM8108_SECURE_BOOT_STATUS_MASK;
+
+	if (ret < 0)
+		MORSE_ERR(mors, "Error reading secure boot status register: %d\n", ret);
+	return ret;
+}
+
 const struct morse_hw_regs mm8108_regs = {
 	/* Register address maps */
 	.irq_base_address = MM8108_REG_INT_BASE,
 	.trgr_base_address = MM8108_REG_TRGR_BASE,
+
+	/* Memory access request */
+	.mem_access_req_base_addr = MM8108_MEM_ACCESS_REQ_BASE,
 
 	/* Reset */
 	.cpu_reset_address = MM8108_REG_RESET,
@@ -595,17 +711,30 @@ const struct morse_hw_regs mm8108_regs = {
 	.boot_address = MM8108_REG_APPS_BOOT_ADDR,
 };
 
+static const struct mem_access_cfg mem_access_cfg = {
+	.expand_cache_access = {
+		.start = EXPANDABLE_ACCESS_START_ADDRESS, .end = EXPANDABLE_ACCESS_END_ADDRESS
+	},
+	.fixed_regions = {
+		{ .start = CONSTANT_REGION_0_START_ADDRESS, .end = CONSTANT_REGION_0_END_ADDRESS },
+		{ .start = CONSTANT_REGION_1_START_ADDRESS, .end = CONSTANT_REGION_1_END_ADDRESS },
+	}
+};
+
 struct morse_hw_cfg mm8108_cfg = {
 	.regs = &mm8108_regs,
 	.chip_id_address = MM8108_REG_CHIP_ID,
 	.ops = &morse_yaps_ops,
 	.bus_double_read = false,
+	.mem_access_cfg = &mem_access_cfg,
 	.enable_short_bcn_as_dtim = true,
 	.led_group.enable_led_support = true,
 	.enable_sdio_burst_mode = mm810x_enable_burst_mode,
+	.get_spi_inter_block_delay_ns = mm810x_get_spi_inter_block_delay_ns,
 	.digital_reset = mm810x_digital_reset,
 	.get_warm_boot_time_ms = mm810x_get_warm_boot_time_ms,
 	.get_cold_boot_time_ms = mm810x_get_cold_boot_time_ms,
+	.get_firmware_trigger_delay_ms = mm810x_get_firmware_trigger_delay_ms,
 	.get_hw_version = mm810x_get_hw_version,
 	.get_fw_path = mm810x_get_fw_path,
 	.set_slow_clock_mode = mm810x_set_slow_clock_mode,
@@ -618,10 +747,18 @@ struct morse_hw_cfg mm8108_cfg = {
 	.get_board_type = mm810x_get_board_type,
 	.board_type_max_value = MM810x_BOARD_TYPE_MAX_VALUE,
 	.get_encoded_country = mm810x_read_encoded_country,
+	.set_security_manifest_ptr = mm810x_set_security_manifest_ptr,
+	.get_secureboot_status = mm810x_get_secureboot_status,
+	.enable_amsdu_support = true,
+	.gpios.busy = -ENOENT,
+	.gpios.reset = -ENOENT,
+	.gpios.spi_irq = -ENOENT,
+	.gpios.wake = -ENOENT,
 };
 
 struct morse_chip_series mm81xx_chip_series = {
-	.chip_id_address = MM8108_REG_CHIP_ID
+	.cfg = &mm8108_cfg,
+	.chip_id_matches = mm810x_chip_id_matches,
 };
 
 /* B0 ROM_LINKED */
@@ -642,6 +779,12 @@ MODULE_FIRMWARE(MORSE_FW_DIR "/" MM8108_FW_BASE
 				 FW_ROM_LINKED_STRING
 				 MORSE_FW_EXT);
 
+/* B3 ROM_LINKED */
+MODULE_FIRMWARE(MORSE_FW_DIR "/" MM8108_FW_BASE
+				 MM8108B3_REV_STRING
+				 FW_ROM_LINKED_STRING
+				 MORSE_FW_EXT);
+
 /* B0 Fullmac */
 MODULE_FIRMWARE(MORSE_FW_DIR "/" MM8108_FW_BASE
 				 MM8108B0_REV_STRING
@@ -659,6 +802,13 @@ MODULE_FIRMWARE(MORSE_FW_DIR "/" MM8108_FW_BASE
 /* B2 Fullmac */
 MODULE_FIRMWARE(MORSE_FW_DIR "/" MM8108_FW_BASE
 				 MM8108B2_REV_STRING
+				 MORSE_FW_FULLMAC_STRING
+				 FW_ROM_LINKED_STRING
+				 MORSE_FW_EXT);
+
+/* B3 Fullmac */
+MODULE_FIRMWARE(MORSE_FW_DIR "/" MM8108_FW_BASE
+				 MM8108B3_REV_STRING
 				 MORSE_FW_FULLMAC_STRING
 				 FW_ROM_LINKED_STRING
 				 MORSE_FW_EXT);

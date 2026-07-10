@@ -108,6 +108,10 @@ struct morse_hw_scan {
 	struct morse_hw_scan_params *params;
 	/** Work to timeout uncompleted scans */
 	struct delayed_work timeout;
+	/** A replay scan is one in which cached scan results are replayed into the RX path */
+	bool is_replay_scan;
+	/** Work to complete replay scans */
+	struct delayed_work replay_end;
 	/** Default time to dwell on each channel during active scans */
 	u32 default_active_dwell_ms;
 	/** Time to dwell on home channel during all scans */
@@ -286,5 +290,16 @@ void morse_sched_scan_results_evt(struct ieee80211_hw *hw);
  * @dwell_ms: Default active scan dwell time
  */
 void morse_hw_scan_set_default_active_scan_dwell(struct morse *mors, uint32_t dwell_ms);
+
+/**
+ * morse_hw_scan_rx_result() - Process a received scan result (probe || beacon).
+ *
+ * @mors: Morse context
+ * @rx: Received scan result
+ * @rx_status: RX status of received scan result
+ */
+void morse_hw_scan_rx_result(struct morse *mors,
+			     const struct sk_buff *rx,
+			     const struct morse_skb_rx_status *rx_status);
 
 #endif  /* !_MORSE_HW_SCAN_H_ */

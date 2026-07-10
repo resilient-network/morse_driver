@@ -45,6 +45,10 @@ enum morse_coredump_reason {
 	MORSE_COREDUMP_REASON_USER_REQUEST = 2,
 	/* chip has notified host of stop */
 	MORSE_COREDUMP_REASON_CHIP_INDICATED_STOP = 3,
+	/* driver was unable to resume chip out of suspend */
+	MORSE_COREDUMP_REASON_FAILED_TO_RESUME = 4,
+	/* chip detected stop on reattach */
+	MORSE_COREDUMP_REASON_STOP_ON_REATTACH = 5,
 };
 
 /* Describe note types when parsing notes in a morse coredump file
@@ -100,6 +104,15 @@ void morse_coredump_destroy(struct morse *mors);
  * return 0 on success
  */
 int morse_coredump_new(struct morse *mors, enum morse_coredump_reason reason);
+
+/**
+ * morse_coredump_get_stop_info() - Get stop information string (if known and set) from HW
+ *
+ * @mors: Morse chip object.
+ * @info: Reason for chip stop. This will get set if stop reason is retrieved from the HW.
+ *        It is the responsibilty of the calling site to free the resultant pointer.
+ */
+void morse_coredump_get_stop_info(struct morse *mors, char **info);
 
 /**
  * morse_coredump() - Generate a morse coredump file.
@@ -165,6 +178,10 @@ static inline const char *morse_coredump_reason_to_str(enum morse_coredump_reaso
 		return "user request";
 	case MORSE_COREDUMP_REASON_CHIP_INDICATED_STOP:
 		return "chip indicated stop";
+	case MORSE_COREDUMP_REASON_FAILED_TO_RESUME:
+		return "failed to resume";
+	case MORSE_COREDUMP_REASON_STOP_ON_REATTACH:
+		return "stop detected on reattach";
 	default:
 		return "unknown";
 	}

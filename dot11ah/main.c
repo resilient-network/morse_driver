@@ -37,8 +37,8 @@ static int __init morse_dot11ah_init(void)
 
 	if (scheme > CHANNELIZATION_SCHEME_IEEE80211_REVMF) {
 		pr_info("Invalid value for channelization_scheme %u, setting to default value %u\n",
-			 scheme, CHANNELIZATION_SCHEME_DEFAULT);
-		scheme = CHANNELIZATION_SCHEME_DEFAULT;
+			 scheme, CONFIG_MORSE_CHANNELIZATION_SCHEME);
+		scheme = CONFIG_MORSE_CHANNELIZATION_SCHEME;
 		morse_dot11ah_set_channelization_scheme(scheme);
 	}
 	pr_info("channelization_scheme = %d (%s)\n", scheme,
@@ -115,7 +115,8 @@ struct morse_dot11ah_cssid_item *morse_dot11ah_find_bssid(const u8 bssid[ETH_ALE
 
 void morse_dot11ah_store_cssid(struct dot11ah_ies_mask *ies_mask, u16 capab_info, u8 *s1g_ies,
 			       int s1g_ies_len, const u8 *bssid,
-			       struct dot11ah_update_rx_beacon_vals *vals)
+			       struct dot11ah_update_rx_beacon_vals *vals,
+			       __le16 fc)
 {
 	/**
 	 * Kernel allocations in this function must be atomic as it occurs
@@ -126,6 +127,7 @@ void morse_dot11ah_store_cssid(struct dot11ah_ies_mask *ies_mask, u16 capab_info
 	int length;
 	const u8 *ssid;
 	u8 network_id_eid;
+	bool is_probe_resp = ieee80211_is_probe_resp(fc);
 	u16 mad = 0;
 
 	if (WARN_ON(!bssid))
@@ -138,7 +140,7 @@ void morse_dot11ah_store_cssid(struct dot11ah_ies_mask *ies_mask, u16 capab_info
 	length = ies_mask->ies[network_id_eid].len;
 
 	/* Derive MAD if set (only present in probe response frames) */
-	if (ies_mask->ies[WLAN_EID_S1G_MAX_AWAY_DURATION].ptr) {
+	if (is_probe_resp && ies_mask->ies[WLAN_EID_S1G_MAX_AWAY_DURATION].ptr) {
 		const struct dot11ah_mad_ie *mad_ie = (const struct dot11ah_mad_ie *)
 			ies_mask->ies[WLAN_EID_S1G_MAX_AWAY_DURATION].ptr;
 		mad = le16_to_cpu(mad_ie->max_away_duration);
@@ -198,8 +200,9 @@ void morse_dot11ah_store_cssid(struct dot11ah_ies_mask *ies_mask, u16 capab_info
 			kfree(s1g_ies_updated);
 		}
 
-		/* Update MAD */
-		stored->max_away_duration = max(stored->max_away_duration, mad);
+		if (is_probe_resp)
+			stored->max_away_duration = mad;
+
 		memcpy(stored->bssid, bssid, ETH_ALEN);
 		goto exit;
 	}
@@ -400,7 +403,7 @@ bool morse_dot11ah_add_mesh_peer(struct dot11ah_ies_mask *ies_mask, u16 capab_in
 		return false;
 
 	/* Create entry for this new mesh peer */
-	morse_dot11ah_store_cssid(ies_mask, capab_info, NULL, 0, peer_mac_addr, NULL);
+	morse_dot11ah_store_cssid(ies_mask, capab_info, NULL, 0, peer_mac_addr, NULL, 0);
 
 	return true;
 }

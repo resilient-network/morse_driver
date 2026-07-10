@@ -66,6 +66,31 @@ static struct morse_regdomain mors_au_2024_regdom = {
 	.channelization_scheme = CHANNELIZATION_SCHEME_IEEE80211_2024
 };
 
+struct morse_reg_rule br_reg_rules[] = {
+	/* S1G Actual Frequencies */
+	_MRR(906, 907, 1, 0, 36, AUTO_BW, 10000, 10000, false, 0, 0, 0),
+	_MRR(915, 916, 1, 0, 36, AUTO_BW, 10000, 10000, false, 0, 0, 0),
+	_MRR(902, 904, 2, 0, 36, AUTO_BW, 10000, 10000, false, 0, 0, 0),
+	_MRR(904, 906, 2, 0, 36, AUTO_BW, 10000, 10000, false, 0, 0, 0),
+	_MRR(916, 920, 4, 0, 36, AUTO_BW, 10000, 10000, false, 0, 0, 0),
+	_MRR(920, 928, 8, 0, 36, AUTO_BW, 10000, 10000, false, 0, 0, 0),
+
+	/* S1G->11ac Mapped Frequencies */
+	_MRR(5210, 5230,  20, 0, 36, AUTO_BW, 10000, 10000, false, 0, 0, 0),
+	_MRR(5550, 5570,  20, 0, 36, AUTO_BW, 10000, 10000, false, 0, 0, 0),
+	_MRR(5650, 5690,  40, 0, 36, AUTO_BW, 10000, 10000, false, 0, 0, 0),
+	_MRR(5170, 5210,  40, 0, 36, AUTO_BW, 10000, 10000, false, 0, 0, 0),
+	_MRR(5570, 5650,  80, 0, 36, AUTO_BW, 10000, 10000, false, 0, 0, 0),
+	_MRR(5735, 5895, 160, 0, 36, AUTO_BW, 10000, 10000, false, 0, 0, 0),
+};
+
+static struct morse_regdomain mors_br_regdom = {
+	.n_reg_rules = ARRAY_SIZE(br_reg_rules),
+	.alpha2 = CHANNEL_ALPHA_BR,
+	.reg_rules = br_reg_rules,
+	.channelization_scheme = CHANNELIZATION_SCHEME_NONE
+};
+
 struct morse_reg_rule ca_reg_rules[] = {
 	/* S1G Actual Frequencies */
 	_MRR(902, 904, 2, 0, 36, AUTO_BW, 10000, 10000, false, 0, 0, 0),
@@ -247,6 +272,7 @@ static struct morse_regdomain *mors_regions[] = {
 	&mors_au_2020_regdom,
 	&mors_au_regdom,
 	&mors_au_2024_regdom,
+	&mors_br_regdom,
 	&mors_ca_regdom,
 	&mors_eu_regdom,
 	&mors_gb_regdom,

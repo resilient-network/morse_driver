@@ -47,6 +47,16 @@ int morse_skbq_deq_num_items(struct morse_skbq *mq, struct sk_buff_head *skbq, i
 struct sk_buff *morse_skbq_alloc_skb(struct morse_skbq *mq, unsigned int length);
 
 /**
+ * morse_skbq_set_mac80211_owned() - Mark SKB ownership for mac80211 completion handling
+ * @skb: SKB to mark
+ * @mac80211_owned: true if SKB is mac80211-originated
+ *
+ * This marker is consumed only for TX channels that report completion to mac80211
+ * (data/mgmt/beacon). It must be set before calling morse_skbq_skb_tx().
+ */
+void morse_skbq_set_mac80211_owned(struct sk_buff *skb, bool mac80211_owned);
+
+/**
  * morse_skbq_skb_tx() - Enqueue a skb to be passed to the chip on the given channel.
  * @mq: The Morse SKBQ.
  * @skb: The skb to enqueue.
@@ -184,5 +194,7 @@ void morse_skbq_data_traffic_resume(struct morse *mors);
  * @return true if the check matches the fw calculated checksum
  */
 bool morse_validate_skb_checksum(u8 *data);
+
+u32 morse_skbq_tx_status_lifetime_ms(void);
 
 #endif /* !_MORSE_SKBQ_H_ */

@@ -11,7 +11,7 @@
 #include "debug.h"
 
 /* Channelization scheme to use */
-static u32 channelization_scheme = CHANNELIZATION_SCHEME_DEFAULT;
+static u32 channelization_scheme = CONFIG_MORSE_CHANNELIZATION_SCHEME;
 module_param(channelization_scheme, uint, 0444);
 MODULE_PARM_DESC(channelization_scheme, "Channelization scheme, affects AU regdom only");
 

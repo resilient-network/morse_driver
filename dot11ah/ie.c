@@ -284,8 +284,7 @@ void morse_dot11_clear_eid_from_ies_mask(struct dot11ah_ies_mask *ies_mask, u8 e
 	free_eid_ies_list(ies_mask->ies[eid].next);
 	if (ies_mask->ies[eid].needs_free)
 		kfree(ies_mask->ies[eid].ptr);
-	ies_mask->ies[eid].ptr = NULL;
-	ies_mask->ies[eid].len = 0;
+	memset(&ies_mask->ies[eid], 0, sizeof(ies_mask->ies[eid]));
 }
 EXPORT_SYMBOL(morse_dot11_clear_eid_from_ies_mask);
 
@@ -345,14 +344,17 @@ struct ie_element *morse_dot11_ies_create_ie_element(struct dot11ah_ies_mask *ie
 {
 	struct ie_element *cur = &ies_mask->ies[eid];
 	struct ie_element *new;
+	u32 i = 0;
 
 	if (cur->ptr) {
 		if (only_one) {
 			morse_dot11_clear_eid_from_ies_mask(ies_mask, eid);
 			WARN_ONCE(1, "EID %u already present, overriding\n", eid);
 		} else {
-			for (cur = &ies_mask->ies[eid]; cur->next; cur = cur->next)
-				continue; /* walk to the end of the list */
+			for (cur = &ies_mask->ies[eid]; cur->next; cur = cur->next) {
+				if (WARN_ON(++i > DOT11AH_MAX_ZERO_LEN_IES_IN_FRAME))
+					return NULL; /* guard against a cycle in the list */
+			}
 
 			new = kzalloc(sizeof(*new), GFP_ATOMIC);
 			if (!new)

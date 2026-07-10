@@ -76,6 +76,18 @@ int morse_cmd_set_txpower(struct morse *mors, s32 *out_power, int txpower);
 int morse_cmd_get_max_txpower(struct morse *mors, s32 *out_power);
 int morse_cmd_add_if(struct morse *mors, u16 *id, const u8 *addr, enum nl80211_iftype type);
 int morse_cmd_rm_if(struct morse *mors, u16 id);
+
+/**
+ * morse_cmd_get_if() - Get the interface type and its MAC address in the chip (FullMAC only)
+ *
+ * @mors: morse chip struct
+ * @type: pointer to the variable that stores the interface type
+ * @mac_addr: pointer to the array that stores the mac address
+ *
+ * @return 0 on success, else error code
+ */
+int morse_cmd_get_if(struct morse *mors, enum morse_cmd_interface_type *type, u8 *mac_addr);
+
 int morse_cmd_resp_process(struct morse *mors, struct sk_buff *skb);
 int morse_cmd_cfg_bss(struct morse *mors, u16 id, u16 beacon_int, u16 dtim_period, u32 cssid);
 int morse_cmd_set_bssid(struct morse *mors, u16 vif_id, const u8 *bssid);
@@ -122,7 +134,7 @@ int morse_cmd_set_channel(struct morse *mors,
 int morse_cmd_get_current_channel(struct morse *mors, u32 *op_chan_freq_hz,
 				  u8 *pri_1mhz_chan_idx, u8 *op_bw_mhz, u8 *pri_bw_mhz);
 int morse_cmd_get_version(struct morse *mors);
-int morse_cmd_cfg_scan(struct morse *mors, bool enabled, bool is_survey);
+int morse_cmd_cfg_scan(struct morse *mors, u16 vif_id, bool enabled, bool is_survey);
 int morse_cmd_get_channel_usage(struct morse *mors, struct morse_survey_rx_usage_record *record);
 
 int morse_cmd_sta_state(struct morse *mors, struct morse_vif *mors_vif,
@@ -134,7 +146,7 @@ int morse_cmd_install_key(struct morse *mors, struct morse_vif *mors_vif,
 			  enum morse_cmd_aes_key_len length);
 int morse_cmd_set_cr_bw(struct morse *mors, struct morse_vif *mors_vif, u8 direction,
 			u8 cr_1mhz_en);
-int morse_cmd_cfg_qos(struct morse *mors, struct morse_queue_params *params);
+int morse_cmd_cfg_qos(struct morse *mors, struct morse_queue_params *params, u16 vif_id);
 int morse_cmd_set_bss_color(struct morse *mors, struct morse_vif *mors_vif, u8 color);
 int morse_cmd_health_check(struct morse *mors);
 int morse_cmd_arp_offload_update_ip_table(struct morse *mors, u16 vif_id,
@@ -154,12 +166,12 @@ int morse_cmd_config_non_tim_mode(struct morse *mors, bool enable, u16 vif_id);
 int morse_cmd_enable_li_sleep(struct morse *mors,  u16 listen_interval, u16 vif_id);
 int morse_cmd_dhcpc_enable(struct morse *mors, u16 vif_id);
 int morse_cmd_twt_agreement_validate_req(struct morse *mors,
-					 struct morse_twt_agreement_data *agreement, u16 iface_id);
+					 struct morse_twt_agreement_data *agreement, u16 vif_id);
 int morse_cmd_twt_agreement_install_req(struct morse *mors,
-					struct morse_twt_agreement_data *agreement, u16 iface_id);
+					struct morse_twt_agreement_data *agreement, u16 vif_id);
 int morse_cmd_twt_remove_req(struct morse *mors,
 			     struct morse_cmd_req_twt_agreement_remove *twt_remove_cmd,
-			     u16 iface_id);
+			     u16 vif_id);
 int morse_cmd_cfg_ibss(struct morse *mors, u16 id,
 		       const u8 *bssid, bool ibss_creator, bool stop_ibss);
 int morse_cmd_cfg_offset_tsf(struct morse *mors, u16 vif_id, s64 offset_tsf);
@@ -278,6 +290,7 @@ int morse_cmd_set_fixed_transmission_rate(struct morse *mors, s32 bandwidth_mhz,
 int morse_cmd_get_rts_threshold(struct morse *mors, u32 *rts_threshold);
 int morse_cmd_set_rts_threshold(struct morse *mors, u32 rts_threshold);
 int morse_cmd_set_cts_to_self(struct morse *mors, bool enabled);
+int morse_cmd_set_channelization_scheme(struct morse *mors, u32 scheme);
 int morse_cmd_start_scan(struct morse *mors, u8 n_ssids, const u8 *ssid, size_t ssid_len,
 			 const u8 *extra_ies, size_t extra_ies_len, u32 dwell_time_ms);
 int morse_cmd_abort_scan(struct morse *mors);
@@ -287,6 +300,8 @@ int morse_cmd_get_connection_state(struct morse *mors, s8 *signal,
 				   u32 *connected_time_s, u8 *dtim_period,
 				   u16 *beacon_interval_tu);
 int morse_cmd_set_cqm_rssi(struct morse *mors, u16 vif_id, s32 cqm_rssi_thold, u32 cqm_rssi_hyst);
+int morse_cmd_set_crypto_in_host(struct morse *mors, bool enabled);
+int morse_cmd_set_dynamic_ps_timeout(struct morse *mors, unsigned int timeout_ms);
 
 /**
  * morse_cmd_get_apf_capabilities() - Get APF capabilities supported by firmware.

@@ -8,6 +8,7 @@
 #include "bus.h"
 #include "led.h"
 #include "mac.h"
+#include "ps.h"
 
 #include <linux/leds.h>
 #include <linux/workqueue.h>
@@ -95,8 +96,10 @@ static void led_work_function(struct work_struct *work)
 
 static int morse_led_feature_enabled(struct morse *mors)
 {
-	return enable_hw_leds && mors->cfg->led_group.enable_led_support &&
-	       !morse_mac_ps_enabled(mors);
+	return enable_hw_leds &&
+	       mors->cfg->led_group.enable_led_support &&
+	       !MORSE_DEVICE_TYPE_IS_FPGA(mors->chip_id) &&
+	       !morse_ps_is_supported(mors);
 }
 
 static const char *morse_led_get_trigger_softmac(struct morse *mors, enum led_mode mode)

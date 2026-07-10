@@ -8,6 +8,8 @@
  *
  */
 
+#include <linux/gpio.h>
+
 #include "chip_if.h"
 #include "morse_commands.h"
 #include "led.h"
@@ -44,6 +46,12 @@
 #define MORSE_REG_INT2_SET(mors)	(MORSE_REG_INT_BASE(mors) + 0x14)
 #define MORSE_REG_INT2_CLR(mors)	(MORSE_REG_INT_BASE(mors) + 0x18)
 #define MORSE_REG_INT2_EN(mors)		(MORSE_REG_INT_BASE(mors) + 0x1C)
+
+#define MORSE_REG_MEM_ACCESS_BASE(mors)		((mors)->cfg->regs->mem_access_req_base_addr)
+#define MORSE_REG_MEM_ACCESS_ADDR(mors)		(MORSE_REG_MEM_ACCESS_BASE(mors) + 0x00)
+#define MORSE_REG_MEM_ACCESS_SIZE(mors)		(MORSE_REG_MEM_ACCESS_BASE(mors) + 0x0C)
+#define MORSE_REG_MEM_ACCESS_STATUS(mors)	(MORSE_REG_MEM_ACCESS_BASE(mors) + 0x18)
+#define MORSE_REG_MEM_ACCESS_STATE(mors)	(MORSE_REG_MEM_ACCESS_BASE(mors) + 0x24)
 
 #define MORSE_REG_CHIP_ID(mors)	((mors)->cfg->chip_id_address)
 #define MORSE_REG_OTP_DATA_WORD(mors, word) \
@@ -89,9 +97,7 @@
 #define MORSE_INT_BEACON_VIF_MASK_ALL		(GENMASK(24, 17))
 #define MORSE_INT_BEACON_BASE_NUM			(17)
 
-/** PV0 NDP probe interrupts (VIF 0 and 1). */
-#define MORSE_INT_NDP_PROBE_REQ_PV0_VIF_MASK_ALL	(GENMASK(26, 25))
-#define MORSE_INT_NDP_PROBE_REQ_PV0_BASE_NUM		(25)
+/** BIT 25 and 26 are unused */
 
 /** Bit 27 Chip to Host stop notify */
 #define MORSE_INT_HW_STOP_NOTIFICATION_NUM	(27)
@@ -114,6 +120,10 @@
 #define MORSE_INT_BUS_IRQ_SELF_TEST_NUM		(30)
 #define MORSE_INT_BUS_IRQ_SELF_TEST		BIT(MORSE_INT_BUS_IRQ_SELF_TEST_NUM)
 #endif
+
+/** Host to Chip memory access reuqest interrupt */
+#define MORSE_MEM_ACCESS_TRGR_SET(_m)		MORSE_REG_TRGR2_SET(_m)
+#define MORSE_MEM_ACCESS_IRQ_BIT		BIT(0)
 
 /** Bit 28 and 29 Host to Chip detach and attach interrupts */
 #define MORSE_HW_DETACH_TRGR_SET(_m)		MORSE_REG_TRGR1_SET(_m)
@@ -147,23 +157,29 @@
 #define MM8108B0_REV 0x6
 #define MM8108B1_REV 0x7
 #define MM8108B2_REV 0x8
+#define MM8108B3_REV 0x9
 
 /* Chip Rev String */
 #define MM8108B_STRING "b"
 #define MM8108B0_REV_STRING MM8108B_STRING "0"
 #define MM8108B1_REV_STRING MM8108B_STRING "1"
 #define MM8108B2_REV_STRING MM8108B_STRING "2"
+#define MM8108B3_REV_STRING MM8108B_STRING "3"
 
 /* Chip ID for MM8108 */
 #define MM8108B0_ID MORSE_DEVICE_ID(MM8108XX_ID, MM8108B0_REV, CHIP_TYPE_SILICON)
 #define MM8108B1_ID MORSE_DEVICE_ID(MM8108XX_ID, MM8108B1_REV, CHIP_TYPE_SILICON)
 #define MM8108B2_ID MORSE_DEVICE_ID(MM8108XX_ID, MM8108B2_REV, CHIP_TYPE_SILICON)
+#define MM8108B3_ID MORSE_DEVICE_ID(MM8108XX_ID, MM8108B3_REV, CHIP_TYPE_SILICON)
 
 /* Chip ID for MM8108 - FPGA */
 #define MM8108B0_FPGA_ID MORSE_DEVICE_ID(MM8108XX_ID, MM8108B0_REV, CHIP_TYPE_FPGA)
 #define MM8108B1_FPGA_ID MORSE_DEVICE_ID(MM8108XX_ID, MM8108B1_REV, CHIP_TYPE_FPGA)
 #define MM8108B2_FPGA_ID MORSE_DEVICE_ID(MM8108XX_ID, MM8108B2_REV, CHIP_TYPE_FPGA)
+#define MM8108B3_FPGA_ID MORSE_DEVICE_ID(MM8108XX_ID, MM8108B3_REV, CHIP_TYPE_FPGA)
 
+
+#define MEM_ACCESS_FIXED_REGION_COUNT	2
 
 #define FW_RAM_ONLY_STRING ""
 #define FW_ROM_LINKED_STRING "-rl"
@@ -188,6 +204,8 @@ enum host_table_firmware_flags {
 	MORSE_FW_FLAGS_SUPPORT_HW_REATTACH = BIT(9),
 	/** Firmware can report TX status for any frame (fullmac only) */
 	MORSE_FW_FLAGS_SUPPORT_FULLMAC_REPORT = BIT(10),
+	/** BCF was not loaded - firmware is running in failsafe mode */
+	MORSE_FW_FLAGS_FAILSAFE_MODE = BIT(11),
 };
 
 enum morse_hw_state {
@@ -226,9 +244,22 @@ struct morse_hw_memory {
 	u32 end;
 };
 
+struct mem_access_cfg {
+	/**
+	 * @expand_cache_access: Region for which access through cache can be expanded
+	 */
+	struct morse_hw_memory expand_cache_access;
+
+	/**
+	 * @fixed_regions: Fixed memory regions to which bus access is always unrestricted
+	 */
+	struct morse_hw_memory fixed_regions[MEM_ACCESS_FIXED_REGION_COUNT];
+};
+
 struct morse_hw_regs {
 	u32 irq_base_address;
 	u32 trgr_base_address;
+	u32 mem_access_req_base_addr;
 	u32 cpu_reset_address;
 	u32 cpu_reset_value;
 	u32 msi_address;
@@ -259,6 +290,20 @@ struct morse_hw_clock {
 	ktime_t reference;
 	/* Used for freeing the data on update */
 	struct rcu_head rcu;
+};
+
+/**
+ * struct morse_gpios - GPIO assignments for SDIO/SPI attached devices.
+ * @reset: Host-controlled GPIO used to reset the device - required for SPI.
+ * @wake: Host-controlled GPIO used to wake the device from low power state.
+ * @busy: Device-controlled GPIO indicating the device is busy.
+ * @spi_irq: Device-controlled GPIO interrupt - required for SPI.
+ */
+struct morse_gpios {
+	int reset;
+	int wake;
+	int busy;
+	int spi_irq;
 };
 
 struct morse_hw_cfg {
@@ -295,6 +340,13 @@ struct morse_hw_cfg {
 	 u32 (*get_cold_boot_time_ms)(u32 chip_id);
 
 	/**
+	 * Get firmware trigger delay/wait time depending on chip id
+	 *
+	 * @chip_id: Registered chip ID when loading the driver
+	 */
+	u32 (*get_firmware_trigger_delay_ms)(u32 chip_id);
+
+	/**
 	 * Get FW path depending on chip id
 	 *
 	 * @chip_id: Registered chip ID when loading the driver
@@ -304,9 +356,21 @@ struct morse_hw_cfg {
 	/**
 	 * Enable SDIO burst mode
 	 *
-	 * @return inter_block_delay_ns
+	 * @mors: Morse context object
+	 * @burst_enabled: Bursting enabled or not
+	 *
+	 * @return error code
 	 */
-	int (*enable_sdio_burst_mode)(struct morse *mors, const u8 burst_mode);
+	int (*enable_sdio_burst_mode)(struct morse *mors, bool burst_enabled);
+
+	/**
+	 * Get burst mode inter block delay
+	 *
+	 * @burst_enabled: Bursting enabled or not
+	 *
+	 * @return Inter block delay in nano seconds
+	 */
+	u32 (*get_spi_inter_block_delay_ns)(bool burst_enabled);
 
 	/**
 	 * Perform necessary actions to prepare the chip before firmware load
@@ -390,6 +454,35 @@ struct morse_hw_cfg {
 	void (*gpio_write_output)(struct morse *mors, int pin_num, bool value);
 
 	/**
+	 * Set Security Manifest Pointer address
+	 *
+	 *
+	 * Write the chip memory address where the security manifest has been loaded
+	 * into the Security Manifest Pointer register, so that the boot loader can
+	 * find it and verify the firmware.
+	 *
+	 * @mors Morse context object
+	 * @addr Load address of the security manifest
+	 *
+	 * @return error code
+	 */
+	int (*set_security_manifest_ptr)(struct morse *mors, uint32_t addr);
+
+	/**
+	 * Retrieve the secure boot status.
+	 *
+	 * Reads the secure boot status register and stores the value
+	 * in the provided status pointer.
+	 *
+	 * @mors	Morse context object.
+	 * @status	Variable where the secure boot status will be stored.
+	 *
+	 * @return	0 on success, -EOPNOTSUPP if the chip does not support secure boot,
+	 * or an error code if the register read failed.
+	 */
+	int (*get_secureboot_status)(struct morse *mors, uint32_t *status);
+
+	/**
 	 * @led_group: Contains information pertaining to gpio-attached LEDs
 	 */
 	struct morse_led_group led_group;
@@ -399,6 +492,11 @@ struct morse_hw_cfg {
 	 * the page header repeated words
 	 */
 	bool bus_double_read;
+
+	/**
+	 * @mem_access_cfg: Restricted mem access config
+	 */
+	const struct mem_access_cfg *mem_access_cfg;
 
 	/**
 	 * @xtal_init_bus_trans_delay_ms : An additional delay incurred if the device
@@ -413,25 +511,32 @@ struct morse_hw_cfg {
 	bool enable_short_bcn_as_dtim;
 
 	/**
-	 * @mm_ps_gpios_supported: Indicate if a hardware config supports powersave
-	 * through hardware gpios
+	 * @enable_amsdu_support: Indicate if A-MSDU to be enabled when airtime fairness is enabled
 	 */
-	bool mm_ps_gpios_supported;
+	bool enable_amsdu_support;
+
+	/** Host GPIO config */
+	struct morse_gpios gpios;
+
 	u32 board_type_max_value;
 	u32 fw_count;
 	u32 host_table_ptr;
-	u32 mm_reset_gpio;
-	u32 mm_wake_gpio;
-	u32 mm_ps_async_gpio;
-	u32 mm_spi_irq_gpio;
 };
 
 struct morse_chip_series {
 	/**
-	 * @chip_id_address: The address where we can read about the type of chip.
-	 * Should not change for a family of chipset.
+	 * @cfg: The hardware config for the chip
 	 */
-	const u32 chip_id_address;
+	struct morse_hw_cfg *cfg;
+
+	/**
+	 * Check whether the given chip ID matches a chip from this series
+	 *
+	 * @chip_id: Chip id to be matched
+	 *
+	 * Return: True if the chip ID matches.
+	 */
+	bool (*chip_id_matches)(u32 chip_id);
 };
 
 int morse_hw_irq_enable(struct morse *mors, u32 irq, bool enable);
@@ -492,15 +597,15 @@ int morse_hw_enable_stop_notifications(struct morse *mors, bool enable);
 void morse_hw_stop_work(struct work_struct *work);
 
 /**
- * morse_chip_cfg_detect_and_init - Read the chip_id at the `chip_id_address` and
- * assign the cfgs and regs structs.
+ * morse_chip_cfg_set_and_validate - Set the config and validate
+ * the chip id
  *
  * @mors: morse struct containing bus_ops and pointers to regs and cfgs
- * @mors_chip_series: Chip family struct containing info to identify device.
+ * @mors_chip_series: Chip family struct containing config to set
  *
  * Return: int error code. Returns 0 if successful.
  */
-int morse_chip_cfg_detect_and_init(struct morse *mors, struct morse_chip_series *mors_chip_series);
+int morse_chip_cfg_set_and_validate(struct morse *mors, struct morse_chip_series *mors_chip_series);
 
 /**
  * morse_chip_cfg_init - Assign the chip-specific cfg and regs based on chip_id.
@@ -542,6 +647,7 @@ int morse_hw_clock_trigger_update(struct morse *mors, bool wait);
  * @return 0 if success else error code
  */
 int morse_hw_clock_now(const struct morse *mors, u64 *now);
+
 
 /**
  * morse_hw_is_already_loaded - Check if the hardware is already loaded
@@ -595,6 +701,15 @@ int morse_hw_detach(struct morse *mors, int cfg);
  * @return true if reattaching to hardware else false
  */
 bool morse_hw_should_reattach(void);
+
+/**
+ * morse_hw_can_detach - Check if host can detach from hardware
+ *
+ * @mors: morse struct
+ *
+ * @return true if detaching is allowed
+ */
+bool morse_hw_can_detach(const struct morse *mors);
 
 /**
  * morse_hw_headless_init - Initialise headless data structure in mors struct
@@ -677,5 +792,15 @@ bool morse_hw_is_stopped_notification_set(struct morse *mors);
  * @return true if on
  */
 bool morse_hw_is_on(const struct morse *mors);
+
+/**
+ * morse_hw_ps_gpios_are_supported - Indicate if a hardware config supports power save through
+ * hardware GPIOs
+ * @gpios: Morse hardware GPIO structure
+ */
+static inline bool morse_hw_ps_gpios_are_supported(struct morse_gpios *gpios)
+{
+	return gpio_is_valid(gpios->wake) && gpio_is_valid(gpios->busy);
+}
 
 #endif /* !_MORSE_HW_H_ */

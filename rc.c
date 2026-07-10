@@ -63,9 +63,9 @@ MODULE_PARM_DESC(fixed_guard, "Fixed guard interval (only used when enable_fixed
 #define MORSE_RC_WARN_RATELIMITED(_m, _f, _a...)		\
 	morse_warn_ratelimited(FEATURE_ID_RATECONTROL, _m, _f, ##_a)
 
-static void morse_rc_work(struct work_struct *work)
+static void morse_rc_work(struct work_struct *w)
 {
-	struct morse_rc *mrc = container_of(work, struct morse_rc, work);
+	struct morse_rc *mrc = container_of(to_delayed_work(w), struct morse_rc, dwork);
 	struct list_head *pos;
 
 	spin_lock_bh(&mrc->lock);
@@ -81,23 +81,7 @@ static void morse_rc_work(struct work_struct *work)
 
 	spin_unlock_bh(&mrc->lock);
 
-	mod_timer(&mrc->timer, jiffies + msecs_to_jiffies(100));
-}
-
-#if KERNEL_VERSION(4, 14, 0) > LINUX_VERSION_CODE
-static void morse_rc_timer(unsigned long addr)
-#else
-static void morse_rc_timer(struct timer_list *t)
-#endif
-{
-#if KERNEL_VERSION(4, 14, 0) > LINUX_VERSION_CODE
-	struct morse *mors = (struct morse *)addr;
-#else
-	struct morse_rc *mrc = TIMER_TO_OBJ(mrc, t, timer);
-	struct morse *mors = mrc->mors;
-#endif
-
-	queue_work(mors->net_wq, &mors->mrc.work);
+	queue_delayed_work(mrc->mors->net_wq, &mrc->dwork, msecs_to_jiffies(100));
 }
 
 int morse_rc_init(struct morse *mors)
@@ -106,18 +90,10 @@ int morse_rc_init(struct morse *mors)
 	INIT_LIST_HEAD(&mors->mrc.stas);
 	spin_lock_init(&mors->mrc.lock);
 
-	INIT_WORK(&mors->mrc.work, morse_rc_work);
-#if KERNEL_VERSION(4, 14, 0) > LINUX_VERSION_CODE
-	init_timer(&mors->mrc.timer);
-	mors->mrc.timer.data = (unsigned long)mors;
-	mors->mrc.timer.function = morse_rc_timer;
-	add_timer(&mors->mrc.timer);
-#else
-	timer_setup(&mors->mrc.timer, morse_rc_timer, 0);
-#endif
+	INIT_DELAYED_WORK(&mors->mrc.dwork, morse_rc_work);
 
 	mors->mrc.mors = mors;
-	mod_timer(&mors->mrc.timer, jiffies + msecs_to_jiffies(100));
+	queue_delayed_work(mors->net_wq, &mors->mrc.dwork, msecs_to_jiffies(100));
 
 	mmrc_init();
 
@@ -126,8 +102,7 @@ int morse_rc_init(struct morse *mors)
 
 int morse_rc_deinit(struct morse *mors)
 {
-	cancel_work_sync(&mors->mrc.work);
-	DEL_TIMER_SYNC(&mors->mrc.timer);
+	cancel_delayed_work_sync(&mors->mrc.dwork);
 
 	return 0;
 }
@@ -646,8 +621,8 @@ void morse_rc_sta_fill_tx_rates(struct morse *mors,
 static void morse_rc_sta_set_rates(struct morse *mors,
 				   struct morse_sta *msta,
 				   struct mmrc_rate_table *rates,
-				   int attempts,
-				   bool was_aggregated)
+				   bool was_aggregated,
+				   bool acked)
 {
 	struct list_head *pos;
 
@@ -656,7 +631,7 @@ static void morse_rc_sta_set_rates(struct morse *mors,
 		struct morse_rc_sta *mrc_sta = list_entry(pos, struct morse_rc_sta, list);
 
 		if (&msta->rc == mrc_sta) {
-			mmrc_feedback(msta->rc.tb, rates, attempts, was_aggregated);
+			mmrc_feedback(msta->rc.tb, rates, was_aggregated, acked);
 			break;
 		}
 	}
@@ -664,8 +639,7 @@ static void morse_rc_sta_set_rates(struct morse *mors,
 }
 
 void morse_rc_sta_feedback_rates(struct morse *mors, struct sk_buff *skb,
-				 struct ieee80211_sta *sta, struct morse_skb_tx_status *tx_sts,
-				 int attempts)
+				 struct ieee80211_sta *sta, struct morse_skb_tx_status *tx_sts)
 {
 	struct ieee80211_hdr *hdr = (struct ieee80211_hdr *)skb->data;
 	struct ieee80211_tx_info *txi = IEEE80211_SKB_CB(skb);
@@ -676,6 +650,7 @@ void morse_rc_sta_feedback_rates(struct morse *mors, struct sk_buff *skb,
 	struct morse_sta *msta = NULL;
 	struct ieee80211_vif *vif = NULL;
 	struct morse_vif *mors_vif;
+	bool sent = false;
 
 	vif = txi->control.vif ? txi->control.vif : morse_get_vif_from_tx_status(mors, tx_sts);
 
@@ -689,10 +664,6 @@ void morse_rc_sta_feedback_rates(struct morse *mors, struct sk_buff *skb,
 
 	mors_vif = ieee80211_vif_to_morse_vif(vif);
 
-	if (attempts <= 0)
-		/* Did we really send the packet? */
-		goto exit;
-
 	/* Update mmrc rates struct from tx status feedback from the firmware */
 	for (i = 0; i < count; i++) {
 		rates.rates[i].rate = morse_ratecode_mcs_index_get(tx_sts->rates[i].morse_ratecode);
@@ -700,8 +671,13 @@ void morse_rc_sta_feedback_rates(struct morse *mors, struct sk_buff *skb,
 		rates.rates[i].guard = morse_ratecode_sgi_get(tx_sts->rates[i].morse_ratecode);
 		rates.rates[i].bw = morse_ratecode_bw_index_get(tx_sts->rates[i].morse_ratecode);
 		rates.rates[i].flags = morse_ratecode_rts_get(tx_sts->rates[i].morse_ratecode);
-		rates.rates[i].attempts = txi->control.rates[i].count;
+		rates.rates[i].attempts = tx_sts->rates[i].count;
+		sent |= !!tx_sts->rates[i].count;
 	}
+
+	if (!sent)
+		/* Did we really send the packet? */
+		goto exit;
 
 	if (msta) {
 		/* Save the rate information. This will be used to update station's tx rate stats */
@@ -726,8 +702,9 @@ void morse_rc_sta_feedback_rates(struct morse *mors, struct sk_buff *skb,
 		}
 	}
 
-	morse_rc_sta_set_rates(mors, msta, &rates, attempts,
-			       !!(le32_to_cpu(tx_sts->flags) & MORSE_TX_STATUS_WAS_AGGREGATED));
+	morse_rc_sta_set_rates(mors, msta, &rates,
+			       !!(le32_to_cpu(tx_sts->flags) & MORSE_TX_STATUS_WAS_AGGREGATED),
+			       !(le32_to_cpu(tx_sts->flags) & MORSE_TX_STATUS_FLAGS_NO_ACK));
 
 exit:
 	ieee80211_tx_info_clear_status(txi);
@@ -804,7 +781,8 @@ void morse_rc_sta_state_check(struct morse *mors,
 			best_tp = mmrc_calculate_theoretical_throughput(best_rate);
 
 			if (mors_vif->mcast_tx_rate_throughput > best_tp ||
-			    !mors_vif->ap->num_stas) {
+			    !mors_vif->ap ||
+			    mors_vif->ap->num_stas == 0) {
 				mors_vif->mcast_tx_rate_throughput = best_tp;
 				mors_vif->mcast_tx_rate = best_rate;
 			}

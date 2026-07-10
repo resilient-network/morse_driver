@@ -1010,7 +1010,11 @@ int morse_dot11_tim_to_s1g(struct dot11ah_s1g_tim_ie *s1g_tim,
 		}
 	}
 
-	/* Only include the tim if we either have BC traffic, or the 11n tim had some bits set. */
+	/*
+	 * Include the TIM IE if we either have BC traffic, or the 11n TIM had some bits set.
+	 * Otherwise, include the bitmap control field as an empty placeholder (for DTIM beacons)
+	 * The LMAC will utilize it later, or will be trimmed prior to transmission
+	 */
 	if (s1g_tim->bitmap_control || state.index_s1g > 0) {
 		s1g_tim->bitmap_control |= (page_slice_no <<
 					    IEEE80211_S1G_TIM_BITMAP_PAGE_SLICE_SHIFT);
@@ -1019,6 +1023,9 @@ int morse_dot11_tim_to_s1g(struct dot11ah_s1g_tim_ie *s1g_tim,
 
 		/* Bitmap Control field is present if the Partial Virtual Bitmap field is present */
 		s1g_tim_length = s1g_tim_length + state.index_s1g + 1;
+	} else if (tim->dtim_count == 0) {
+		s1g_tim->bitmap_control = 0;
+		s1g_tim_length = s1g_tim_length + 1;
 	}
 
 	return s1g_tim_length;

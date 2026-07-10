@@ -223,13 +223,13 @@ static void prepare_sta_stats(void *data, struct morse_sta *msta)
  *
  * @t: BSS Stats context
  */
-#if KERNEL_VERSION(4, 14, 0) > LINUX_VERSION_CODE
+#if KERNEL_VERSION(4, 15, 0) > LINUX_VERSION_CODE
 static void morse_bss_stats_timer_cb(unsigned long addr)
 #else
 static void morse_bss_stats_timer_cb(struct timer_list *t)
 #endif
 {
-#if KERNEL_VERSION(4, 14, 0) > LINUX_VERSION_CODE
+#if KERNEL_VERSION(4, 15, 0) > LINUX_VERSION_CODE
 	struct morse_bss_stats_context *bss_stats = (struct morse_bss_stats_context *)addr;
 #else
 	struct morse_bss_stats_context *bss_stats = TIMER_TO_OBJ(bss_stats, t, timer);
@@ -707,7 +707,7 @@ int morse_bss_stats_init(struct morse_vif *mors_vif)
 	bss_stats->mors = mors;
 	bss_stats->mors_vif = mors_vif;
 
-#if KERNEL_VERSION(4, 14, 0) > LINUX_VERSION_CODE
+#if KERNEL_VERSION(4, 15, 0) > LINUX_VERSION_CODE
 	init_timer(&bss_stats->timer);
 	bss_stats->timer.data = (unsigned long)bss_stats;
 	bss_stats->timer.function = morse_bss_stats_timer_cb;

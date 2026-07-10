@@ -257,6 +257,18 @@ int morse_mac_event_recv(struct morse *mors, struct sk_buff *skb)
 
 		break;
 	}
+	case MORSE_CMD_ID_EVT_NDP_PROBE_REQUEST_RECEIVED: {
+		struct morse_cmd_evt_ndp_probe_request_received *probe_req_data =
+			(struct morse_cmd_evt_ndp_probe_request_received *)event;
+		struct ieee80211_vif *vif = morse_get_vif_from_vif_id(mors, vif_id);
+
+		ret = morse_ndp_probe_req_rx(mors, vif,
+						probe_req_data->rx_bw_mhz,
+						probe_req_data->is_pv1);
+
+		break;
+	}
+
 	default:
 		ret = -EINVAL;
 	}

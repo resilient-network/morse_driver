@@ -367,6 +367,18 @@ static const struct morse_dot11ah_ch_map mors_au_map = {
 		.channelization_scheme = CHANNELIZATION_SCHEME_IEEE80211_REVMF,
 };
 
+/* BR map */
+static const struct morse_dot11ah_ch_map mors_br_map = {
+		.alpha = CHANNEL_ALPHA_BR,
+		.prim_1mhz_channel_loc_to_idx = &prim_1mhz_channel_loc_to_idx_default,
+		.calculate_primary_s1g = &calculate_primary_s1g_channel_default,
+		.s1g_op_chan_pri_chan_to_5g = &s1g_op_chan_pri_chan_to_5g_default,
+		.get_pri_1mhz_chan = &get_pri_1mhz_chan_default,
+		.transform_overlapping_5g_chan = NULL,
+		.num_mapped_channels = ARRAY_SIZE(br_s1g_channels),
+		.s1g_channels = br_s1g_channels,
+};
+
 /* NZ map */
 static const struct morse_dot11ah_ch_map mors_nz_map = {
 		.alpha = CHANNEL_ALPHA_NZ,
@@ -488,6 +500,7 @@ const struct morse_dot11ah_ch_map *mapped_channels[] = {
 	&mors_au_2020_map,
 	&mors_au_2024_map,
 	&mors_au_map,
+	&mors_br_map,
 	&mors_ca_map,
 	&mors_eu_map,
 	&mors_gb_map,
@@ -555,6 +568,9 @@ static enum morse_dot11ah_region morse_reg_get_region(const char *alpha)
 	if (!strcmp(alpha, "AU"))
 		return MORSE_AU;
 
+	if (!strcmp(alpha, "BR"))
+		return MORSE_BR;
+
 	if (!strcmp(alpha, "CA"))
 		return MORSE_CA;
 
@@ -600,7 +616,8 @@ static struct morse_dot11ah_channel *lookup_s1g_chan_from_5g_chan(int chan_5g)
 	return NULL;
 }
 
-#if KERNEL_VERSION(5, 10, 11) > MAC80211_VERSION_CODE
+#if KERNEL_VERSION(5, 10, 11) > MAC80211_VERSION_CODE || \
+	KERNEL_VERSION(6, 18, 0) <= MAC80211_VERSION_CODE
 u8 ch_flag_to_chan_bw(enum morse_dot11ah_channel_flags flags)
 #else
 u8 ch_flag_to_chan_bw(enum ieee80211_channel_flags flags)
@@ -759,6 +776,7 @@ int morse_dot11ah_channel_to_freq_khz(int chan)
 
 		return (start_freq + chan * 500);
 	}
+	case MORSE_BR:
 	case MORSE_CA:
 	case MORSE_NZ:
 	case MORSE_US:
@@ -818,6 +836,7 @@ int morse_dot11ah_freq_khz_bw_mhz_to_chan(u32 freq, u8 bw)
 		channel = (freq - start_freq) /  500;
 		break;
 	}
+	case MORSE_BR:
 	case MORSE_CA:
 	case MORSE_NZ:
 	case MORSE_US:

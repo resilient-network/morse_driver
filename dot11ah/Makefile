@@ -8,10 +8,14 @@ DEBFLAGS = -O2
 endif
 
 # Set 0 to a version number. This is done to match the Linux expectations
-override MORSE_VERSION = "0-rel_1_17_9_2026_Apr_20"
+override MORSE_VERSION = "0-rel_mm6108_2_0_1_2026_Jun_11"
 
 #ccflags-y += $(DEBFLAGS) -Werror
 ccflags-y += "-DMORSE_VERSION=$(MORSE_VERSION)"
+
+# Default channelization_scheme to CHANNELIZATION_SCHEME_IEEE80211_REVMF
+CONFIG_MORSE_CHANNELIZATION_SCHEME ?= 3
+ccflags-y += "-DCONFIG_MORSE_CHANNELIZATION_SCHEME=$(CONFIG_MORSE_CHANNELIZATION_SCHEME)"
 
 ifneq ($(CONFIG_DISABLE_MORSE_RC),y)
 	ccflags-y += "-DCONFIG_MORSE_RC"

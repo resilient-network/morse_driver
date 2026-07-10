@@ -54,6 +54,7 @@ static const char * const morse_log_features[] = {
 	[FEATURE_ID_APF] = "apf",
 	[FEATURE_ID_HEADLESS] = "headless",
 	[FEATURE_ID_WOWLAN] = "wowlan",
+	[FEATURE_ID_SCAN_RES_CACHE] = "scanrescache",
 };
 
 /*
@@ -146,9 +147,7 @@ static int read_page_stats(struct seq_file *file, void *data)
 	print_stat(file, "Page write fail", mors->debug.page_stats.write_fail);
 	print_stat(file, "No page", mors->debug.page_stats.no_page);
 	print_stat(file, "No command page", mors->debug.page_stats.cmd_no_page);
-	print_stat(file, "Command page retry", mors->debug.page_stats.cmd_rsv_page_retry);
 	print_stat(file, "No beacon page", mors->debug.page_stats.bcn_no_page);
-	print_stat(file, "Excessive beacon loss", mors->debug.page_stats.excessive_bcn_loss);
 	print_stat(file, "Queue stop", mors->debug.page_stats.queue_stop);
 	print_stat(file, "Popped page owned by chip", mors->debug.page_stats.page_owned_by_chip);
 	print_stat(file, "Tx aged out", mors->debug.page_stats.tx_aged_out);
@@ -504,10 +503,16 @@ static int read_vendor_ies(struct seq_file *file, void *data)
 		seq_printf(file, "%s: VIF [%d]:\n", morse_vif_name(vif), mors_vif->id);
 		spin_lock_bh(&mors_vif->vendor_ie.lock);
 		list_for_each_entry(item, &vie_config->ie_list, list) {
-			ie = (u8 *)item->ie.oui;
+			struct ieee80211_vendor_ie *element =
+				(struct ieee80211_vendor_ie *)item->element;
+
+			if (!element)
+				continue;
+
+			ie = (u8 *)element->oui;
 			seq_printf(file, "Vendor IE: (mask 0x%04x)", item->mgmt_type_mask);
 
-			for (i = 0; i < item->ie.len; i++) {
+			for (i = 0; i < element->len; i++) {
 				if ((i % 32) == 0)
 					seq_puts(file, "\n\t");
 				seq_printf(file, "%02X ", ie[i]);
@@ -615,7 +620,7 @@ static ssize_t morse_debug_bus_reset_write(struct file *file, const char __user 
 	if (value != 1)
 		return -EINVAL;
 
-	schedule_work(&mors->reset);
+	schedule_work(&mors->recovery.bus_reset);
 
 	return count;
 }
@@ -638,7 +643,7 @@ static ssize_t morse_debug_driver_restart_write(struct file *file, const char __
 		return -EINVAL;
 	if (value != 1)
 		return -EINVAL;
-	schedule_work(&mors->driver_restart);
+	schedule_work(&mors->recovery.driver_restart);
 	return count;
 }
 
@@ -686,26 +691,6 @@ static const struct file_operations watchdog_fops = {
 	.llseek = no_llseek,
 #endif
 	.write = morse_debug_watchdog_write,
-};
-
-static ssize_t morse_debug_reset_required_read(struct file *file,
-					       char __user *user_buf, size_t count, loff_t *ppos)
-{
-	struct morse *mors = file->private_data;
-	char buf[5];
-	size_t len;
-
-	len = scnprintf(buf, sizeof(buf), "%u\n", mors->reset_required);
-
-	return simple_read_from_buffer(user_buf, count, ppos, buf, len);
-}
-
-static const struct file_operations reset_required_fops = {
-	.open = simple_open,
-#if KERNEL_VERSION(6, 12, 0) > LINUX_VERSION_CODE
-	.llseek = no_llseek,
-#endif
-	.read = morse_debug_reset_required_read,
 };
 
 struct hostif_log_item {
@@ -1160,9 +1145,6 @@ int morse_init_debug(struct morse *mors)
 	debugfs_create_file("restart", 0600, mors->debug.debugfs_phy, mors, &driver_restart_fops);
 
 	debugfs_create_file("watchdog", 0600, mors->debug.debugfs_phy, mors, &watchdog_fops);
-
-	debugfs_create_file("reset_required", 0600, mors->debug.debugfs_phy, mors,
-			    &reset_required_fops);
 
 #endif
 

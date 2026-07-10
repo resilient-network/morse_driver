@@ -336,13 +336,10 @@ void morse_mac_process_twt_action_tx_finish(struct morse *mors, struct ieee80211
  * @enable_twt          True if TWT is configured
  * @is_ap		True if the interface is in AP mode
  * @is_sta		True if the interface is in STA mode
- * @ps_is_enabled	True if power save is enabled
- * @ps_is_offloaded	True if power save offload is enabled
  * @connection_monitor_is_enabled	True if the MAC80211 connection monitor is enabled
  */
 void morse_twt_init_vif(struct morse *mors, struct morse_vif *mors_vif,
 			bool enable_twt, bool is_ap, bool is_sta,
-			bool ps_is_enabled, bool ps_is_offloaded,
 			bool connection_monitor_is_enabled);
 
 /**

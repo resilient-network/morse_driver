@@ -36,10 +36,15 @@ MODULE_PARM_DESC(hw_reload_after_stop,
 "Reload HW after a stop notification. Abort if stop events are less than this seconds apart (-1 to disable)");
 
 /* Re-attach to a running hardware */
-bool reattach_hw __read_mostly;
+bool reattach_hw __read_mostly = CONFIG_MORSE_REATTACH_HW;
 module_param(reattach_hw, bool, 0644);
 MODULE_PARM_DESC(reattach_hw,
 	"Do not reset hardware state during module exit, attempt to reattach during module init");
+
+static const struct morse_chip_series *chip_series[] = {
+	&mm61xx_chip_series,
+	&mm81xx_chip_series,
+};
 
 static int hw_enable_irq(struct morse *mors, u32 irq, bool enable)
 {
@@ -70,10 +75,12 @@ int morse_hw_irq_enable(struct morse *mors, u32 irq, bool enable)
 void morse_hw_stop_work(struct work_struct *work)
 {
 	bool is_already_stopped;
-	struct morse *mors = container_of(work, struct morse, hw_stop);
+	time64_t now;
+	struct morse *mors = container_of(work, struct morse, recovery.hw_stop);
 
 	mutex_lock(&mors->lock);
 	is_already_stopped = morse_hw_is_stopped(mors);
+	trace_hw_stop(is_already_stopped);
 	if (!is_already_stopped)
 		morse_hw_set_state(mors, MORSE_HW_STATE_STOPPED);
 	mutex_unlock(&mors->lock);
@@ -87,8 +94,15 @@ void morse_hw_stop_work(struct work_struct *work)
 	if (hw_reload_after_stop < 0)
 		return;
 
+	if (!mors->recovery.is_ready) {
+		dev_err(mors->dev, "HW recovery flow is not ready\n");
+		return;
+	}
+
+	now = ktime_get_seconds();
 	if (hw_reload_after_stop > 0 &&
-	    (ktime_get_seconds() - mors->last_hw_stop) < hw_reload_after_stop) {
+	    mors->last_hw_stop &&
+	    (now - mors->last_hw_stop) < hw_reload_after_stop) {
 		/* HW reload was attempted twice in rapid succession - abort to prevent thrashing */
 		dev_err(mors->dev,
 			"Automatic HW reload aborted due to retry in < %ds\n",
@@ -99,9 +113,9 @@ void morse_hw_stop_work(struct work_struct *work)
 	mutex_lock(&mors->lock);
 	if (!morse_coredump_new(mors, MORSE_COREDUMP_REASON_CHIP_INDICATED_STOP))
 		set_bit(MORSE_STATE_FLAG_DO_COREDUMP, &mors->state_flags);
-	mors->last_hw_stop = ktime_get_seconds();
+	mors->last_hw_stop = now;
 	mutex_unlock(&mors->lock);
-	schedule_work(&mors->driver_restart);
+	schedule_work(&mors->recovery.driver_restart);
 }
 
 void morse_hw_restart(struct morse *mors)
@@ -115,12 +129,12 @@ void morse_hw_restart(struct morse *mors)
 
 	mors->last_hw_stop = ktime_get_seconds();
 	mutex_unlock(&mors->lock);
-	schedule_work(&mors->driver_restart);
+	schedule_work(&mors->recovery.driver_restart);
 }
 
 static void to_host_hw_stop_irq_handle(struct morse *mors)
 {
-	schedule_work(&mors->hw_stop);
+	schedule_work(&mors->recovery.hw_stop);
 }
 
 static void morse_hw_headless_done_irq_handle(struct morse *mors)
@@ -137,13 +151,13 @@ int morse_hw_irq_handle(struct morse *mors)
 
 	morse_reg32_read(mors, MORSE_REG_INT1_STS(mors), &status1);
 	trace_hw_irq(status1);
+	if (!status1)
+		goto exit;
 
-	if (status1 & MORSE_CHIP_IF_IRQ_MASK_ALL)
-		mors->cfg->ops->chip_if_handle_irq(mors, status1);
 	if (status1 & MORSE_INT_BEACON_VIF_MASK_ALL)
 		morse_beacon_irq_handle(mors, status1);
-	if (status1 & MORSE_INT_NDP_PROBE_REQ_PV0_VIF_MASK_ALL)
-		morse_ndp_probe_req_resp_irq_handle(mors, status1);
+	if (status1 & MORSE_CHIP_IF_IRQ_MASK_ALL)
+		mors->cfg->ops->chip_if_handle_irq(mors, status1);
 	if (status1 & MORSE_INT_HW_STOP_NOTIFICATION)
 		to_host_hw_stop_irq_handle(mors);
 	if (status1 & MORSE_HW_HEADLESS_DONE)
@@ -155,6 +169,7 @@ int morse_hw_irq_handle(struct morse *mors)
 
 	morse_reg32_write(mors, MORSE_REG_INT1_CLR(mors), status1);
 
+exit:
 #if defined(CONFIG_MORSE_DEBUG_IRQ)
 	mors->debug.hostsync_stats.irq++;
 	for (i = 0; i < ARRAY_SIZE(mors->debug.hostsync_stats.irq_bits); i++) {
@@ -179,7 +194,7 @@ int morse_hw_toggle_aon_latch(struct morse *mors)
 {
 	u32 address = MORSE_REG_AON_LATCH_ADDR(mors);
 	u32 mask = MORSE_REG_AON_LATCH_MASK(mors);
-	u32 latch;
+	u32 latch = 0;
 
 	if (address) {
 		/* invoke AON latch procedure */
@@ -243,10 +258,11 @@ int morse_hw_clock_now(const struct morse *mors, u64 *now)
 	return ret;
 }
 
-static bool hw_supports_clock_read(const struct morse *mors)
+static bool hw_supports_clock_interaction(const struct morse *mors)
 {
-	return MORSE_REG_MTIME_LOWER(mors) || MORSE_REG_MTIME_UPPER(mors);
+	return MORSE_REG_MTIME_LOWER(mors) > 0 && MORSE_REG_MTIME_UPPER(mors) > 0;
 }
+
 
 static int hw_read_clock(struct morse *mors, u64 *out)
 {
@@ -284,7 +300,7 @@ int morse_hw_clock_update(struct morse *mors)
 	struct morse_hw_clock *old;
 	ktime_t reference;
 
-	if (!hw_supports_clock_read(mors)) {
+	if (!hw_supports_clock_interaction(mors)) {
 		ret = -ENOTSUPP;
 		MORSE_WARN_ON_ONCE(FEATURE_ID_HWCLOCK, 1);
 		goto exit;
@@ -332,7 +348,7 @@ int morse_hw_clock_trigger_update(struct morse *mors, bool wait)
 	const int overhead_ms = 10;
 	DECLARE_COMPLETION_ONSTACK(hw_clock_update);
 
-	if (!hw_supports_clock_read(mors)) {
+	if (!hw_supports_clock_interaction(mors)) {
 		ret = -EOPNOTSUPP;
 		goto exit;
 	}
@@ -403,56 +419,58 @@ int morse_hw_enable_stop_notifications(struct morse *mors, bool enable)
 	return morse_hw_irq_enable(mors, MORSE_INT_HW_STOP_NOTIFICATION_NUM, enable);
 }
 
-int morse_chip_cfg_detect_and_init(struct morse *mors, struct morse_chip_series *mors_chip_series)
+int morse_chip_cfg_set_and_validate(struct morse *mors, struct morse_chip_series *mors_chip_series)
 {
 	int ret = 0;
 	u32 chip_id = 0;
 
+	/* cfg must be available on mors object prior to initiating any bus operations */
+	mors->cfg = mors_chip_series->cfg;
+
 	morse_claim_bus(mors);
-	ret = morse_reg32_read(mors, mors_chip_series->chip_id_address, &chip_id);
+	ret = morse_reg32_read(mors, MORSE_REG_CHIP_ID(mors), &chip_id);
 	morse_release_bus(mors);
 	if (ret < 0) {
 		MORSE_ERR(mors, "%s: Failed to access HW (errno:%d)", __func__, ret);
 		return ret;
 	}
 
-	ret = morse_chip_cfg_init(mors, chip_id);
+	if (!mors_chip_series->chip_id_matches(chip_id))
+		return -ENODEV;
+
+	mors->chip_id = chip_id;
 
 	return ret;
 }
 
 int morse_chip_cfg_init(struct morse *mors, u32 chip_id)
 {
-	int ret = 0;
+	int i;
 
-	mors->chip_id = chip_id;
-
-	switch (chip_id) {
-	case(MM8108B0_ID):
-	case(MM8108B1_ID):
-	case(MM8108B2_ID):
-	case(MM8108B0_FPGA_ID):
-	case(MM8108B1_FPGA_ID):
-	case(MM8108B2_FPGA_ID):
-		mors->cfg = &mm8108_cfg;
-		break;
-	case(MM6108A0_ID):
-	case(MM6108A1_ID):
-	case(MM6108A2_ID):
-		mors->cfg = &mm6108_cfg;
-		break;
-	default:
-		return -ENODEV;
+	for (i = 0; i < ARRAY_SIZE(chip_series); i++) {
+		if (chip_series[i]->chip_id_matches(chip_id)) {
+			mors->cfg = chip_series[i]->cfg;
+			mors->chip_id = chip_id;
+			return 0;
+		}
 	}
 
-	return ret;
+	return -ENODEV;
 }
 
 bool morse_hw_is_already_loaded(struct morse *mors)
 {
-	return (morse_firmware_get_host_table_ptr(mors) == 0) &&
-			(morse_firmware_magic_verify(mors) == 0) &&
-			(morse_firmware_check_compatibility(mors) == 0);
+	if ((morse_firmware_get_host_table_ptr(mors) != 0) ||
+	    (morse_firmware_magic_verify(mors) != 0) ||
+	    (morse_firmware_get_fw_flags(mors) != 0))
+		return false;
+
+	if (mors->firmware_flags & MORSE_FW_FLAGS_FAILSAFE_MODE) {
+		MORSE_INFO(mors, "Firmware is in failsafe mode; forcing reload\n");
+		return false;
+	}
+
+	return true;
 }
 
 static const u8 *hw_headless_state_to_str(enum headless_state state)
@@ -762,6 +780,11 @@ bool morse_hw_should_reattach(void)
 	return reattach_hw;
 }
 
+bool morse_hw_can_detach(const struct morse *mors)
+{
+	return reattach_hw && !morse_hw_is_stopped(mors) && !mors->recovery.ignore_detach;
+}
+
 static const u8 *hw_state_to_str(enum morse_hw_state state)
 {
 	switch (state) {
@@ -823,6 +846,7 @@ void morse_hw_set_state(struct morse *mors, enum morse_hw_state next)
 	}
 
 	MORSE_INFO(mors, "%s: %s -> %s", __func__, hw_state_to_str(state), hw_state_to_str(next));
+	trace_hw_state(hw_state_to_str(state), hw_state_to_str(next));
 	mors->hw_state = next;
 	MORSE_WARN_ON(FEATURE_ID_DEFAULT, !transition_okay);
 }

@@ -13,12 +13,12 @@
 #include "misc.h"
 #include "yaps_hw.h"
 
-#define BCF_DATABASE_SIZE               (1024)	/* From firmware */
-#define MORSE_FW_DIR                    "morse"
+#define BCF_DEFAULT_SIZE		(2048)
+#define MORSE_FW_DIR			"morse"
 #define MORSE_FW_FULLMAC_STRING		"-flm"
-#define MORSE_FW_THIN_LMAC_STRING       "-tlm"
-#define MORSE_FW_VIRTUAL_STA_STRING     "-vst"
-#define MORSE_FW_EXT                    ".bin"
+#define MORSE_FW_THIN_LMAC_STRING	"-tlm"
+#define MORSE_FW_VIRTUAL_STA_STRING	"-vst"
+#define MORSE_FW_EXT			".bin"
 
 #define IFLASH_BASE_ADDR	0x400000
 #define DFLASH_BASE_ADDR	0xC00000
@@ -35,6 +35,7 @@
 enum morse_fw_info_tlv_type {
 	MORSE_FW_INFO_TLV_BCF_ADDR = 1,
 	MORSE_FW_INFO_TLV_COREDUMP_MEM_REGION = 2,
+	MORSE_FW_INFO_TLV_BCF_SIZE = 3,
 };
 
 struct morse_fw_info_tlv_coredump_mem {
@@ -61,6 +62,8 @@ enum morse_fw_extended_host_table_tag {
 	MORSE_FW_HOST_TABLE_TAG_PAGER_PKT_MEMORY = 4,
 	MORSE_FW_HOST_TABLE_TAG_PAGER_BYPASS_CMD_RESP = 5,
 	MORSE_FW_HOST_TABLE_TAG_HEADLESS_CFG_ADDR = 6,
+	MORSE_FW_HOST_TABLE_TAG_MAX_AP_NUM_STA = 7,
+	MORSE_FW_HOST_TABLE_TAG_BOOT_CODE = 8
 };
 
 struct extended_host_table_tlv_hdr {
@@ -120,6 +123,16 @@ struct extended_host_table_headless_cfg_addr {
 	__le32 headless_cfg_addr;
 };
 
+struct extended_host_table_max_ap_num_sta {
+	struct extended_host_table_tlv_hdr header;
+	__le32 max_ap_num_sta;
+};
+
+struct extended_host_table_boot_code {
+	struct extended_host_table_tlv_hdr header;
+	u8 code;
+};
+
 struct extended_host_table_insert_skb_checksum {
 	struct extended_host_table_tlv_hdr header;
 	u8 insert_and_validate_checksum;
@@ -151,6 +164,27 @@ struct extended_host_table {
 	/** Data TLVs in the extended host table*/
 	u8 ext_host_table_data_tlvs[];
 } __packed;
+
+enum morse_secure_boot_status {
+	MORSE_SECURE_BOOT_SUCCESS,
+	MORSE_SECURE_BOOT_MANIFEST_ERROR,
+	MORSE_SECURE_BOOT_VERSION_ERROR,
+	MORSE_SECURE_BOOT_OTP_ERROR,
+	MORSE_SECURE_BOOT_DIGEST_MISMATCH,
+	MORSE_SECURE_BOOT_SIGN_VERIFY_ERROR,
+	MORSE_SECURE_BOOT_CERT_VERIFY_ERROR,
+	MORSE_SECURE_BOOT_CERT_ERROR,
+	MORSE_SECURE_BOOT_PARSE_ERROR,
+	MORSE_SECURE_BOOT_PUBLIC_KEY_ERROR,
+	MORSE_SECURE_BOOT_SIGNATURE_ERROR,
+	MORSE_SECURE_BOOT_SHA_ERROR,
+	MORSE_SECURE_BOOT_KEY_REVOKE_ERROR,
+	MORSE_SECURE_BOOT_KEY_UPDATE_ERROR,
+	MORSE_SECURE_BOOT_PROVISION_ERROR,
+	MORSE_SECURE_BOOT_STATE_ERROR,
+	MORSE_SECURE_BOOT_MANIFEST_TLV_ERROR,
+	MORSE_SECURE_BOOT_PROGRAM_TYPE_ERROR,
+};
 
 /**
  * morse_firmware_prepare() - Reset the chip and download firmware.
@@ -211,5 +245,23 @@ int morse_firmware_magic_verify(struct morse *mors);
  * Return: 0 if compatible, error otherwise.
  */
 int morse_firmware_check_compatibility(struct morse *mors);
+
+/**
+ * morse_firmware_get_fw_flags - Get state flags from running firmware
+ *
+ * @mors pointer to the chip object
+ *
+ * Return: Firmware flags
+ */
+enum host_table_firmware_flags morse_firmware_get_fw_flags(struct morse *mors);
+
+/**
+ * morse_firmware_boot_code_to_str - Get a description for the boot code.
+ *
+ * @boot_code Boot code
+ *
+ * Return: Boot code description
+ */
+const char *morse_firmware_boot_code_to_str(enum morse_cmd_boot_code boot_code);
 
 #endif /* !_MORSE_FW_H_ */

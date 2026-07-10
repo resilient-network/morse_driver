@@ -94,6 +94,20 @@ static int mesh_stats_read(struct seq_file *file, void *data)
 	return 0;
 }
 
+static u8 bw_index_to_mhz(u8 bw_idx)
+{
+	if (bw_idx == MMRC_BW_8MHZ)
+		return 8;
+	if (bw_idx == MMRC_BW_4MHZ)
+		return 4;
+	if (bw_idx == MMRC_BW_2MHZ)
+		return 2;
+	if (bw_idx == MMRC_BW_16MHZ)
+		return 16;
+
+	return 1;
+}
+
 static int stats_read(struct seq_file *file, void *data)
 {
 	struct morse *mors = dev_get_drvdata(file->private);
@@ -101,7 +115,7 @@ static int stats_read(struct seq_file *file, void *data)
 	struct mmrc_table *tb;
 	const struct mmrc_stats_table *rate_stats;
 	struct mmrc_rate ratei;
-	u16 i, col_idx, bw;
+	u16 i, col_idx;
 	u32 total_sent_packets = 0;
 	u16 caps_size;
 	u32 avg_throughput;
@@ -143,10 +157,7 @@ static int stats_read(struct seq_file *file, void *data)
 
 			rate_stats = &tb->table[ratei.index];
 
-			bw = ratei.bw == MMRC_BW_2MHZ ? 2 :
-			    ratei.bw == MMRC_BW_4MHZ ? 4 :
-			    ratei.bw == MMRC_BW_8MHZ ? 8 : ratei.bw == MMRC_BW_16MHZ ? 16 : 1;
-			seq_printf(file, "%2uMHz ", bw);
+			seq_printf(file, "%2uMHz ", bw_index_to_mhz(ratei.bw));
 			col_idx++;
 			seq_printf(file, "%*s ", (int)strlen(cols[col_idx++]),
 					ratei.guard == MMRC_GUARD_SHORT ? "SGI" : "LGI");
@@ -210,6 +221,121 @@ static int stats_read(struct seq_file *file, void *data)
 	return 0;
 }
 
+static int stats_abridged_read(struct seq_file *file, void *data)
+{
+	struct morse *mors = dev_get_drvdata(file->private);
+	struct list_head *pos;
+	struct mmrc_table *tb;
+	const struct mmrc_stats_table *rate_stats;
+	struct mmrc_rate ratei;
+	u16 i;
+	u16 col_idx;
+	u32 total_sent_packets = 0;
+	s8 rate_idxs[5];
+
+	const char *const header[] = {
+		"--------------Rate-------------", " ---Probability--",
+		" ---------Last--------", "   ------Total------",
+		" ----MPDU-----"
+	};
+	const char *const cols[] = {
+		"SS", "MCS", "BW", "Guard", "Selection", "Index",
+		"Evidence", "Average", "Retry", "Success", "Attempt",
+		"  Success", "  Attempt", "Success", " Fail"
+	};
+
+	spin_lock_bh(&mors->mrc.lock);
+	list_for_each(pos, &mors->mrc.stas) {
+		struct morse_rc_sta *mrc_sta = container_of(pos, struct morse_rc_sta, list);
+		struct morse_sta *sta = container_of(mrc_sta, struct morse_sta, rc);
+
+		tb = mrc_sta->tb;
+
+		seq_puts(file, "\nMorse Micro S1G Rate Control Algorithm Statistics\n");
+		seq_printf(file, "Peer: %pM\n", sta->addr);
+		seq_printf(file, "Cycle: %u\n", tb->cycle_cnt);
+
+		for (i = 0; i < ARRAY_SIZE(header); i++)
+			seq_printf(file, "%s", header[i]);
+		seq_puts(file, "\n");
+		for (i = 0; i < ARRAY_SIZE(cols); i++)
+			seq_printf(file, "%s ", cols[i]);
+		seq_puts(file, "\n");
+
+		rate_idxs[0] = tb->best_tp.index;
+		rate_idxs[1] = tb->second_tp.index;
+		rate_idxs[2] = tb->best_prob.index;
+		rate_idxs[3] = tb->baseline.index;
+		if (tb->num_lookaround_candidates != 0 &&
+		    tb->current_lookaround_rate_index != tb->best_tp.index &&
+		    tb->current_lookaround_rate_index != tb->second_tp.index &&
+		    tb->current_lookaround_rate_index != tb->best_prob.index &&
+		    tb->current_lookaround_rate_index != tb->baseline.index)
+			rate_idxs[4] = tb->current_lookaround_rate_index;
+		else
+			rate_idxs[4] = -1;
+
+		for (i = 0; i < ARRAY_SIZE(rate_idxs); i++) {
+			if (rate_idxs[i] == -1)
+				break;
+
+			col_idx = 0;
+			ratei = get_rate_row(tb, rate_idxs[i]);
+			if (!validate_rate(tb, &ratei) || rate_idxs[i] != ratei.index)
+				continue;
+
+			rate_stats = &tb->table[ratei.index];
+
+			seq_printf(file, "%*u ", (int)strlen(cols[col_idx++]), ratei.ss + 1);
+			seq_printf(file, "%*u ", (int)strlen(cols[col_idx++]), ratei.rate);
+			seq_printf(file, "%*u ", (int)strlen(cols[col_idx++]),
+				   bw_index_to_mhz(ratei.bw));
+			seq_printf(file, "%*s ", (int)strlen(cols[col_idx++]),
+					ratei.guard == MMRC_GUARD_SHORT ? "SGI" : "LGI");
+
+			/* Display rate selection of last update */
+			seq_printf(file, "    %c%c%c%c%c ",
+				ratei.index == tb->current_lookaround_rate_index ? 'L' : ' ',
+				ratei.index == tb->best_tp.index ? 'A' : ' ',
+				ratei.index == tb->second_tp.index ? 'B' : ' ',
+				ratei.index == tb->best_prob.index ? 'C' : ' ',
+				ratei.index == tb->baseline.index ? 'D' : ' '
+			);
+
+			col_idx++;
+
+			seq_printf(file, "%*u ", (int)strlen(cols[col_idx++]), ratei.index);
+
+			seq_printf(file, "%*d ", (int)strlen(cols[col_idx++]),
+					rate_stats->evidence);
+			seq_printf(file, "%*u ", (int)strlen(cols[col_idx++]), rate_stats->prob);
+
+			seq_printf(file, "%*u ", (int)strlen(cols[col_idx++]),
+					rate_stats->sent - rate_stats->sent_success);
+			seq_printf(file, "%*u ", (int)strlen(cols[col_idx++]),
+					rate_stats->sent_success);
+			seq_printf(file, "%*u ", (int)strlen(cols[col_idx++]), rate_stats->sent);
+
+			seq_printf(file, "%*u ", (int)strlen(cols[col_idx++]),
+					rate_stats->total_success);
+			seq_printf(file, "%*u ", (int)strlen(cols[col_idx++]),
+					rate_stats->total_sent);
+			seq_printf(file, "%*u ", (int)strlen(cols[col_idx++]),
+					rate_stats->back_mpdu_success);
+			seq_printf(file, "%*u\n", (int)strlen(cols[col_idx++]),
+					rate_stats->back_mpdu_failure);
+			total_sent_packets += rate_stats->total_sent;
+		}
+		seq_printf(file,
+			   "\nNumber of packets sent: %u including %u look-around packets\n\n",
+			   total_sent_packets, tb->total_lookaround);
+	}
+
+	spin_unlock_bh(&mors->mrc.lock);
+
+	return 0;
+}
+
 static int stats_csv_read(struct seq_file *file, void *data)
 {
 	struct morse *mors = dev_get_drvdata(file->private);
@@ -217,7 +343,7 @@ static int stats_csv_read(struct seq_file *file, void *data)
 	struct mmrc_table *tb;
 	const struct mmrc_stats_table *rate_stats;
 	struct mmrc_rate ratei;
-	u16 i, bw;
+	u16 i;
 	u16 caps_size;
 	u32 avg_throughput;
 
@@ -241,10 +367,7 @@ static int stats_csv_read(struct seq_file *file, void *data)
 
 			rate_stats = &tb->table[ratei.index];
 
-			bw = ratei.bw == MMRC_BW_2MHZ ? 2 :
-			    ratei.bw == MMRC_BW_4MHZ ? 4 :
-			    ratei.bw == MMRC_BW_8MHZ ? 8 : ratei.bw == MMRC_BW_16MHZ ? 16 : 1;
-			seq_printf(file, "%uMHz", bw);
+			seq_printf(file, "%uMHz", bw_index_to_mhz(ratei.bw));
 			seq_printf(file, ",%cGI", ratei.guard == MMRC_GUARD_SHORT ? 'S' : 'L');
 			seq_printf(file, ",%d,", rate_stats->evidence);
 
@@ -330,6 +453,8 @@ void mmrc_s1g_add_mesh_debugfs(struct morse *mors)
 void mmrc_s1g_add_sta_debugfs(struct morse *mors)
 {
 	debugfs_create_devm_seqfile(mors->dev, "mmrc_table", mors->debug.debugfs_phy, stats_read);
+	debugfs_create_devm_seqfile(mors->dev, "mmrc_abridged_table", mors->debug.debugfs_phy,
+				    stats_abridged_read);
 	debugfs_create_devm_seqfile(mors->dev, "mmrc_table_csv", mors->debug.debugfs_phy,
 				    stats_csv_read);
 

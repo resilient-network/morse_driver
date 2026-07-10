@@ -13,6 +13,7 @@
 #include "debug.h"
 #include "dot11ah/dot11ah.h"
 #include "skb_header.h"
+#include "skbq.h"
 #include "vendor.h"
 #include "vendor_ie.h"
 #include "utils.h"
@@ -88,6 +89,18 @@ bool morse_mac_is_s1g_long_beacon(struct morse *mors, struct sk_buff *skb)
 	return ret;
 }
 
+static bool skip_beacon_tx_if_offload_active(struct morse_vif *mors_vif)
+{
+	bool skip;
+
+	spin_lock(&mors_vif->beacon_offload.lock);
+	if (mors_vif->beacon_offload.state > MORSE_BEACON_OFFLOAD_STATE_DISABLED)
+		mors_vif->beacon_offload.skipped_tasklet_events++;
+	skip = mors_vif->beacon_offload.skipped_tasklet_events;
+	spin_unlock(&mors_vif->beacon_offload.lock);
+	return skip;
+}
+
 void morse_insert_beacon_timing_element(struct morse_vif *mors_vif,
 					struct dot11ah_ies_mask *ies_mask)
 {
@@ -135,6 +148,7 @@ static void morse_beacon_fill_tx_info(struct morse *mors, struct morse_skb_tx_in
 	(void)mors;
 	(void)skb;
 
+	morse_skbq_set_mac80211_owned(skb, true);
 	tx_info->flags |= cpu_to_le32(MORSE_TX_CONF_FLAGS_VIF_ID_SET(mors_vif->id));
 
 	if (bw_idx == DOT11_BANDWIDTH_1MHZ)
@@ -451,6 +465,12 @@ static void morse_beacon_tasklet(unsigned long data)
 	if (!morse_mac_is_iface_ap_type(vif))
 		return;
 
+	if (skip_beacon_tx_if_offload_active(mors_vif)) {
+		MORSE_BEACON_DBG(mors, "%s: tasklet skipped due to beacon offload\n",
+					__func__);
+		return;
+	}
+
 	/* Set the long beacon index to 0 if long beacon is the DTIM beacon
 	 * otherwise shift the long beacon to be the beacon immediately after the DTIM beacon
 	 */
@@ -497,8 +517,6 @@ static void morse_beacon_tasklet(unsigned long data)
 
 	/* Wake up pageset handler */
 	trace_beacon_tasklet_exit(mors->chip_if->event_flags);
-	mors->beacon_queued = true;
-	wake_up(&mors->beacon_tasklet_waitq);
 
 	/* TODO: currently due to the way we implement firmware beaconing,
 	 * these might still get sent before the DTIM beacon.
@@ -552,6 +570,15 @@ static int morse_beacon_irq_enable(struct morse_vif *mors_vif, bool enable)
 	return morse_hw_irq_enable(mors, beacon_irq_num, enable);
 }
 
+static void morse_beacon_offload_init(struct morse_vif *mors_vif)
+{
+	spin_lock_init(&mors_vif->beacon_offload.lock);
+	spin_lock_bh(&mors_vif->beacon_offload.lock);
+	mors_vif->beacon_offload.state = MORSE_BEACON_OFFLOAD_STATE_DISABLED;
+	mors_vif->beacon_offload.skipped_tasklet_events = 0;
+	spin_unlock_bh(&mors_vif->beacon_offload.lock);
+}
+
 int morse_beacon_init(struct morse_vif *mors_vif)
 {
 	struct morse *mors = morse_vif_to_morse(mors_vif);
@@ -567,7 +594,7 @@ int morse_beacon_init(struct morse_vif *mors_vif)
 		enable_short_bcn_as_dtim = mors->cfg->enable_short_bcn_as_dtim;
 	}
 
-	mors_vif->beacon_offload_enabled = false;
+	morse_beacon_offload_init(mors_vif);
 	tasklet_init(&mors_vif->beacon_tasklet, morse_beacon_tasklet, (unsigned long)mors_vif);
 
 	ret = morse_beacon_irq_enable(mors_vif, true);

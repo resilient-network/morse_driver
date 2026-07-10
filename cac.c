@@ -48,7 +48,21 @@ void morse_cac_count_auth(const struct ieee80211_vif *vif, const struct ieee8021
 	if (auth_transaction != 1)
 		return;
 
+	/* Don't include retries in calculations */
+	if (ieee80211_has_retry(hdr->frame_control)) {
+		cac->arrfs++;
+		return;
+	}
+
 	cac->arfs++;
+}
+
+void morse_cac_count_probe_reqs(const struct ieee80211_vif *vif)
+{
+	struct morse_vif *mors_vif = (struct morse_vif *)vif->drv_priv;
+	struct morse_cac *cac = &mors_vif->cac;
+
+	cac->prfs++;
 }
 
 static void cac_threshold_change(struct morse_cac *cac, int diff)
@@ -116,13 +130,12 @@ static int cac_set_threshold_change(struct morse_cac *cac, bool end_of_period)
 	for (i = 0; i < cac->conf->rules.rule_tot; i++) {
 		struct cac_threshold_change_rule *rule = &cac->conf->rules.rule[i];
 
-		MORSE_CAC_DBG(mors, "CAC:   %i: arfs=%u change=%d\n",
-			i, rule->arfs, rule->threshold_change);
-
 		if (rule->threshold_change < 0) {
 			/* Process rule to decrease threshold */
 			if (cac->arfs > rule->arfs) {
 				/* Decrease threshold */
+				MORSE_CAC_DBG(mors, "CAC: Apply rule %i arfs>%u change=%d\n",
+					i, rule->arfs, rule->threshold_change);
 				return rule->threshold_change;
 			}
 		} else {
@@ -135,6 +148,8 @@ static int cac_set_threshold_change(struct morse_cac *cac, bool end_of_period)
 				return 0;
 			if (cac->arfs < rule->arfs) {
 				/* Increase threshold */
+				MORSE_CAC_DBG(mors, "CAC: Apply rule %i arfs<%u change=%d\n",
+					i, rule->arfs, rule->threshold_change);
 				return rule->threshold_change;
 			}
 		}
@@ -160,8 +175,10 @@ static void cac_timer_work(struct morse_cac *cac)
 
 	/* Check if the threshold needs to be tighted or relaxed and set. */
 	if (cac->arfs != 0 || cac->threshold_value != CAC_THRESHOLD_MAX) {
-		MORSE_CAC_DBG(mors, "CAC: Check ARFS=%u threshold=%u end=%u\n",
-			      cac->arfs, cac->threshold_value, end_of_period);
+		MORSE_CAC_DBG(mors,
+			      "CAC: Check ARFS=%u (ARRFS=%u) threshold=%u end=%u probes=%u\n",
+			      cac->arfs, cac->arrfs, cac->threshold_value, end_of_period,
+			      cac->prfs);
 		threshold_change = cac_set_threshold_change(cac, end_of_period);
 		if (threshold_change != 0) {
 			cac_threshold_change(cac, threshold_change);
@@ -174,18 +191,20 @@ static void cac_timer_work(struct morse_cac *cac)
 	if (end_of_period) {
 		cac->cac_period_used = 0;
 		cac->arfs = 0;
+		cac->arrfs = 0;
+		cac->prfs = 0;
 	}
 
 	mod_timer(&cac->timer, jiffies + msecs_to_jiffies(MORSE_CAC_CHECK_INTERVAL_MS));
 }
 
-#if KERNEL_VERSION(4, 14, 0) > LINUX_VERSION_CODE
+#if KERNEL_VERSION(4, 15, 0) > LINUX_VERSION_CODE
 static void cac_timer(unsigned long addr)
 #else
 static void cac_timer(struct timer_list *t)
 #endif
 {
-#if KERNEL_VERSION(4, 14, 0) > LINUX_VERSION_CODE
+#if KERNEL_VERSION(4, 15, 0) > LINUX_VERSION_CODE
 	struct morse_cac *cac = (struct morse_cac *)addr;
 #else
 	struct morse_cac *cac = TIMER_TO_OBJ(cac, t, timer);
@@ -331,7 +350,7 @@ int morse_cac_init(struct morse *mors, struct morse_vif *mors_vif, bool in_recon
 
 	cac->mors = mors;
 
-#if KERNEL_VERSION(4, 14, 0) > LINUX_VERSION_CODE
+#if KERNEL_VERSION(4, 15, 0) > LINUX_VERSION_CODE
 	init_timer(&cac->timer);
 	cac->timer.data = (unsigned long)cac;
 	cac->timer.function = cac_timer;

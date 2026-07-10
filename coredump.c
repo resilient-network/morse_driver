@@ -230,13 +230,14 @@ static void elf_copy_notes(struct morse *mors,
 	}
 }
 
-static void get_stop_info(struct morse *mors)
+static char *get_stop_info(struct morse *mors)
 {
 	const struct morse_coredump_mem_region *region;
 	const struct morse_coredump_data *crash = &mors->coredump.crash;
 
 	lockdep_assert_held(&mors->coredump.lock);
 	list_for_each_entry(region, &crash->memory.regions, list) {
+		char *out = NULL;
 		struct stop_info {
 			__le32 hart;
 			__le32 line;
@@ -265,26 +266,19 @@ static void get_stop_info(struct morse *mors)
 		if (read_memory_region(mors, region, info) == 0) {
 			uint hart = le32_to_cpu(info->hart);
 			uint line = le32_to_cpu(info->line);
-			uint info_len = region->len - sizeof(*info);
-			uint info_strlen;
+			uint info_strlen = strnlen(info->info, region->len - sizeof(*info));
 
-			info->info[info_len + 1] = '\0';
-			info_strlen = strlen(info->info);
-
-			if (info_strlen > 0 || line > 0) {
-				mors->coredump.crash.information =
-					kasprintf(GFP_KERNEL, "%*pEhp:%d (hart:%d)", info_strlen,
-						  info->info, line, hart);
-			}
+			if (info_strlen > 0 || line > 0)
+				out = kasprintf(GFP_KERNEL, "%*pEhp:%d (hart:%d)", info_strlen,
+						info->info, line, hart);
 		}
 
 		kfree(info);
-		if (mors->coredump.crash.information) {
-			MORSE_COREDUMP_ERR(mors, "stop at %s\n",
-					   mors->coredump.crash.information);
-			break;
-		}
+		if (out)
+			return out;
 	}
+
+	return NULL;
 }
 
 static void elf_copy_memory_regions(struct morse *mors,
@@ -391,7 +385,15 @@ static int coredump_build(struct morse *mors, void **cd, size_t *cd_size)
 	/* Claim/release bus for the entire bus access operation */
 	morse_claim_bus(mors);
 
-	get_stop_info(mors);
+	if (WARN_ON(mors->coredump.crash.information)) {
+		kfree(mors->coredump.crash.information);
+		mors->coredump.crash.information = NULL;
+	}
+
+	mors->coredump.crash.information = get_stop_info(mors);
+	if (mors->coredump.crash.information)
+		MORSE_COREDUMP_ERR(mors, "stop at %s\n", mors->coredump.crash.information);
+
 	INIT_LIST_HEAD(&notes);
 	add_coredump_meta(mors, &notes);
 
@@ -490,6 +492,30 @@ static int userspace_coredump(struct morse *mors)
 	return ret;
 }
 
+static void coredump_clear_stop_info(struct morse *mors)
+{
+	mutex_lock(&mors->coredump.lock);
+
+	kfree(mors->coredump.crash.information);
+	mors->coredump.crash.information = NULL;
+
+	mutex_unlock(&mors->coredump.lock);
+}
+
+void morse_coredump_get_stop_info(struct morse *mors, char **info)
+{
+	if (WARN_ON(*info))
+		return;
+
+	mutex_lock(&mors->coredump.lock);
+
+	morse_claim_bus(mors);
+	*info = get_stop_info(mors);
+	morse_release_bus(mors);
+
+	mutex_unlock(&mors->coredump.lock);
+}
+
 int morse_coredump(struct morse *mors)
 {
 	int ret = 0;
@@ -554,6 +580,8 @@ int morse_coredump(struct morse *mors)
 			"%s: unknown coredump method: %d\n", __func__, method);
 		break;
 	}
+
+	coredump_clear_stop_info(mors);
 
 	if (mors->cfg->post_coredump_hook)
 		ret = mors->cfg->post_coredump_hook(mors, method);
@@ -644,16 +672,6 @@ void morse_coredump_set_fw_version_str(struct morse *mors, const char *str)
 
 	if (str)
 		mors->coredump.fw_ver_str = kstrdup_const(str, GFP_KERNEL);
-
-	mutex_unlock(&mors->coredump.lock);
-}
-
-static void coredump_clear_stop_info(struct morse *mors)
-{
-	mutex_lock(&mors->coredump.lock);
-
-	kfree(mors->coredump.crash.information);
-	mors->coredump.crash.information = NULL;
 
 	mutex_unlock(&mors->coredump.lock);
 }

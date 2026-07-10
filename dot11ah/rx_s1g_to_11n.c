@@ -1000,8 +1000,11 @@ static void morse_dot11ah_s1g_to_beacon(struct ieee80211_vif *vif, struct sk_buf
 
 	/* Store SSID or restore it */
 	if (ies_mask->ies[network_id_eid].ptr) {
-		morse_dot11ah_store_cssid(ies_mask, le16_to_cpu(updated_vals.capab_info),
-				s1g_ies, s1g_ies_len, s1g_beacon->u.s1g_beacon.sa, &updated_vals);
+		morse_dot11ah_store_cssid(ies_mask,
+					  le16_to_cpu(updated_vals.capab_info),
+					  s1g_ies, s1g_ies_len, s1g_beacon->u.s1g_beacon.sa,
+					  &updated_vals,
+					  s1g_beacon->frame_control);
 
 		/* Fill in fc_bss_bw_subfield here, otherwise it will be
 		 * always set to 255 when DTIM period is 1 (no short beacons)
@@ -1255,7 +1258,8 @@ static void morse_dot11ah_s1g_to_probe_resp(struct ieee80211_vif *vif, struct sk
 	/* Create/Update the S1G IES for this cssid/bssid entry */
 	morse_dot11ah_store_cssid(ies_mask,
 				  le16_to_cpu(s1g_probe_resp->u.probe_resp.capab_info),
-				  s1g_ies, s1g_ies_len, s1g_probe_resp->bssid, NULL);
+				  s1g_ies, s1g_ies_len, s1g_probe_resp->bssid, NULL,
+				  s1g_probe_resp->frame_control);
 
 	probe_resp = kmalloc(length_11n, GFP_KERNEL);
 	if (!probe_resp)

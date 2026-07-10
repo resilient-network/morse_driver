@@ -105,7 +105,7 @@ bool morse_ps_is_interface_same(struct morse *mors, struct morse_vif *mors_vif);
  */
 void morse_ps_update_interface_state(struct morse *mors, struct morse_vif *mors_vif, bool enabled);
 
-int morse_ps_init(struct morse *mors, bool enable, bool enable_dynamic_ps);
+int morse_ps_init(struct morse *mors);
 
 void morse_ps_finish(struct morse *mors);
 
@@ -122,5 +122,33 @@ int morse_ps_system_suspend(struct morse *mors);
  * @mors: Morse chip instance
  */
 void morse_ps_system_resume(struct morse *mors);
+
+/**
+ * morse_ps_is_dynamic_offload_enabled() - Check if dynamic_ps_offload is enabled or not.
+ *
+ * Return: true if enabled, false if not.
+ */
+bool morse_ps_is_dynamic_offload_enabled(void);
+
+/**
+ * morse_ps_is_disabled() - Check if ps is disabled.
+ *
+ * Return: true if ps is disabled, false if not.
+ */
+bool morse_ps_is_disabled(void);
+
+/**
+ * morse_ps_is_fully_enabled() - Check if ps is fully enabled.
+ *
+ * Return: true if ps if fully enabled, false if not.
+ */
+bool morse_ps_is_fully_enabled(void);
+
+/**
+ * morse_ps_is_supported() - Check if the device have capability to support ps.
+ *
+ * Return: true if the device meet all conditions to support PS, false if not.
+ */
+bool morse_ps_is_supported(struct morse *mors);
 
 #endif /* !_MORSE_PS_H_ */

@@ -197,6 +197,18 @@ void morse_wiphy_connected(struct morse *mors, const u8 *bssid, const u8 *assoc_
 void morse_wiphy_disconnected(struct morse *mors);
 
 /**
+ * morse_wiphy_disconnected_work_nolock() - Notify the kernel that the connection has been lost
+ *
+ * The caller of this function must hold mors->lock.
+ *
+ * @mors: Morse device instance.
+ * @mors_vif: Morse interface.
+ * @autoconnect: True if the chip is expected to autoconnect, false if else.
+ */
+void morse_wiphy_disconnected_work_nolock(struct morse *mors,
+					  struct morse_vif *mors_vif, bool autoconnect);
+
+/**
  * morse_wiphy_traffic_control() -  Pause or resume traffic
  * @mors: morse device instance
  * @pause_data_traffic: true to pause, false to resume
@@ -224,6 +236,31 @@ void morse_wiphy_stop_tx_queues(struct morse *mors);
  * morse_wiphy_wake_tx_queues() - Inform the network stack it may resume enqueuing packets for tx.
  */
 void morse_wiphy_wake_tx_queues(struct morse *mors);
+
+/**
+ * morse_wiphy_is_idle() - FullMAC VIF is currently in IDLE state.
+ */
+bool morse_wiphy_is_idle(const struct morse_vif *mors_vif);
+
+/**
+ * morse_wiphy_is_connecting() - FullMAC VIF is connecting to AP.
+ */
+bool morse_wiphy_is_connecting(const struct morse_vif *mors_vif);
+
+/**
+ * morse_wiphy_is_connected() - FullMAC VIF is connected to AP.
+ */
+bool morse_wiphy_is_connected(const struct morse_vif *mors_vif);
+
+/**
+ * morse_wiphy_is_disconnecting() - FullMAC VIF is disconnecting from AP.
+ */
+bool morse_wiphy_is_disconnecting(const struct morse_vif *mors_vif);
+
+/**
+ * morse_wiphy_is_roaming() - FullMAC VIF is currently roaming.
+ */
+bool morse_wiphy_is_roaming(const struct morse_vif *mors_vif);
 
 #else
 
@@ -320,6 +357,12 @@ static inline void morse_wiphy_disconnected(struct morse *mors)
 {
 }
 
+static inline void
+morse_wiphy_disconnected_work_nolock(struct morse *mors,
+				     struct morse_vif *mors_vif, bool autoconnect)
+{
+}
+
 static inline int
 morse_wiphy_traffic_control(struct morse *mors, bool pause_data_traffic, int sources)
 {
@@ -338,6 +381,36 @@ static inline void morse_wiphy_stop_tx_queues(struct morse *mors)
 
 static inline void morse_wiphy_wake_tx_queues(struct morse *mors)
 {
+}
+
+static inline bool
+morse_wiphy_is_idle(const struct morse_vif *mors_vif)
+{
+	return false;
+}
+
+static inline bool
+morse_wiphy_is_connecting(const struct morse_vif *mors_vif)
+{
+	return false;
+}
+
+static inline bool
+morse_wiphy_is_connected(const struct morse_vif *mors_vif)
+{
+	return false;
+}
+
+static inline bool
+morse_wiphy_is_disconnecting(const struct morse_vif *mors_vif)
+{
+	return false;
+}
+
+static inline bool
+morse_wiphy_is_roaming(const struct morse_vif *mors_vif)
+{
+	return false;
 }
 
 #endif

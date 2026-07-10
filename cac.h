@@ -33,10 +33,11 @@ enum cac_command {
 
 /** CAC threshold change rule */
 struct cac_threshold_change_rule {
-	/* Threshold in Authentication Request Frames per Second */
+	/* @arfs: Threshold in Authentication Request Frames per Second */
 	u16 arfs;
-	/** Change in threshold to apply if condition is matched, between -CAC_THRESHOLD_MAX and
-	 * CAC_THRESHOLD_MAX.
+
+	/** @threshold_change: Change in threshold to apply if condition is matched, between
+	 *		       %-CAC_THRESHOLD_MAX and %CAC_THRESHOLD_MAX.
 	 */
 	s16 threshold_change;
 };
@@ -45,17 +46,21 @@ struct cac_threshold_change_rule {
  * CAC threshold change rules (AP only).
  */
 struct cac_threshold_change_rules {
+	/** @rule_tot: Total number of rules. */
 	u8 rule_tot;
+
+	/** @rule: Individual rules. */
 	struct cac_threshold_change_rule rule[CAC_CFG_CHANGE_RULE_MAX];
 };
 
 struct morse_cac_config {
 	/**
-	 * CAC enabled
+	 * @enabled: True if CAC is enabled.
 	 */
 	bool enabled;
+
 	/**
-	 * Threshold change rules
+	 * @rules: Threshold change rules.
 	 */
 	struct cac_threshold_change_rules rules;
 };
@@ -65,37 +70,50 @@ struct morse_cac_config {
  */
 struct morse_cac {
 	struct morse *mors;
-	/* Serialise CAC timer functions */
+	 /* Serialise CAC timer functions */
 	spinlock_t lock;
 	struct timer_list timer;
 	int cac_period_used;
 
-	/* CAC configuration and rules */
+	/** @conf: CAC configuration and rules */
 	struct morse_cac_config *conf;
 
 	/**
-	 * Threshold value for restricting authentications and associations, between 0 and
-	 * CAC_THRESHOLD_MAX.
-	 * A value of CAC_INDEX_MAX means there are no restrictions.
-	 * A value of 0 means that only STAs already associating or not supporting CAC can
-	 * associate.
+	 * @threshold_value: Threshold value for restricting authentications and associations,
+	 *		     between 0 and CAC_THRESHOLD_MAX.
+	 * * CAC_INDEX_MAX means there are no restrictions.
+	 * * 0 means that only STAs already associating or not supporting CAC can associate.
 	 */
 	u16 threshold_value;
 
-	/**
-	 * Authentication request frames received.
-	 */
+	/** @arfs: Authentication request frames received per second. */
 	u16 arfs;
+
+	/** @arrfs: Authentication request retry frames received per second. */
+	u16 arrfs;
+
+	/** @prfs: Probe request frames received per second. */
+	u16 prfs;
 };
 
-/** Convert a threshold percentage into a raw value */
+/**
+ * cac_threshold_pc2val(): Convert a threshold percentage into a raw value.
+ * @val: Percentage value.
+ *
+ * Return: Raw value.
+ */
 static inline s16 cac_threshold_pc2val(s16 val)
 {
 	return val * CAC_THRESHOLD_MAX / 100;
 }
 
-/** Convert a raw value into a threshold percentage
- *  The value is rounded up for consistency with values rounded down by cac_threshold_pc2val.
+/**
+ * cac_threshold_val2pc(): Convert a raw value into a threshold percentage.
+ * @val: Raw value.
+ *
+ * Return: Threshold as a percentage.
+ *
+ * The value is rounded up for consistency with values rounded down by cac_threshold_pc2val().
  */
 static inline s16 cac_threshold_val2pc(s16 val)
 {
@@ -106,71 +124,74 @@ static inline s16 cac_threshold_val2pc(s16 val)
 }
 
 /**
- * @brief Keep a count of received initial authentication request packets (AP only).
+ * morse_cac_count_auth() - Keep a count of received initial authentication request
+ *			    packets (AP only).
+ * @mors_vif:	Virtual interface.
+ * @hdr:	802.11 header.
  */
 void morse_cac_count_auth(const struct ieee80211_vif *vif, const struct ieee80211_mgmt *hdr);
 
 /**
- * morse_cac_insert_ie() - Insert a CAC IE into an sk_buff
- *
- * @ies_mask: Contains array of information elements.
- * @vif: The VIF the IE was received on.
- * @fc: The packet frame_control field.
+ * morse_cac_count_probe_reqs() - Keep a count of received probe request packets (AP only).
+ * @vif:	mac80211 VIF.
+ */
+void morse_cac_count_probe_reqs(const struct ieee80211_vif *vif);
+
+/**
+ * morse_cac_insert_ie() - Insert a CAC IE into an sk_buff.
+ * @ies_mask:	Contains array of information elements.
+ * @vif:	mac80211 VIF
+ * @fc:		The packet frame_control field.
  */
 void morse_cac_insert_ie(struct dot11ah_ies_mask *ies_mask, struct ieee80211_vif *vif, __le16 fc);
 
 /**
- * morse_cac_is_enabled() - Indicate whether CAC is enabled on an interface
+ * morse_cac_is_enabled() - Indicate whether CAC is enabled on an interface.
+ * @mors_vif:	Virtual interface.
  *
- * @mors_vif	Virtual interface
- *
- * Return: True if CAC is enabled on the interface
+ * Return: True if CAC is enabled on the interface.
  */
 bool morse_cac_is_enabled(struct morse_vif *mors_vif);
 
 /**
- * morse_cac_get_rules() - Get threshold change rules
- *
- * @mors_vif	Virtual interface
- * @rules	Structure to receive threshold change rules
- * @rule_tot	Field to receive number of rules
+ * morse_cac_get_rules() - Get threshold change rules.
+ * @mors_vif:	Virtual interface.
+ * @rules	Structure to receive threshold change rules.
+ * @rule_tot	Field to receive number of rules.
  */
 void morse_cac_get_rules(struct morse_vif *mors_vif, struct cac_threshold_change_rules *rules,
 			 u8 *rule_tot);
 
 /**
- * morse_cac_set_rules() - Configure threshold change rules
- *
- * @mors_vif	Virtual interface
- * @rules	Threshold change rules
+ * morse_cac_set_rules() - Configure threshold change rules.
+ * @mors_vif:	Virtual interface.
+ * @rules	Threshold change rules.
  */
 void morse_cac_set_rules(struct morse_vif *mors_vif, struct cac_threshold_change_rules *rules);
 
 /**
- * morse_cac_deinit() - De-initialise CAC on an interface
+ * morse_cac_deinit() - De-initialise CAC on an interface.
+ * @mors_vif:	Virtual interface.
  *
- * @mors_vif	Virtual interface
- *
- * Return: 0 if the command succeeded, else an error code
+ * Return: 0 if the command succeeded, else an error code.
  */
 int morse_cac_deinit(struct morse_vif *mors_vif);
 
 /**
- * morse_cac_init() - Initialise CAC on an interface
+ * morse_cac_init() - Initialise CAC on an interface.
+ * @mors:	Global Morse structure.
+ * @mors_vif:	Virtual interface.
+ * @in_reconfig:
+ *		The HW state is restarting and reconfig is in progress.
  *
- * @mors The global Morse structure
- * @mors_vif Morse VIF
- * @in_reconfig The HW state is restarting and reconfig is in progress
- *
- * Return: 0 if the command succeeded, else an error code
+ * Return: 0 if the command succeeded, else an error code.
  */
 int morse_cac_init(struct morse *mors, struct morse_vif *mors_vif, bool in_reconfig);
 
 /**
- * morse_cac_reconfig() - Restore the CAC config
- *
- * @mors The global Morse structure
- * @mors_vif Morse VIF
+ * morse_cac_reconfig() - Restore the CAC config.
+ * @mors:	Global Morse structure.
+ * @mors_vif:	Virtual interface.
  */
 void morse_cac_reconfig(struct morse *mors, struct morse_vif *mors_vif);
 

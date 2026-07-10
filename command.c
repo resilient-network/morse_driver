@@ -12,6 +12,7 @@
 #include <linux/workqueue.h>
 
 #include "debug.h"
+#include "dot11ah/dot11ah.h"
 #include "command.h"
 #include "skbq.h"
 #include "mac.h"
@@ -191,6 +192,7 @@ static int morse_cmd_tx(struct morse *mors, struct morse_cmd_resp *resp,
 		if (retry > 0)
 			reinit_completion(&cmd_comp);
 		timeout = timeout ? timeout : default_cmd_timeout_ms;
+		morse_skbq_set_mac80211_owned(skb, false);
 		ret = morse_skbq_skb_tx(cmd_q, &skb, NULL, MORSE_SKB_CHAN_COMMAND);
 		mutex_unlock(&mors->cmd_lock);
 
@@ -238,7 +240,7 @@ static int morse_cmd_tx(struct morse *mors, struct morse_cmd_resp *resp,
 	else if (ret != 0)
 		MORSE_ERR(mors, "Command %s %02x:%02x failed with rc %d (0x%x)\n",
 			  func, le16_to_cpu(req->hdr.message_id),
-			  le16_to_cpu(req->hdr.host_id), ret, ret);
+			  le16_to_cpu(req->hdr.host_id), ret, (u16)(-ret));
 
 	return ret;
 }
@@ -260,7 +262,7 @@ static int morse_cmd_ocs_req(struct morse_vif *mors_vif, struct morse_cmd_resp_o
 
 	/* Prepare request */
 	req.hdr = drv_req->hdr;
-	morse_cmd_init(mors, &req.hdr, MORSE_CMD_ID_OCS, 0, sizeof(req));
+	morse_cmd_init(mors, &req.hdr, MORSE_CMD_ID_OCS, mors_vif->id, sizeof(req));
 
 	req.subcmd = drv_req->subcmd;
 	req.config.op_channel_freq_hz = drv_req->config.op_channel_freq_hz;
@@ -315,7 +317,7 @@ static int morse_cmd_coredump(struct morse *mors)
 
 	mors->user_coredump_comp = &user_coredump_comp;
 	set_bit(MORSE_STATE_FLAG_DO_COREDUMP, &mors->state_flags);
-	schedule_work(&mors->driver_restart);
+	schedule_work(&mors->recovery.driver_restart);
 
 	mutex_unlock(&mors->lock);
 	rem = wait_for_completion_timeout(&user_coredump_comp, msecs_to_jiffies(timeout_ms));
@@ -451,7 +453,8 @@ static int morse_cmd_drv(struct morse *mors,
 
 			mors->custom_configs.listen_interval = le16_to_cpu(cmd_li->listen_interval);
 
-			mors->custom_configs.listen_interval_ovr = true;
+			mors->custom_configs.listen_interval_ovr =
+				(mors->custom_configs.listen_interval != 0);
 
 			MORSE_DBG(mors, "Listen Interval %d\n",
 				  mors->custom_configs.listen_interval);
@@ -925,6 +928,28 @@ int morse_cmd_rm_if(struct morse *mors, u16 vif_id)
 	return ret;
 }
 
+int morse_cmd_get_if(struct morse *mors, enum morse_cmd_interface_type *type, u8 *mac_addr)
+{
+	struct morse_cmd_req_get_interface req;
+	struct morse_cmd_resp_get_interface resp;
+	int ret;
+
+	morse_cmd_init(mors, &req.hdr, MORSE_CMD_ID_GET_INTERFACE, 0, sizeof(req));
+
+	ret = morse_cmd_tx(mors, (struct morse_cmd_resp *)&resp,
+			   (struct morse_cmd_req *)&req, sizeof(resp), 0, __func__);
+
+	if (ret)
+		return ret;
+
+	*type = le16_to_cpu(resp.vif_type);
+
+	if (*type == MORSE_CMD_INTERFACE_TYPE_STA)
+		memcpy(mac_addr, resp.mac_addr, ETH_ALEN);
+
+	return 0;
+}
+
 int morse_cmd_set_bssid(struct morse *mors, u16 vif_id, const u8 *bssid)
 {
 	int ret;
@@ -1036,7 +1061,8 @@ int morse_cmd_install_key(struct morse *mors, struct morse_vif *mors_vif,
 	    MORSE_CMD_TEMPORAL_KEY_TYPE_PTK : MORSE_CMD_TEMPORAL_KEY_TYPE_GTK;
 
 	req.key_idx = key->keyidx;
-	memcpy(&req.key[0], &key->key[0], sizeof(req.key));
+	memset(&req.key[0], 0, sizeof(req.key));
+	memcpy(&req.key[0], &key->key[0], key->keylen);
 
 	ret = morse_cmd_tx(mors, (struct morse_cmd_resp *)&resp,
 			   (struct morse_cmd_req *)&req, sizeof(resp), 0, __func__);
@@ -1073,13 +1099,19 @@ int morse_cmd_get_version(struct morse *mors)
 		int major;
 		int minor;
 		int patch;
+		int chip_ver;
 
 		resp->version[le32_to_cpu(resp->length)] = '\0';
 		MORSE_INFO(mors,
 			   "Morse Driver Version: %s, Morse FW Version: %s\n",
 			   DRV_VERSION, resp->version);
 
-		if (sscanf(resp->version, "rel_%d_%d_%d", &major, &minor, &patch) == 3) {
+		/* Chip-qualified tags are expected as rel_<chip>_<major>_<minor>_<patch>,
+		 * where <chip> is a 6-character identifier such as mm6108.
+		 */
+		if (sscanf(resp->version, "rel_%d_%d_%d", &major, &minor, &patch) == 3 ||
+			sscanf(resp->version, "rel_mm%4d_%d_%d_%d", &chip_ver, &major, &minor,
+			       &patch) == 4) {
 			MORSE_WARN_ON_ONCE(FEATURE_ID_DEFAULT, major > __UINT8_MAX__);
 			MORSE_WARN_ON_ONCE(FEATURE_ID_DEFAULT, minor > __UINT8_MAX__);
 			MORSE_WARN_ON_ONCE(FEATURE_ID_DEFAULT, patch > __UINT8_MAX__);
@@ -1108,12 +1140,12 @@ int morse_cmd_get_disabled_channels(struct morse *mors,
 	return morse_cmd_tx(mors, (struct morse_cmd_resp *)resp, &req, resp_len, 0, __func__);
 }
 
-int morse_cmd_cfg_scan(struct morse *mors, bool enabled, bool is_survey)
+int morse_cmd_cfg_scan(struct morse *mors, u16 vif_id, bool enabled, bool is_survey)
 {
 	int ret;
 	struct morse_cmd_req_scan_config req;
 
-	morse_cmd_init(mors, &req.hdr, MORSE_CMD_ID_SCAN_CONFIG, 0, sizeof(req));
+	morse_cmd_init(mors, &req.hdr, MORSE_CMD_ID_SCAN_CONFIG, vif_id, sizeof(req));
 
 	req.enabled = enabled;
 	req.is_survey = is_survey;
@@ -1211,6 +1243,7 @@ static int morse_cmd_vendor_set_channel(struct morse *mors, int cmd_len,
 	int ret;
 	struct morse_channel_info *stored_info = &mors->custom_configs.default_bw_info;
 	const struct morse_dot11ah_channel *chan_s1g;
+	u32 op_chan_freq_hz = le32_to_cpu(drv_req->op_chan_freq_hz);
 
 	ret = morse_cmd_tx(mors, (struct morse_cmd_resp *)drv_resp,
 			   (struct morse_cmd_req *)drv_req, sizeof(*drv_resp), 0, __func__);
@@ -1219,8 +1252,8 @@ static int morse_cmd_vendor_set_channel(struct morse *mors, int cmd_len,
 
 
 	/* Store info */
-	if (le32_to_cpu(drv_req->op_chan_freq_hz) != MORSE_CMD_CHANNEL_FREQ_NOT_SET)
-		stored_info->op_chan_freq_hz = le32_to_cpu(drv_req->op_chan_freq_hz);
+	if (op_chan_freq_hz != MORSE_CMD_CHANNEL_FREQ_NOT_SET)
+		stored_info->op_chan_freq_hz = op_chan_freq_hz;
 
 	if (drv_req->pri_1mhz_chan_idx != MORSE_CMD_CHANNEL_IDX_NOT_SET)
 		stored_info->pri_1mhz_chan_idx = drv_req->pri_1mhz_chan_idx;
@@ -1234,14 +1267,8 @@ static int morse_cmd_vendor_set_channel(struct morse *mors, int cmd_len,
 	/* Validate that primary does not exceed operating */
 	stored_info->pri_bw_mhz = (stored_info->op_bw_mhz == 1) ? 1 : stored_info->pri_bw_mhz;
 
+	/* Power selected by chip - can be changed below */
 	mors->tx_power_mbm = QDBM_TO_MBM(le32_to_cpu(drv_resp->power_qdbm));
-
-	MORSE_INFO(mors,
-		   "%s%s: f:%d o:%d p:%d i:%d power:%d mBm\n",
-		   __func__, mors->in_scan ? " (scanning)" : "",
-		   le32_to_cpu(drv_req->op_chan_freq_hz), drv_req->op_bw_mhz,
-		   drv_req->pri_bw_mhz, drv_req->pri_1mhz_chan_idx,
-		   mors->tx_power_mbm);
 
 	if (!drv_req->__deprecated_reg_tx_power_set) {
 		/* This flag is deprecated - should always be set to 1 */
@@ -1249,11 +1276,20 @@ static int morse_cmd_vendor_set_channel(struct morse *mors, int cmd_len,
 		return 0;
 	}
 
-	/* Update txpower using S1G max values if possible */
-	chan_s1g = morse_dot11ah_s1g_freq_to_s1g(le32_to_cpu(drv_req->op_chan_freq_hz),
-				drv_req->op_bw_mhz);
+	/* Update Tx power using S1G max values if possible */
+	chan_s1g = morse_dot11ah_s1g_freq_to_s1g(op_chan_freq_hz, drv_req->op_bw_mhz);
 	if (chan_s1g)
 		morse_mac_set_txpower(mors, chan_s1g->ch.max_reg_power);
+	else
+		MORSE_ERR(mors, "%s: power could not be set for channel (f:%u kHz, bw:%u MHz)",
+			  __func__, HZ_TO_KHZ(op_chan_freq_hz), drv_req->op_bw_mhz);
+
+	MORSE_INFO(mors,
+		   "%s%s: f:%d o:%d p:%d i:%d power:%d mBm\n",
+		   __func__, mors->in_scan ? " (scanning)" : "",
+		   op_chan_freq_hz, drv_req->op_bw_mhz,
+		   drv_req->pri_bw_mhz, drv_req->pri_1mhz_chan_idx,
+		   mors->tx_power_mbm);
 
 	return 0;
 }
@@ -1281,7 +1317,8 @@ static int morse_cmd_vendor_dhcp_offload(struct morse *mors, struct morse_cmd_re
 
 	/* A successful DHCP offload enable command may require a state update */
 	if (ret == 0 && le32_to_cpu(dhcp_req->opcode) == MORSE_CMD_DHCP_OPCODE_ENABLE) {
-		if (le32_to_cpu(dhcp_resp->retcode) == MORSE_CMD_DHCP_RETCODE_SUCCESS) {
+		if (le32_to_cpu(dhcp_resp->retcode) == MORSE_CMD_DHCP_RETCODE_SUCCESS ||
+		    le32_to_cpu(dhcp_resp->retcode) == MORSE_CMD_DHCP_RETCODE_ALREADY_ENABLED) {
 			mors->custom_configs.enable_dhcpc_offload = true;
 			MORSE_DBG(mors, "%s: dhcp client hw offload enabled\n", __func__);
 		}
@@ -1335,8 +1372,8 @@ static int morse_cmd_vendor_standby_enter(struct morse *mors,
 	if (is_fullmac_mode()) {
 		struct morse_vif *mors_vif = morse_wiphy_get_sta_vif(mors);
 
-		if (!test_bit(MORSE_SME_STATE_CONNECTING, &mors_vif->sme_state) &&
-		    !test_bit(MORSE_SME_STATE_CONNECTED, &mors_vif->sme_state))
+		if (!morse_wiphy_is_connecting(mors_vif) &&
+		    !morse_wiphy_is_connected(mors_vif))
 			return -EINVAL;
 	}
 
@@ -1377,7 +1414,7 @@ static int morse_cmd_vendor_standby_exit(struct morse *mors,
 
 	vif_id = le16_to_cpu(standby_mode_resp->hdr.vif_id);
 	exit = &standby_mode_resp->info;
-	valid_response = (le16_to_cpu(standby_mode_resp->hdr.len) ==
+	valid_response = (le16_to_cpu(standby_mode_resp->hdr.len) >=
 		(sizeof(*standby_mode_resp) - sizeof(standby_mode_resp->hdr)));
 	vif = morse_get_vif_from_vif_id(mors, vif_id);
 
@@ -1390,6 +1427,13 @@ static int morse_cmd_vendor_standby_exit(struct morse *mors,
 		morse_mac_is_sta_vif_associated(vif) &&
 		valid_response && exit->sta_state < IEEE80211_STA_ASSOC)
 		ieee80211_connection_loss(vif);
+
+	if (is_fullmac_mode() && valid_response && exit->sta_state < IEEE80211_STA_ASSOC) {
+		struct morse_vif *mors_vif = morse_wiphy_get_sta_vif(mors);
+
+		if (morse_wiphy_is_connected(mors_vif))
+			morse_wiphy_disconnected_work_nolock(mors, mors_vif, true);
+	}
 
 exit:
 	return ret;
@@ -1447,7 +1491,9 @@ static int morse_cmd_get_set_non_tim_mode(struct ieee80211_vif *vif,
 	if (is_set_cmd) {
 		/* Do not allow disabling non-TIM mode when STAs are associated */
 		if (vif->type == NL80211_IFTYPE_AP &&
-				le32_to_cpu(req->value) == 0 && mors_vif->ap->num_stas) {
+		    le32_to_cpu(req->value) == 0 &&
+		    mors_vif->ap &&
+		    mors_vif->ap->num_stas) {
 			ret = -EPERM;
 			goto exit;
 		}
@@ -1693,8 +1739,12 @@ static int morse_cmd_vendor_get_set_params(struct morse *mors, struct morse_vif 
 	/* Some set commands require post processing */
 	switch (param) {
 	case MORSE_CMD_PARAM_ID_DYNAMIC_PS_TIMEOUT_MS:
-		if (is_set)
-			mors_ps_set_net_timeout_ms(mors, le32_to_cpu(req->value));
+		if (is_set) {
+			unsigned int timeout_ms = le32_to_cpu(req->value);
+
+			mors_ps_set_net_timeout_ms(mors, timeout_ms);
+			mors->custom_configs.dynamic_ps_timeout_ms = timeout_ms;
+		}
 		break;
 	default:
 		break;
@@ -1723,8 +1773,71 @@ void morse_cmd_set_bss_color_in_s1g_capab(struct morse *mors,
 	s1g_capab->capab_info[8] |= S1G_CAP8_SET_COLOR(bss_color);
 }
 
+static int morse_cmd_get_channelization_fullmac(struct morse *mors,
+						struct morse_cmd_req_get_set_generic_param *req,
+						struct morse_cmd_resp_get_set_generic_param *resp)
+{
+	int ret;
+
+	ret = morse_cmd_tx(mors,
+			   (struct morse_cmd_resp *)resp,
+			   (struct morse_cmd_req *)req,
+			   sizeof(*resp),
+			   0,
+			   __func__);
+
+	if (ret == MORSE_RET_CMD_NOT_HANDLED) {
+		/*
+		 * Firmware does not support configurable channelization.
+		 * Ignore the error and report 2020.
+		 */
+		resp->hdr.len = cpu_to_le16(sizeof(*resp) - sizeof(resp->hdr));
+		resp->hdr.host_id = req->hdr.host_id;
+		resp->status = cpu_to_le32(MORSE_RET_SUCCESS);
+		resp->value = cpu_to_le32(CHANNELIZATION_SCHEME_IEEE80211_2020);
+		return 0;
+	}
+
+	return ret;
+}
+
 /**
- * morse_cmd_vendor_postprocess() - Post process vendor command after it was handled by the chip.
+ * morse_cmd_vendor_postprocess_fullmac() - Post process vendor command after it was handled
+ *					    by the chip (fullmac version).
+ */
+static void morse_cmd_vendor_postprocess_fullmac(struct morse *mors, struct morse_vif *mors_vif,
+						 const struct morse_cmd_req_vendor *req,
+						 struct morse_cmd_resp_vendor *resp)
+{
+	u16 message_id = le16_to_cpu(req->hdr.message_id);
+
+	switch (message_id) {
+	case MORSE_CMD_ID_GET_SET_GENERIC_PARAM:
+	{
+		struct morse_cmd_req_get_set_generic_param *get_set_cmd =
+		    (struct morse_cmd_req_get_set_generic_param *)req;
+		u32 param_id = le32_to_cpu(get_set_cmd->param_id);
+		u32 action = le32_to_cpu(get_set_cmd->action);
+		u32 value = le32_to_cpu(get_set_cmd->value);
+
+		if (mors_vif &&
+		    action == MORSE_CMD_PARAM_ACTION_SET &&
+		    param_id == MORSE_CMD_PARAM_ID_AUTOCONNECT)
+			mors_vif->autoconnect = value;
+
+		if (action == MORSE_CMD_PARAM_ACTION_SET &&
+		    param_id == MORSE_CMD_PARAM_ID_CHANNELIZATION)
+			morse_dot11ah_set_channelization_scheme(value);
+	}
+		break;
+	default:
+		break;
+	}
+}
+
+/**
+ * morse_cmd_vendor_postprocess() - Post process vendor command after it was handled by the chip
+ *				    (softmac version).
  */
 static void morse_cmd_vendor_postprocess(struct morse *mors, struct morse_vif *mors_vif,
 					 const struct morse_cmd_req_vendor *req,
@@ -1915,10 +2028,23 @@ int morse_cmd_vendor(struct morse *mors, struct morse_vif *mors_vif,
 		ret = morse_cmd_vendor_force_power_mode(mors, resp, req);
 		break;
 	case MORSE_CMD_ID_GET_SET_GENERIC_PARAM:
-		/* fullmac is not supporting AU new channelization */
-		if (is_fullmac_mode() &&
-		    le32_to_cpu(((struct morse_cmd_req_get_set_generic_param *)req)->param_id) !=
-		    MORSE_CMD_PARAM_ID_CHANNELIZATION) {
+		if (is_fullmac_mode()) {
+			struct morse_cmd_req_get_set_generic_param *get_set_cmd =
+			    (struct morse_cmd_req_get_set_generic_param *)req;
+			u32 param_id = le32_to_cpu(get_set_cmd->param_id);
+			u32 action = le32_to_cpu(get_set_cmd->action);
+
+			/*
+			 * Get channelization needs special backwards compatibility
+			 * handling for old firmware. Delete this later.
+			 */
+			if (action == MORSE_CMD_PARAM_ACTION_GET &&
+			    param_id == MORSE_CMD_PARAM_ID_CHANNELIZATION) {
+				ret = morse_cmd_get_channelization_fullmac(mors,
+					(struct morse_cmd_req_get_set_generic_param *)req,
+					(struct morse_cmd_resp_get_set_generic_param *)resp);
+				break;
+			}
 			direct_to_hw = true;
 			break;
 		}
@@ -1956,7 +2082,9 @@ int morse_cmd_vendor(struct morse *mors, struct morse_vif *mors_vif,
 	}
 	*resp_len = le16_to_cpu(resp->hdr.len) + sizeof(struct morse_cmd_header);
 
-	if (!is_fullmac_mode())
+	if (is_fullmac_mode())
+		morse_cmd_vendor_postprocess_fullmac(mors, mors_vif, req, resp);
+	else
 		morse_cmd_vendor_postprocess(mors, mors_vif, req, resp);
 
 exit:
@@ -2017,12 +2145,12 @@ int morse_cmd_set_cr_bw(struct morse *mors, struct morse_vif *mors_vif, u8 direc
 	return ret;
 }
 
-int morse_cmd_cfg_qos(struct morse *mors, struct morse_queue_params *params)
+int morse_cmd_cfg_qos(struct morse *mors, struct morse_queue_params *params, u16 vif_id)
 {
 	int ret;
 	struct morse_cmd_req_set_qos_params req;
 
-	morse_cmd_init(mors, &req.hdr, MORSE_CMD_ID_SET_QOS_PARAMS, 0, sizeof(req));
+	morse_cmd_init(mors, &req.hdr, MORSE_CMD_ID_SET_QOS_PARAMS, vif_id, sizeof(req));
 
 	req.uapsd = params->uapsd;
 	req.queue_idx = params->aci;
@@ -2178,7 +2306,7 @@ int morse_cmd_dhcpc_enable(struct morse *mors, u16 vif_id)
 
 static int morse_cmd_twt_agreement_req(struct morse *mors,
 				       struct morse_twt_agreement_data *agreement,
-				       u16 iface_id, bool validate_only)
+				       u16 vif_id, bool validate_only)
 {
 	int ret = 0;
 	struct morse_cmd_req_twt_agreement_install *req;
@@ -2190,7 +2318,7 @@ static int morse_cmd_twt_agreement_req(struct morse *mors,
 		message_id = MORSE_CMD_ID_TWT_AGREEMENT_VALIDATE;
 	else
 		message_id = MORSE_CMD_ID_TWT_AGREEMENT_INSTALL;
-	morse_cmd_init(mors, &req->hdr, message_id, iface_id,
+	morse_cmd_init(mors, &req->hdr, message_id, vif_id,
 		       sizeof(*req) + MORSE_CMD_DOT11_TWT_AGREEMENT_MAX_LEN);
 
 	req->flow_id = (le16_to_cpu(agreement->params.req_type) & IEEE80211_TWT_REQTYPE_FLOWID) >>
@@ -2203,23 +2331,23 @@ static int morse_cmd_twt_agreement_req(struct morse *mors,
 }
 
 int morse_cmd_twt_agreement_validate_req(struct morse *mors,
-					 struct morse_twt_agreement_data *agreement, u16 iface_id)
+					 struct morse_twt_agreement_data *agreement, u16 vif_id)
 {
-	return morse_cmd_twt_agreement_req(mors, agreement, iface_id, true);
+	return morse_cmd_twt_agreement_req(mors, agreement, vif_id, true);
 }
 
 int morse_cmd_twt_agreement_install_req(struct morse *mors,
-					struct morse_twt_agreement_data *agreement, u16 iface_id)
+					struct morse_twt_agreement_data *agreement, u16 vif_id)
 {
-	return morse_cmd_twt_agreement_req(mors, agreement, iface_id, false);
+	return morse_cmd_twt_agreement_req(mors, agreement, vif_id, false);
 }
 
 int morse_cmd_twt_remove_req(struct morse *mors,
 			     struct morse_cmd_req_twt_agreement_remove *twt_remove_req,
-			     u16 iface_id)
+			     u16 vif_id)
 {
 	morse_cmd_init(mors, &twt_remove_req->hdr, MORSE_CMD_ID_TWT_AGREEMENT_REMOVE,
-		       iface_id, sizeof(*twt_remove_req));
+		       vif_id, sizeof(*twt_remove_req));
 
 	return morse_cmd_tx(mors, NULL, (struct morse_cmd_req *)twt_remove_req, 0, 0, __func__);
 }
@@ -2490,19 +2618,61 @@ int morse_cmd_configure_page_slicing(struct morse_vif *mors_vif, bool enable)
 	return ret;
 }
 
+static void morse_beacon_offload_update(struct morse_vif *mors_vif,
+					   enum morse_beacon_offload_state state)
+{
+	spin_lock_bh(&mors_vif->beacon_offload.lock);
+	mors_vif->beacon_offload.state = state;
+	mors_vif->beacon_offload.skipped_tasklet_events = 0;
+	spin_unlock_bh(&mors_vif->beacon_offload.lock);
+}
+
+/**
+ * morse_beacon_offload_disable - Disable beacon offload
+ *
+ * Updates mac80211s internal DTIM count so the next ieee80211_beacon_get call will have
+ * @dtim_count. DTIM sync and offload state change must happen inside a single spinlock.
+ *
+ * @morse_vif: Morse Virtual interface
+ * @dtim_count: Target DTIM count to synchronise to
+ */
+static void morse_beacon_offload_disable(struct morse_vif *mors_vif, uint16_t dtim_count)
+{
+	spin_lock_bh(&mors_vif->beacon_offload.lock);
+	morse_hw_beacon_update_mac80211_dtim_count(mors_vif, dtim_count);
+	mors_vif->beacon_offload.state = MORSE_BEACON_OFFLOAD_STATE_DISABLED;
+	spin_unlock_bh(&mors_vif->beacon_offload.lock);
+}
+
 int morse_cmd_beacon_offload(struct morse_vif *mors_vif, enum morse_beacon_offload_op operation)
 {
 	struct morse_cmd_req_beacon_offload *req;
 	struct morse_cmd_resp_beacon_offload resp;
+	enum morse_beacon_offload_state start_state;
 	struct morse *mors;
 	size_t cmd_size;
 	int ret = 0;
 	u32 flags = 0;
+	bool op_start;
 
 	mors = morse_vif_to_morse(mors_vif);
 	if (!morse_hw_beacon_can_offload(mors_vif)) {
 		MORSE_ERR(mors, "%s: beacon offloading unsupported\n", __func__);
 		return -ENOTSUPP;
+	}
+
+	/* Caller holds mors->lock, so this read is safe without the beacon_offload spinlock */
+	start_state = mors_vif->beacon_offload.state;
+	op_start = (operation == MORSE_BEACON_OFFLOAD_OP_START);
+	if (op_start) {
+		flags |= MORSE_CMD_BEACON_OFFLOAD_FLAGS_START;
+		if (start_state != MORSE_BEACON_OFFLOAD_STATE_DISABLED)
+			return -EALREADY;
+
+	} else {
+		flags |= MORSE_CMD_BEACON_OFFLOAD_FLAGS_STOP;
+		if (start_state != MORSE_BEACON_OFFLOAD_STATE_ENABLED)
+			return -EALREADY;
 	}
 
 	cmd_size = sizeof(struct morse_cmd_req_beacon_offload);
@@ -2511,14 +2681,9 @@ int morse_cmd_beacon_offload(struct morse_vif *mors_vif, enum morse_beacon_offlo
 	if (!req)
 		return -ENOMEM;
 
-	if (operation == MORSE_BEACON_OFFLOAD_OP_START)
-		flags |= MORSE_CMD_BEACON_OFFLOAD_FLAGS_START;
-	else if (operation == MORSE_BEACON_OFFLOAD_OP_STOP)
-		flags |= MORSE_CMD_BEACON_OFFLOAD_FLAGS_STOP;
-
 	req->flags = cpu_to_le32(flags);
 
-	if (operation == MORSE_BEACON_OFFLOAD_OP_START) {
+	if (op_start) {
 		/* this will realloc the req and return the new size in cmd_size */
 		ret = morse_hw_beacon_offload_insert_tlvs(mors_vif, &req, &cmd_size);
 
@@ -2532,19 +2697,25 @@ int morse_cmd_beacon_offload(struct morse_vif *mors_vif, enum morse_beacon_offlo
 	morse_cmd_init(mors, &req->hdr, MORSE_CMD_ID_BEACON_OFFLOAD, mors_vif->id, cmd_size);
 	morse_hw_beacon_offload_dump_cmd(mors, req);
 
+	/* For stop operations we need to log all beacon tasklets that occur during offload */
+	if (!op_start)
+		morse_beacon_offload_update(mors_vif, MORSE_BEACON_OFFLOAD_STATE_STOPPING);
+
 	ret = morse_cmd_tx(mors, (struct morse_cmd_resp *)&resp, (struct morse_cmd_req *)req,
 			   sizeof(resp), 0, __func__);
 
 	if (ret)
 		goto exit;
 
-	if (operation == MORSE_BEACON_OFFLOAD_OP_STOP) {
-		morse_hw_beacon_update_mac80211_dtim_count(mors_vif, le16_to_cpu(resp.dtim_count));
-		mors_vif->beacon_offload_enabled = false;
-	} else if (operation == MORSE_BEACON_OFFLOAD_OP_START) {
-		mors_vif->beacon_offload_enabled = true;
-	}
+	if (!op_start)
+		morse_beacon_offload_disable(mors_vif, le16_to_cpu(resp.dtim_count));
+	else
+		morse_beacon_offload_update(mors_vif, MORSE_BEACON_OFFLOAD_STATE_ENABLED);
+
 exit:
+	if (ret)
+		morse_beacon_offload_update(mors_vif, start_state);
+
 	kfree(req);
 	return ret;
 }
@@ -2709,6 +2880,45 @@ int morse_cmd_set_cts_to_self(struct morse *mors, bool enabled)
 	return morse_cmd_tx(mors, NULL, (struct morse_cmd_req *)&req, 0, 0, __func__);
 }
 
+int morse_cmd_set_crypto_in_host(struct morse *mors, bool enabled)
+{
+	struct morse_cmd_req_get_set_generic_param req;
+
+	morse_cmd_init(mors, &req.hdr, MORSE_CMD_ID_GET_SET_GENERIC_PARAM, 0, sizeof(req));
+	req.param_id = cpu_to_le32(MORSE_CMD_PARAM_ID_CRYPTO_IN_HOST);
+	req.action = cpu_to_le32(MORSE_CMD_PARAM_ACTION_SET);
+	req.flags = 0;
+	req.value = cpu_to_le32(enabled ? 1 : 0);
+
+	return morse_cmd_tx(mors, NULL, (struct morse_cmd_req *)&req, 0, 0, __func__);
+}
+
+int morse_cmd_set_dynamic_ps_timeout(struct morse *mors, unsigned int timeout_ms)
+{
+	struct morse_cmd_req_get_set_generic_param req;
+
+	morse_cmd_init(mors, &req.hdr, MORSE_CMD_ID_GET_SET_GENERIC_PARAM, 0, sizeof(req));
+	req.param_id = cpu_to_le32(MORSE_CMD_PARAM_ID_DYNAMIC_PS_TIMEOUT_MS);
+	req.action = cpu_to_le32(MORSE_CMD_PARAM_ACTION_SET);
+	req.flags = 0;
+	req.value = cpu_to_le32(timeout_ms);
+
+	return morse_cmd_tx(mors, NULL, (struct morse_cmd_req *)&req, 0, 0, __func__);
+}
+
+int morse_cmd_set_channelization_scheme(struct morse *mors, u32 scheme)
+{
+	struct morse_cmd_req_get_set_generic_param req;
+
+	morse_cmd_init(mors, &req.hdr, MORSE_CMD_ID_GET_SET_GENERIC_PARAM, 0, sizeof(req));
+	req.param_id = cpu_to_le32(MORSE_CMD_PARAM_ID_CHANNELIZATION);
+	req.action = cpu_to_le32(MORSE_CMD_PARAM_ACTION_SET);
+	req.flags = 0;
+	req.value = cpu_to_le32(scheme);
+
+	return morse_cmd_tx(mors, NULL, (struct morse_cmd_req *)&req, 0, 0, __func__);
+}
+
 int morse_cmd_start_scan(struct morse *mors,
 			 u8 n_ssids,
 			 const u8 *ssid, size_t ssid_len,
@@ -2831,7 +3041,7 @@ int morse_cmd_set_cqm_rssi(struct morse *mors, u16 vif_id, s32 cqm_rssi_thold, u
 	struct morse_cmd_req_set_cqm_rssi req;
 	int ret;
 
-	morse_cmd_init(mors, &req.hdr, MORSE_CMD_ID_SET_CQM_RSSI, 0, sizeof(req));
+	morse_cmd_init(mors, &req.hdr, MORSE_CMD_ID_SET_CQM_RSSI, vif_id, sizeof(req));
 	req.threshold = cpu_to_le32(cqm_rssi_thold);
 	req.hysteresis = cpu_to_le32(cqm_rssi_hyst);
 

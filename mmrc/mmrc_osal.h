@@ -19,6 +19,10 @@
 #define MMRC_OSAL_ASSERT(_x) WARN_ON_ONCE(!(_x))
 #endif
 
+#ifndef MMRC_OSAL_STATIC_ASSERT
+#define MMRC_OSAL_STATIC_ASSERT(_x) BUILD_BUG_ON(!(_x))
+#endif
+
 #ifndef MMRC_OSAL_PR_ERR
 #define MMRC_OSAL_PR_ERR(...) pr_err(__VA_ARGS__)
 #endif

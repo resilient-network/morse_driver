@@ -637,6 +637,9 @@ static int morse_yaps_hw_update_status(struct morse_yaps *yaps)
 		ret = -EIO;
 	}
 
+	if (morse_calc_bytes_remaining(yaps))
+		set_bit(MORSE_RX_PEND, &yaps->mors->chip_if->event_flags);
+
 exit_unlock:
 	yaps_hw_unlock(yaps);
 
@@ -742,6 +745,7 @@ int morse_yaps_hw_init(struct morse *mors)
 		goto err_exit;
 	}
 
+	INIT_WORK(&mors->recovery.hw_stop, morse_hw_stop_work);
 	INIT_WORK(&mors->chip_if_work, morse_yaps_work);
 	INIT_WORK(&mors->tx_stale_work, morse_yaps_stale_tx_work);
 
@@ -772,6 +776,7 @@ void morse_yaps_hw_finish(struct morse *mors)
 	morse_yaps_finish(yaps);
 	cancel_work_sync(&mors->chip_if_work);
 	cancel_work_sync(&mors->tx_stale_work);
+	cancel_work_sync(&mors->recovery.hw_stop);
 	if (yaps->aux_data) {
 		kfree(yaps->aux_data->from_chip_buffer);
 		yaps->aux_data->from_chip_buffer = NULL;

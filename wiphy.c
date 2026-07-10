@@ -21,6 +21,7 @@
 
 #include "bus.h"
 #include "command.h"
+#include "dot11ah/dot11ah.h"
 #include "mac.h"
 #include "morse.h"
 #include "ps.h"
@@ -155,6 +156,92 @@ struct morse_vif *morse_wdev_to_morse_vif(struct wireless_dev *wdev)
 	return NULL;
 }
 
+static const char *sme_state_to_str(enum morse_sme_state sme_state)
+{
+	switch (sme_state) {
+	case MORSE_SME_STATE_IDLE:
+		return "idle";
+	case MORSE_SME_STATE_CONNECTING:
+		return "connecting";
+	case MORSE_SME_STATE_CONNECTED:
+		return "connected";
+	case MORSE_SME_STATE_DISCONNECTING:
+		return "disconnecting";
+	case MORSE_SME_STATE_ROAMING:
+		return "roaming";
+	default:
+		return "unknown";
+	}
+}
+
+bool morse_wiphy_is_idle(const struct morse_vif *mors_vif)
+{
+	return (mors_vif->sme_state == MORSE_SME_STATE_IDLE);
+}
+
+bool morse_wiphy_is_connecting(const struct morse_vif *mors_vif)
+{
+	return (mors_vif->sme_state == MORSE_SME_STATE_CONNECTING);
+}
+
+bool morse_wiphy_is_connected(const struct morse_vif *mors_vif)
+{
+	return (mors_vif->sme_state == MORSE_SME_STATE_CONNECTED);
+}
+
+bool morse_wiphy_is_disconnecting(const struct morse_vif *mors_vif)
+{
+	return (mors_vif->sme_state == MORSE_SME_STATE_DISCONNECTING);
+}
+
+bool morse_wiphy_is_roaming(const struct morse_vif *mors_vif)
+{
+	return (mors_vif->sme_state == MORSE_SME_STATE_ROAMING);
+}
+
+static bool
+morse_wiphy_set_state(struct morse_vif *mors_vif, enum morse_sme_state next, const char *func_name)
+{
+	bool transition_okay;
+	enum morse_sme_state prev;
+	struct morse *mors = morse_vif_to_morse(mors_vif);
+
+	lockdep_assert_held(&mors->lock);
+
+	prev = mors_vif->sme_state;
+	switch (prev) {
+	case MORSE_SME_STATE_IDLE:
+		transition_okay = (next == MORSE_SME_STATE_CONNECTING);
+		break;
+	case MORSE_SME_STATE_CONNECTING:
+		transition_okay = (next == MORSE_SME_STATE_IDLE ||
+				   next == MORSE_SME_STATE_CONNECTED ||
+				   next == MORSE_SME_STATE_CONNECTING);
+		break;
+	case MORSE_SME_STATE_CONNECTED:
+		transition_okay = (next == MORSE_SME_STATE_IDLE ||
+				   next == MORSE_SME_STATE_DISCONNECTING ||
+				   next == MORSE_SME_STATE_ROAMING);
+		break;
+	case MORSE_SME_STATE_DISCONNECTING:
+		transition_okay = (next == MORSE_SME_STATE_IDLE);
+		break;
+	case MORSE_SME_STATE_ROAMING:
+		transition_okay = (next == MORSE_SME_STATE_IDLE ||
+				   next == MORSE_SME_STATE_CONNECTED);
+		break;
+	default:
+		transition_okay = false;
+		break;
+	}
+
+	MORSE_INFO(mors, "%s: %s -> %s", func_name, sme_state_to_str(prev), sme_state_to_str(next));
+	mors_vif->sme_state = next;
+	MORSE_WARN_ON(FEATURE_ID_DEFAULT, !transition_okay);
+
+	return transition_okay;
+}
+
 /**
  * morse_wiphy_dot11ah_channel_to_5g - Map 802.11ah channel to 5GHz channel.
  */
@@ -231,6 +318,60 @@ static int morse_wiphy_fixed_rate(struct morse *mors)
 	return morse_cmd_set_fixed_transmission_rate(mors, bw, mcs, sgi, nss);
 }
 
+static int morse_wiphy_s1g_to_5g_chandef(struct morse *mors, struct cfg80211_chan_def *chandef,
+				      u32 op_chan_freq_hz, u8 pri_1mhz_chan_idx,
+				      u8 op_bw_mhz, u8 pri_bw_mhz)
+{
+	int ret = 0;
+	int op_chan_s1g, pri_chan_s1g;
+	int op_chan_5g, pri_chan_5g;
+	u32 op_freq_5g;
+	enum nl80211_chan_width width_5g;
+
+	/* Look up S1G channel numbers based on the channel info we received from the chip.
+	 */
+	op_chan_s1g = morse_dot11ah_freq_khz_bw_mhz_to_chan(HZ_TO_KHZ(op_chan_freq_hz), op_bw_mhz);
+	pri_chan_s1g = morse_dot11ah_calc_prim_s1g_chan(op_bw_mhz, 1, op_chan_s1g,
+							pri_1mhz_chan_idx);
+
+	/* Map to 5GHz channel info.
+	 */
+	op_chan_5g = morse_dot11ah_s1g_chan_to_5g_chan(op_chan_s1g);
+	pri_chan_5g = morse_dot11ah_s1g_op_chan_pri_chan_to_5g(op_chan_s1g, pri_chan_s1g);
+	op_freq_5g = ieee80211_channel_to_frequency(op_chan_5g, NL80211_BAND_5GHZ);
+	switch (op_bw_mhz) {
+	case 1:
+		width_5g = NL80211_CHAN_WIDTH_20_NOHT;
+		break;
+	case 2:
+		width_5g = NL80211_CHAN_WIDTH_40;
+		break;
+	case 4:
+		width_5g = NL80211_CHAN_WIDTH_80;
+		break;
+	case 8:
+		width_5g = NL80211_CHAN_WIDTH_160;
+		break;
+	default:
+		width_5g = WARN_ON(NL80211_CHAN_WIDTH_20_NOHT);
+	}
+
+	if (op_chan_5g == -ENOENT || pri_chan_5g == -ENOENT) {
+		/* This can happen if we observe the chip with its initial channel configuration,
+		 * which is not necessarily valid for the current regulatory domain.
+		 */
+		ret = -EINVAL;
+		goto out;
+	}
+
+	chandef->chan = morse_wiphy_get_5g_channel(mors->wiphy, pri_chan_5g);
+	chandef->center_freq1 = op_freq_5g;
+	chandef->width = width_5g;
+	chandef->center_freq2 = 0;
+out:
+	return ret;
+}
+
 static void morse_wiphy_update_arp_filter(struct morse_vif *mors_vif)
 {
 	struct morse *mors = wiphy_priv(mors_vif->wdev.wiphy);
@@ -241,7 +382,7 @@ static void morse_wiphy_update_arp_filter(struct morse_vif *mors_vif)
 	if (!mors_vif->custom_configs->enable_arp_offload)
 		return;
 
-	if (!test_bit(MORSE_SME_STATE_CONNECTED, &mors_vif->sme_state))
+	if (!morse_wiphy_is_connected(mors_vif))
 		return;
 
 	ret = morse_cmd_arp_offload_update_ip_table(mors, mors_vif->id,
@@ -251,19 +392,61 @@ static void morse_wiphy_update_arp_filter(struct morse_vif *mors_vif)
 		MORSE_ERR(mors, "failed to configure ARP offload address table: %d\n", ret);
 }
 
-static int morse_ndev_open(struct net_device *dev)
+/**
+ * morse_wiphy_should_reuse_vif() - Check if there's a vif present in the chip.
+ *
+ * This function will update macaddr, wiphy->frag_threshold and wiphy->rts_threshold
+ * in mors if the vif is present in the chip.
+ *
+ * @mors: Global morse structure
+ *
+ * @return true if vif is present, else false
+ */
+static bool morse_wiphy_should_reuse_vif(struct morse *mors)
 {
-	struct morse_persistent_vif_configs *mors_vif_conf;
-	struct morse_vif *mors_vif = netdev_priv(dev);
-	struct wireless_dev *wdev = &mors_vif->wdev;
-	struct morse *mors = wiphy_priv(wdev->wiphy);
+	enum morse_cmd_interface_type curr_vif_type;
+	struct wiphy *wiphy = mors->wiphy;
+	u32 frag_threshold;
+	u32 rts_threshold;
+	u8 curr_mac_addr[ETH_ALEN];
+	bool ret;
+
+	if (!morse_hw_should_reattach())
+		return false;
+
+	ret = morse_cmd_get_if(mors, &curr_vif_type, curr_mac_addr);
+	if (ret || curr_vif_type != MORSE_CMD_INTERFACE_TYPE_STA)
+		return false;
+
+	memcpy(&mors->macaddr, curr_mac_addr, ETH_ALEN);
+
+	ret = morse_cmd_get_frag_threshold(mors, &frag_threshold);
+	wiphy->frag_threshold = frag_threshold;
+
+	ret = morse_cmd_get_rts_threshold(mors, &rts_threshold);
+	wiphy->rts_threshold = rts_threshold;
+
+	return true;
+}
+
+static int morse_wiphy_add_if(struct morse *mors,
+			      struct morse_vif *mors_vif,
+			      struct net_device *dev,
+			      struct wireless_dev *wdev)
+{
+	const u32 channelization_scheme = morse_dot11ah_get_channelization_scheme();
 	int ret;
 
-	/* Carrier state is initially off. It will be set on when a connection is established.
-	 */
-	netif_carrier_off(dev);
-
-	mutex_lock(&mors->lock);
+	ret = morse_cmd_set_channelization_scheme(mors, channelization_scheme);
+	if (ret == MORSE_RET_CMD_NOT_HANDLED &&
+	    channelization_scheme == CHANNELIZATION_SCHEME_IEEE80211_2020) {
+		/*
+		 * Firmware does not support selecting channelization scheme.
+		 * Ignore the error and let it use 2020.
+		 */
+	} else if (ret) {
+		goto out;
+	}
 
 	ret = morse_cmd_set_country(mors, mors->country);
 	if (ret)
@@ -292,6 +475,33 @@ static int morse_ndev_open(struct net_device *dev)
 
 	if (mors->cfg->set_slow_clock_mode)
 		mors->cfg->set_slow_clock_mode(mors, morse_mac_slow_clock_mode());
+
+out:
+	return ret;
+}
+
+static int morse_ndev_open(struct net_device *dev)
+{
+	struct morse_persistent_vif_configs *mors_vif_conf;
+	struct morse_vif *mors_vif = netdev_priv(dev);
+	struct wireless_dev *wdev = &mors_vif->wdev;
+	struct morse *mors = wiphy_priv(wdev->wiphy);
+	int ret = 0;
+
+	/* Carrier state is initially off. It will be set on when a connection is established.
+	 */
+	netif_carrier_off(dev);
+
+	mutex_lock(&mors->lock);
+
+	if (mors->reuse_vif) {
+		MORSE_DBG(mors, "%s: reusing VIF\n", __func__);
+	} else {
+		MORSE_DBG(mors, "%s: adding new VIF\n", __func__);
+		ret = morse_wiphy_add_if(mors, mors_vif, dev, wdev);
+		if (ret)
+			goto out;
+	}
 
 	mutex_lock(&mors->persistent_vif_config.lock);
 	mors_vif_conf = morse_get_vif_conf_from_id(mors, mors_vif->id);
@@ -332,6 +542,7 @@ static int morse_ndev_close(struct net_device *dev)
 		mors->mon_if.id = INVALID_VIF_ID;
 
 	mors->wiphy_started = false;
+	mors->reuse_vif = false;
 out:
 	mutex_unlock(&mors->lock);
 
@@ -349,7 +560,7 @@ static netdev_tx_t morse_ndev_data_tx(struct sk_buff *skb, struct net_device *de
 		.flags = cpu_to_le32(MORSE_TX_CONF_FLAGS_FULLMAC_REPORT),
 	};
 
-	if (!test_bit(MORSE_SME_STATE_CONNECTED, &mors_vif->sme_state)) {
+	if (!morse_wiphy_is_connected(mors_vif)) {
 		dev_kfree_skb_any(skb);
 		dev->stats.tx_dropped++;
 		return NETDEV_TX_OK;
@@ -446,10 +657,15 @@ morse_wiphy_fill_vendor_ies(struct morse_vif *mors_vif, u8 *dest,
 
 	list_for_each_entry_safe(vendor_ie, tmp, &vie_config->ie_list, list) {
 		if (vendor_ie->mgmt_type_mask & mgmt_type_mask) {
-			dest[dest_idx++] = vendor_ie->ie.element_id;
-			dest[dest_idx++] = vendor_ie->ie.len;
-			memcpy(&dest[dest_idx], vendor_ie->ie.oui, vendor_ie->ie.len);
-			dest_idx += vendor_ie->ie.len;
+			struct ieee80211_vendor_ie *ie =
+					(struct ieee80211_vendor_ie *)vendor_ie->element;
+			if (!ie)
+				continue;
+
+			dest[dest_idx++] = ie->element_id;
+			dest[dest_idx++] = ie->len;
+			memcpy(&dest[dest_idx], ie->oui, ie->len);
+			dest_idx += ie->len;
 		}
 	}
 
@@ -775,24 +991,23 @@ static int morse_wiphy_connect(struct wiphy *wiphy, struct net_device *ndev,
 	struct morse_vif *mors_vif = netdev_priv(ndev);
 	struct morse *mors = wiphy_priv(wiphy);
 	struct morse_wiphy_connect_params params = {0};
+	enum morse_sme_state next = MORSE_SME_STATE_CONNECTING;
 	int ret;
 
 	mutex_lock(&mors->lock);
 
-	if (test_bit(MORSE_SME_STATE_CONNECTING, &mors_vif->sme_state)) {
-		ret = -EBUSY;
-		goto out;
-	}
+	mors->reuse_vif = false;
 
 	if (sme->prev_bssid) {
 		/* This is a roaming request, not an initial connection. */
 		params.roam = true;
-		if (WARN_ON(!test_bit(MORSE_SME_STATE_CONNECTED, &mors_vif->sme_state))) {
+		next = MORSE_SME_STATE_ROAMING;
+		if (WARN_ON(!morse_wiphy_is_connected(mors_vif))) {
 			ret = -ENOENT;
 			goto out;
 		}
 	} else {
-		if (test_bit(MORSE_SME_STATE_CONNECTED, &mors_vif->sme_state)) {
+		if (morse_wiphy_is_connected(mors_vif)) {
 			ret = -EBUSY;
 			goto out;
 		}
@@ -876,7 +1091,7 @@ static int morse_wiphy_connect(struct wiphy *wiphy, struct net_device *ndev,
 	if (ret)
 		goto out;
 
-	set_bit(MORSE_SME_STATE_CONNECTING, &mors_vif->sme_state);
+	morse_wiphy_set_state(mors_vif, next, __func__);
 
 out:
 	mutex_unlock(&mors->lock);
@@ -893,15 +1108,24 @@ static int morse_wiphy_disconnect(struct wiphy *wiphy, struct net_device *ndev, 
 
 	mutex_lock(&mors->lock);
 
-	if (!test_bit(MORSE_SME_STATE_CONNECTING, &mors_vif->sme_state) &&
-	    !test_bit(MORSE_SME_STATE_CONNECTED, &mors_vif->sme_state)) {
+	if (!morse_wiphy_is_connecting(mors_vif) &&
+	    !morse_wiphy_is_connected(mors_vif) &&
+	    !morse_wiphy_is_roaming(mors_vif)) {
 		ret = -EINVAL;
 		goto out;
 	}
 
-	ret = morse_cmd_disconnect(mors);
+	if (morse_wiphy_is_disconnecting(mors_vif)) {
+		ret = -EBUSY;
+		goto out;
+	}
 
-	if (test_and_clear_bit(MORSE_SME_STATE_CONNECTING, &mors_vif->sme_state)) {
+	ret = morse_cmd_disconnect(mors);
+	if (ret)
+		goto out;
+
+	if (morse_wiphy_is_connecting(mors_vif) ||
+	    morse_wiphy_is_roaming(mors_vif)) {
 		/* Cancelling a connection attempt while it is in progress. */
 		cfg80211_connect_timeout(ndev, /* bssid */ NULL,
 					 /* req_ie */ NULL, /* req_ie_len */ 0,
@@ -909,9 +1133,8 @@ static int morse_wiphy_disconnect(struct wiphy *wiphy, struct net_device *ndev, 
 #if KERNEL_VERSION(4, 11, 0) <= MAC80211_VERSION_CODE
 					 , NL80211_TIMEOUT_UNSPECIFIED
 #endif
-		    );
-
-		if (test_and_clear_bit(MORSE_SME_STATE_CONNECTED, &mors_vif->sme_state)) {
+		);
+		if (morse_wiphy_is_roaming(mors_vif)) {
 			/* The connection attempt being cancelled was a roam request. If we
 			 * received a DISCONNECTED event before this point, we suppressed it in
 			 * anticipation of the subsequent CONNECTED event when roaming finishes.
@@ -919,6 +1142,10 @@ static int morse_wiphy_disconnect(struct wiphy *wiphy, struct net_device *ndev, 
 			netif_carrier_off(ndev);
 			queue_work(mors->wiphy_wq, &mors_vif->disconnected_work);
 		}
+		morse_wiphy_set_state(mors_vif, MORSE_SME_STATE_IDLE, __func__);
+	} else {
+		/* Disconnecting from existing connection. */
+		morse_wiphy_set_state(mors_vif, MORSE_SME_STATE_DISCONNECTING, __func__);
 	}
 
 out:
@@ -934,15 +1161,9 @@ static int morse_wiphy_get_channel(struct wiphy *wiphy, struct wireless_dev *wde
 			     struct cfg80211_chan_def *chandef)
 {
 	struct morse *mors = wiphy_priv(wiphy);
-	int ret;
+	u8 pri_1mhz_chan_idx, op_bw_mhz, pri_bw_mhz;
 	u32 op_chan_freq_hz;
-	u8 op_bw_mhz;
-	u8 pri_bw_mhz;
-	u8 pri_1mhz_chan_idx;
-	int op_chan_s1g, pri_chan_s1g;
-	int op_chan_5g, pri_chan_5g;
-	u32 op_freq_5g;
-	enum nl80211_chan_width width_5g;
+	int ret;
 
 	mutex_lock(&mors->lock);
 
@@ -956,47 +1177,8 @@ static int morse_wiphy_get_channel(struct wiphy *wiphy, struct wireless_dev *wde
 	if (ret)
 		goto out;
 
-	/* Look up S1G channel numbers based on the channel info we received from the chip.
-	 */
-	op_chan_s1g = morse_dot11ah_freq_khz_bw_mhz_to_chan(HZ_TO_KHZ(op_chan_freq_hz), op_bw_mhz);
-	pri_chan_s1g = morse_dot11ah_calc_prim_s1g_chan(op_bw_mhz, 1, op_chan_s1g,
-							pri_1mhz_chan_idx);
-
-	/* Map to 5GHz channel info.
-	 */
-	op_chan_5g = morse_dot11ah_s1g_chan_to_5g_chan(op_chan_s1g);
-	pri_chan_5g = morse_dot11ah_s1g_op_chan_pri_chan_to_5g(op_chan_s1g, pri_chan_s1g);
-	op_freq_5g = ieee80211_channel_to_frequency(op_chan_5g, NL80211_BAND_5GHZ);
-	switch (op_bw_mhz) {
-	case 1:
-		width_5g = NL80211_CHAN_WIDTH_20_NOHT;
-		break;
-	case 2:
-		width_5g = NL80211_CHAN_WIDTH_40;
-		break;
-	case 4:
-		width_5g = NL80211_CHAN_WIDTH_80;
-		break;
-	case 8:
-		width_5g = NL80211_CHAN_WIDTH_160;
-		break;
-	default:
-		width_5g = WARN_ON(NL80211_CHAN_WIDTH_20_NOHT);
-	}
-
-	if (op_chan_5g == -ENOENT || pri_chan_5g == -ENOENT) {
-		/* This can happen if we observe the chip with its initial channel configuration,
-		 * which is not necessarily valid for the current regulatory domain.
-		 */
-		ret = -EINVAL;
-		goto out;
-	}
-
-	chandef->chan = morse_wiphy_get_5g_channel(wiphy, pri_chan_5g);
-	chandef->center_freq1 = op_freq_5g;
-	chandef->width = width_5g;
-	chandef->center_freq2 = 0;
-
+	ret = morse_wiphy_s1g_to_5g_chandef(mors, chandef, op_chan_freq_hz, pri_1mhz_chan_idx,
+					    op_bw_mhz, pri_bw_mhz);
 out:
 	mutex_unlock(&mors->lock);
 
@@ -1014,7 +1196,7 @@ static int morse_wiphy_get_station(struct wiphy *wiphy, struct net_device *ndev,
 
 	mutex_lock(&mors->lock);
 
-	if (!test_bit(MORSE_SME_STATE_CONNECTED, &mors_vif->sme_state)) {
+	if (!morse_wiphy_is_connected(mors_vif)) {
 		ret = -ENODEV;
 		goto out;
 	}
@@ -1102,7 +1284,7 @@ morse_wiphy_set_power_mgmt(struct wiphy *wiphy, struct net_device *dev, bool ena
 	struct morse_vif *mors_vif = netdev_priv(dev);
 	int ret;
 
-	if (!morse_mac_ps_enabled(mors))
+	if (!morse_ps_is_supported(mors))
 		return -EOPNOTSUPP;
 
 	mutex_lock(&mors->lock);
@@ -1157,16 +1339,195 @@ static void morse_wiphy_connected_update_rts(struct morse *mors, struct cfg80211
 	}
 }
 
+static void morse_wiphy_process_assoc_resp_ies(struct morse_vif *mors_vif,
+					       const u8 *assoc_resp_ies,
+					       const u16 assoc_resp_ies_len)
+{
+	struct dot11ah_ies_mask *ies_mask = NULL;
+	struct dot11_morse_vendor_caps_ops_ie *ie = NULL;
+
+	ies_mask = morse_dot11ah_ies_to_ies_mask(assoc_resp_ies, assoc_resp_ies_len);
+	if (!ies_mask)
+		return;
+
+	ie = morse_vendor_find_vendor_ie(ies_mask);
+	if (!ie)
+		goto out;
+
+	morse_vendor_fill_sta_vendor_info(mors_vif, ie);
+
+out:
+	morse_dot11ah_ies_mask_free(ies_mask);
+}
+
+/* Usually the hw sends SCAN_RESULT events during its connection process,
+ * so cfg80211 would already be informed about the BSS we are
+ * connecting to, by the time we receive the CONNECTED event. But it is
+ * possible to receive a CONNECTED event with no preceding SCAN_RESULT
+ * events, for example if we reattached to the hw and it was already
+ * connected. This function informs cfg80211 about the BSS in this case.
+ *
+ * We do not have a copy of the real probe response IEs here, so we need
+ * to synthesise IEs containing the minimal information cfg80211 expects.
+ *
+ * Caller takes ownership of the BSS reference on success.
+ */
+static struct cfg80211_bss *
+morse_wiphy_inform_bss_after_connected(struct morse *mors, const u8 *bssid)
+{
+	struct morse_vif *mors_vif = morse_wiphy_get_sta_vif(mors);
+	struct cfg80211_bss *bss = NULL;
+	struct cfg80211_chan_def chandef;
+	u8 ies[MORSE_CMD_SSID_MAX_LEN + 2];
+	u8 ies_len, ssid_len;
+	s8 signal, dtim_period;
+	u16 beacon_interval;
+	u32 connected_time;
+	u32 op_chan_freq_hz;
+	u8 pri_1mhz_chan_idx;
+	u8 op_bw_mhz, pri_bw_mhz;
+	u8 *ssid;
+	int ret;
+
+	lockdep_assert_held(&mors->lock);
+
+	ret = morse_cmd_get_connection_state(mors, &signal, &connected_time, &dtim_period,
+					     &beacon_interval);
+	if (ret)
+		goto out;
+
+	ret = morse_cmd_get_current_channel(mors, &op_chan_freq_hz, &pri_1mhz_chan_idx, &op_bw_mhz,
+					    &pri_bw_mhz);
+	if (ret)
+		goto out;
+
+	ret = morse_wiphy_s1g_to_5g_chandef(mors, &chandef, op_chan_freq_hz, pri_1mhz_chan_idx,
+					    op_bw_mhz, pri_bw_mhz);
+	if (ret)
+		goto out;
+
+	/* This assumes that the connection has been requested via NL80211_CMD_CONNECT */
+#if KERNEL_VERSION(6, 0, 0) > MAC80211_VERSION_CODE
+	WARN_ON(!mors_vif->wdev.ssid_len);
+	ssid = mors_vif->wdev.ssid;
+	ssid_len = mors_vif->wdev.ssid_len;
+#else
+	WARN_ON(!mors_vif->wdev.u.client.ssid_len);
+	ssid = mors_vif->wdev.u.client.ssid;
+	ssid_len = mors_vif->wdev.u.client.ssid_len;
+#endif
+	if (WARN_ON(ssid_len > MORSE_CMD_SSID_MAX_LEN))
+		ssid_len = MORSE_CMD_SSID_MAX_LEN;
+
+	memcpy(&ies[2], ssid, ssid_len);
+	ies_len = ssid_len + 2;
+	ies[0] = WLAN_EID_SSID;
+	ies[1] = ssid_len;
+	signal = DBM_TO_MBM(signal);
+	bss = cfg80211_inform_bss(mors->wiphy, chandef.chan, CFG80211_BSS_FTYPE_UNKNOWN, bssid,
+				  0, 0, beacon_interval, ies, ies_len, signal, GFP_KERNEL);
+
+out:
+	return bss;
+}
+
 /* Handle any firmware interactions needed after connection is first established.
- * Note that this is not called for the roaming case (connected while already connected).
  */
 static void morse_wiphy_connected_work(struct work_struct *work)
 {
 	struct morse_vif *mors_vif = container_of(work, struct morse_vif, connected_work);
 	struct morse *mors = wiphy_priv(mors_vif->wdev.wiphy);
+	struct net_device *ndev = mors_vif->ndev;
+	struct wiphy *wiphy = mors->wiphy;
+	struct cfg80211_bss *bss;
+	const u8 *bssid = mors_vif->connected_params->bssid;
+	const u8 *assoc_resp_ies = mors_vif->connected_params->assoc_resp_ies;
+	const u16 assoc_resp_ies_len = mors_vif->connected_params->assoc_resp_ies_len;
+	bool roamed = false;
 	int ret;
 
 	mutex_lock(&mors->lock);
+
+	if (morse_wiphy_is_roaming(mors_vif)) {
+		roamed = true;
+		MORSE_INFO(mors, "roamed to BSS %pM\n", bssid);
+	} else {
+		MORSE_INFO(mors, "connected to BSS %pM\n", bssid);
+	}
+
+	morse_wiphy_set_state(mors_vif, MORSE_SME_STATE_CONNECTED, __func__);
+
+	bss = cfg80211_get_bss(wiphy, NULL, bssid, NULL, 0,
+			       IEEE80211_BSS_TYPE_ANY, IEEE80211_PRIVACY_ANY);
+	if (!bss)
+		bss = morse_wiphy_inform_bss_after_connected(mors, bssid);
+	if (mors_vif->connected_bss)
+		cfg80211_put_bss(wiphy, mors_vif->connected_bss);
+	mors_vif->connected_bss = bss;
+
+	netif_carrier_on(ndev);
+
+	cfg80211_ref_bss(wiphy, bss);
+
+	if (!roamed) {
+#if KERNEL_VERSION(6, 0, 0) <= MAC80211_VERSION_CODE
+		struct cfg80211_connect_resp_params params = {
+			.status = WLAN_STATUS_SUCCESS,
+			.links[0].bssid = bssid,
+			.links[0].bss = bss,
+			.resp_ie = assoc_resp_ies,
+			.resp_ie_len = assoc_resp_ies_len,
+		};
+		cfg80211_connect_done(ndev, &params, GFP_KERNEL);
+#elif KERNEL_VERSION(4, 12, 0) <= MAC80211_VERSION_CODE
+		struct cfg80211_connect_resp_params params = {
+			.status = WLAN_STATUS_SUCCESS,
+			.bssid = bssid,
+			.bss = bss,
+			.resp_ie = assoc_resp_ies,
+			.resp_ie_len = assoc_resp_ies_len,
+		};
+		cfg80211_connect_done(ndev, &params, GFP_KERNEL);
+#elif KERNEL_VERSION(4, 11, 0) <= MAC80211_VERSION_CODE
+		cfg80211_connect_bss(ndev, bssid, bss, NULL, 0, assoc_resp_ies, assoc_resp_ies_len,
+				     WLAN_STATUS_SUCCESS, GFP_KERNEL, 0);
+#else
+		cfg80211_connect_bss(ndev, bssid, bss, NULL, 0, assoc_resp_ies, assoc_resp_ies_len,
+				     WLAN_STATUS_SUCCESS, GFP_KERNEL);
+#endif
+	} else {
+#if KERNEL_VERSION(6, 0, 0) <= MAC80211_VERSION_CODE
+		struct cfg80211_roam_info roam_info = {
+			.links[0].bssid = bssid,
+			.links[0].bss = bss,
+			.resp_ie = assoc_resp_ies,
+			.resp_ie_len = assoc_resp_ies_len,
+		};
+		cfg80211_roamed(ndev, &roam_info, GFP_KERNEL);
+#elif KERNEL_VERSION(4, 12, 0) <= MAC80211_VERSION_CODE
+		struct cfg80211_roam_info roam_info = {
+			.bss = bss,
+			.bssid = bssid,
+			.resp_ie = assoc_resp_ies,
+			.resp_ie_len = assoc_resp_ies_len,
+		};
+		cfg80211_roamed(ndev, &roam_info, GFP_KERNEL);
+#else
+		cfg80211_roamed_bss(ndev, bss, NULL, 0, assoc_resp_ies, assoc_resp_ies_len,
+				    GFP_KERNEL);
+#endif
+	}
+
+	if (assoc_resp_ies_len)
+		morse_wiphy_process_assoc_resp_ies(mors_vif, assoc_resp_ies, assoc_resp_ies_len);
+
+	/* TODO: this should only be called if we connected with SAE (or OWE?) */
+#if (KERNEL_VERSION(6, 2, 0) <= MAC80211_VERSION_CODE) || \
+	(defined(CONFIG_ANDROID) && (KERNEL_VERSION(6, 1, 25) <= LINUX_VERSION_CODE))
+	cfg80211_port_authorized(ndev, bssid, NULL, 0, GFP_KERNEL);
+#elif KERNEL_VERSION(4, 15, 0) <= MAC80211_VERSION_CODE
+	cfg80211_port_authorized(ndev, bssid, GFP_KERNEL);
+#endif
 
 	if (mors_vif->connected_bss)
 		morse_wiphy_connected_update_rts(mors, mors_vif->connected_bss);
@@ -1178,6 +1539,9 @@ static void morse_wiphy_connected_work(struct work_struct *work)
 		if (ret)
 			MORSE_WARN(mors, "Failed to enable in-chip DHCP client\n");
 	}
+
+	kfree(mors_vif->connected_params);
+	mors_vif->connected_params = NULL;
 
 	mutex_unlock(&mors->lock);
 }
@@ -1199,13 +1563,30 @@ static void morse_wiphy_disconnected_update_rts(struct morse *mors)
 	}
 }
 
-static void morse_wiphy_disconnected_work(struct work_struct *work)
+void morse_wiphy_disconnected_work_nolock(struct morse *mors,
+					  struct morse_vif *mors_vif, bool autoconnect)
 {
-	struct morse_vif *mors_vif = container_of(work, struct morse_vif, disconnected_work);
-	struct morse *mors = wiphy_priv(mors_vif->wdev.wiphy);
 	struct wiphy *wiphy = mors_vif->wdev.wiphy;
+	struct net_device *ndev = mors_vif->ndev;
 
-	mutex_lock(&mors->lock);
+	lockdep_assert_held(&mors->lock);
+
+	if (morse_wiphy_is_disconnecting(mors_vif))
+		autoconnect = false;
+	if (!morse_wiphy_set_state(mors_vif, MORSE_SME_STATE_IDLE, __func__))
+		return;
+
+	MORSE_INFO(mors, "disconnected\n");
+
+	netif_carrier_off(ndev);
+
+	if (autoconnect)
+		morse_wiphy_set_state(mors_vif, MORSE_SME_STATE_CONNECTING, __func__);
+	else
+		/* TODO: get reason, deassoc/deauth IEs */
+		cfg80211_disconnected(ndev, WLAN_REASON_UNSPECIFIED,
+				      /* ie */ NULL, /* ie_len */ 0,
+				      /* locally_generated */ false, GFP_KERNEL);
 
 	morse_wiphy_disconnected_update_rts(mors);
 
@@ -1215,7 +1596,15 @@ static void morse_wiphy_disconnected_work(struct work_struct *work)
 		mors_vif->connected_bss = NULL;
 	}
 	mors_vif->bss_vendor_info.valid = false;
+}
 
+static void morse_wiphy_disconnected_work(struct work_struct *work)
+{
+	struct morse_vif *mors_vif = container_of(work, struct morse_vif, disconnected_work);
+	struct morse *mors = wiphy_priv(mors_vif->wdev.wiphy);
+
+	mutex_lock(&mors->lock);
+	morse_wiphy_disconnected_work_nolock(mors, mors_vif, mors_vif->autoconnect);
 	mutex_unlock(&mors->lock);
 }
 
@@ -1357,7 +1746,7 @@ morse_wiphy_interface_change(struct wiphy *wiphy, struct net_device *ndev,
 
 	switch (wdev->iftype) {
 	case NL80211_IFTYPE_STATION:
-		if (test_bit(MORSE_SME_STATE_CONNECTED, &mors_vif->sme_state))
+		if (morse_wiphy_is_connected(mors_vif))
 			/* 4-address mode must be configured before connecting. */
 			return -EBUSY;
 		break;
@@ -1613,6 +2002,8 @@ int morse_wiphy_register(struct morse *mors)
 	u32 flags = 0;
 #endif
 
+	mors->reuse_vif = morse_wiphy_should_reuse_vif(mors);
+
 	ret = wiphy_register(wiphy);
 	if (ret < 0)
 		dev_info(dev, "wiphy_register fail\r\n");
@@ -1660,14 +2051,15 @@ void morse_wiphy_cleanup(struct morse *mors)
 	if (ndev)
 		netif_carrier_off(ndev);
 
-	if (mors_vif && test_and_clear_bit(MORSE_SME_STATE_CONNECTED, &mors_vif->sme_state)) {
+	if (mors_vif &&
+	    (morse_wiphy_is_connected(mors_vif) ||
+	     morse_wiphy_is_disconnecting(mors_vif))) {
+		morse_wiphy_set_state(mors_vif, MORSE_SME_STATE_IDLE, __func__);
 		cfg80211_disconnected(ndev, WLAN_REASON_UNSPECIFIED,
 				      NULL, 0, disconnect_locally_generated, GFP_KERNEL);
-		morse_ps_wakers_inc(mors);
-		morse_ps_queue_eval(mors);
 	}
 
-	if (mors_vif && test_and_clear_bit(MORSE_SME_STATE_CONNECTING, &mors_vif->sme_state))
+	if (mors_vif && morse_wiphy_is_connecting(mors_vif))
 		cfg80211_connect_timeout(ndev, NULL, NULL, 0, GFP_KERNEL
 #if KERNEL_VERSION(4, 11, 0) <= MAC80211_VERSION_CODE
 					 , NL80211_TIMEOUT_UNSPECIFIED
@@ -1682,16 +2074,30 @@ void morse_wiphy_cleanup(struct morse *mors)
 		mors->scan_req = NULL;
 	}
 	clear_bit(MORSE_SCAN_STATE_ABORTED, &mors->scan_state);
+	if (mors_vif && !morse_wiphy_is_idle(mors_vif))
+		morse_wiphy_set_state(mors_vif, MORSE_SME_STATE_IDLE, __func__);
 	mors->wiphy_started = false;
 }
 
 void morse_wiphy_restarted(struct morse *mors)
 {
+	const u32 channelization_scheme = morse_dot11ah_get_channelization_scheme();
 	struct wiphy *wiphy = mors->wiphy;
 	u32 rts_threshold;
 	int ret;
 
 	lockdep_assert_held(&mors->lock);
+
+	ret = morse_cmd_set_channelization_scheme(mors, channelization_scheme);
+	if (ret == MORSE_RET_CMD_NOT_HANDLED &&
+	    channelization_scheme == CHANNELIZATION_SCHEME_IEEE80211_2020) {
+		/*
+		 * Firmware does not support selecting channelization scheme.
+		 * Ignore the error and let it use 2020.
+		 */
+	} else if (ret) {
+		MORSE_ERR(mors, "error setting channelization scheme after restart: %d\n", ret);
+	}
 
 	ret = morse_cmd_set_country(mors, mors->country);
 	if (ret)
@@ -1784,6 +2190,11 @@ void morse_wiphy_deinit(struct morse *mors)
 
 		unregister_inetaddr_notifier(&mors_vif->arp_filter.ifa_notifier);
 		unregister_netdevice_queue(mors_vif->ndev, &unreg_list);
+
+		if (sta_vif == mors_vif)
+			sta_vif = NULL;
+		else if (wdev->iftype == NL80211_IFTYPE_MONITOR)
+			mors->monitor_mode = false;
 	}
 	unregister_netdevice_many(&unreg_list);
 	rtnl_unlock();
@@ -1820,6 +2231,9 @@ void morse_wiphy_rx(struct morse *mors, struct sk_buff *skb)
 	struct morse_vif *mors_vif = sta_vif;
 	struct net_device *ndev = mors_vif->ndev;
 
+	if (!mors->wiphy_started)
+		return;
+
 	skb->dev = ndev;
 	skb->protocol = eth_type_trans(skb, ndev);
 	ndev->stats.rx_packets++;
@@ -1840,6 +2254,9 @@ morse_wiphy_rx_mgmt(struct morse *mors,
 	u32 freq_5g, freq_s1g, bw_s1g, chan_s1g, chan_5g;
 	struct wireless_dev *wdev = &mors_vif->wdev;
 	enum dot11_bandwidth bw_idx;
+
+	if (!mors->wiphy_started)
+		return;
 
 	freq_s1g = KHZ100_TO_KHZ(le16_to_cpu(hdr_rx_status->freq_100khz));
 	bw_idx = morse_ratecode_bw_index_get(hdr_rx_status->morse_ratecode);
@@ -1901,6 +2318,9 @@ int morse_wiphy_scan_result(struct morse *mors, struct morse_cmd_evt_scan_result
 	int ies_11n_len = 0;
 	s32 signal;
 	int ret;
+
+	if (!mors->wiphy_started)
+		return -EINVAL;
 
 	chan_s1g = morse_dot11ah_s1g_freq_to_s1g(le32_to_cpu(result->channel_freq_hz),
 						 result->bw_mhz);
@@ -1965,146 +2385,44 @@ void morse_wiphy_scan_done(struct morse *mors, bool aborted)
 	queue_work(mors->wiphy_wq, &mors->scan_done_work);
 }
 
-static void morse_wiphy_process_assoc_resp_ies(struct morse_vif *mors_vif,
-					       const u8 *assoc_resp_ies,
-					       const u16 assoc_resp_ies_len)
-{
-	struct dot11ah_ies_mask *ies_mask = NULL;
-	struct dot11_morse_vendor_caps_ops_ie *ie = NULL;
-
-	ies_mask = morse_dot11ah_ies_to_ies_mask(assoc_resp_ies, assoc_resp_ies_len);
-	if (!ies_mask)
-		return;
-
-	ie = morse_vendor_find_vendor_ie(ies_mask);
-	if (!ie)
-		goto out;
-
-	morse_vendor_fill_sta_vendor_info(mors_vif, ie);
-
-out:
-	morse_dot11ah_ies_mask_free(ies_mask);
-}
-
 void morse_wiphy_connected(struct morse *mors, const u8 *bssid,
 			   const u8 *assoc_resp_ies, u16 assoc_resp_ies_len)
 {
 	struct morse_vif *mors_vif = sta_vif;
-	struct net_device *ndev = mors_vif->ndev;
-	struct wiphy *wiphy = mors->wiphy;
-	struct cfg80211_bss *bss;
-	bool roamed = false;
 
-	if (test_and_set_bit(MORSE_SME_STATE_CONNECTED, &mors_vif->sme_state)) {
-		roamed = true;
-		MORSE_INFO(mors, "roamed to BSS %pM\n", bssid);
-	} else {
-		MORSE_INFO(mors, "connected to BSS %pM\n", bssid);
-	}
-	WARN_ON(!test_and_clear_bit(MORSE_SME_STATE_CONNECTING, &mors_vif->sme_state));
+	if (!mors->wiphy_started)
+		return;
 
-	bss = cfg80211_get_bss(wiphy, NULL, bssid, NULL, 0,
-			       IEEE80211_BSS_TYPE_ANY, IEEE80211_PRIVACY_ANY);
-	/* The firmware should have informed us about the BSS via a "scan result" event
-	 * before this "connected" event was received, so it should exist in the BSS cache.
-	 */
-	WARN_ON(!bss);
-	if (mors_vif->connected_bss)
-		cfg80211_put_bss(wiphy, mors_vif->connected_bss);
-	mors_vif->connected_bss = bss;
+	if (mors->reuse_vif)
+		return;
 
-	netif_carrier_on(ndev);
+	mors_vif->connected_params =
+	    kzalloc(sizeof(struct morse_connected_evt_params) + assoc_resp_ies_len, GFP_KERNEL);
+	if (WARN_ON(!mors_vif->connected_params))
+		return;
 
-	cfg80211_ref_bss(wiphy, bss);
-	if (!roamed) {
-#if KERNEL_VERSION(6, 0, 0) <= MAC80211_VERSION_CODE
-		struct cfg80211_connect_resp_params params = {
-			.status = WLAN_STATUS_SUCCESS,
-			.links[0].bssid = bssid,
-			.links[0].bss = bss,
-			.resp_ie = assoc_resp_ies,
-			.resp_ie_len = assoc_resp_ies_len,
-		};
-		cfg80211_connect_done(ndev, &params, GFP_KERNEL);
-#elif KERNEL_VERSION(4, 12, 0) <= MAC80211_VERSION_CODE
-		struct cfg80211_connect_resp_params params = {
-			.status = WLAN_STATUS_SUCCESS,
-			.bssid = bssid,
-			.bss = bss,
-			.resp_ie = assoc_resp_ies,
-			.resp_ie_len = assoc_resp_ies_len,
-		};
-		cfg80211_connect_done(ndev, &params, GFP_KERNEL);
-#elif KERNEL_VERSION(4, 11, 0) <= MAC80211_VERSION_CODE
-		cfg80211_connect_bss(ndev, bssid, bss, NULL, 0, assoc_resp_ies, assoc_resp_ies_len,
-				     WLAN_STATUS_SUCCESS, GFP_KERNEL, 0);
-#else
-		cfg80211_connect_bss(ndev, bssid, bss, NULL, 0, assoc_resp_ies, assoc_resp_ies_len,
-				     WLAN_STATUS_SUCCESS, GFP_KERNEL);
-#endif
-	} else {
-#if KERNEL_VERSION(6, 0, 0) <= MAC80211_VERSION_CODE
-		struct cfg80211_roam_info roam_info = {
-			.links[0].bssid = bssid,
-			.links[0].bss = bss,
-			.resp_ie = assoc_resp_ies,
-			.resp_ie_len = assoc_resp_ies_len,
-		};
-		cfg80211_roamed(ndev, &roam_info, GFP_KERNEL);
-#elif KERNEL_VERSION(4, 12, 0) <= MAC80211_VERSION_CODE
-		struct cfg80211_roam_info roam_info = {
-			.bss = bss,
-			.bssid = bssid,
-			.resp_ie = assoc_resp_ies,
-			.resp_ie_len = assoc_resp_ies_len,
-		};
-		cfg80211_roamed(ndev, &roam_info, GFP_KERNEL);
-#else
-		cfg80211_roamed_bss(ndev, bss, NULL, 0, assoc_resp_ies, assoc_resp_ies_len,
-				    GFP_KERNEL);
-#endif
-	}
+	memcpy(mors_vif->connected_params->bssid, bssid, ETH_ALEN);
+	mors_vif->connected_params->assoc_resp_ies_len = assoc_resp_ies_len;
+	memcpy(mors_vif->connected_params->assoc_resp_ies, assoc_resp_ies, assoc_resp_ies_len);
 
-	if (assoc_resp_ies_len)
-		morse_wiphy_process_assoc_resp_ies(mors_vif, assoc_resp_ies, assoc_resp_ies_len);
-
-/* TODO: this should only be called if we connected with SAE (or OWE?) */
-#if (KERNEL_VERSION(6, 2, 0) <= MAC80211_VERSION_CODE) || \
-	(defined(CONFIG_ANDROID) && (KERNEL_VERSION(6, 1, 25) <= LINUX_VERSION_CODE))
-	cfg80211_port_authorized(ndev, bssid, NULL, 0, GFP_KERNEL);
-#elif KERNEL_VERSION(4, 15, 0) <= LINUX_VERSION_CODE
-	cfg80211_port_authorized(ndev, bssid, GFP_KERNEL);
-#endif
-
-	if (!roamed)
-		queue_work(mors->wiphy_wq, &mors_vif->connected_work);
+	queue_work(mors->wiphy_wq, &mors_vif->connected_work);
 }
 
 void morse_wiphy_disconnected(struct morse *mors)
 {
 	struct morse_vif *mors_vif = sta_vif;
-	struct net_device *ndev = mors_vif->ndev;
 
 	if (!mors->wiphy_started)
 		return;
 
-	if (test_bit(MORSE_SME_STATE_CONNECTING, &mors_vif->sme_state))
+	if (mors->reuse_vif)
+		return;
+
+	if (morse_wiphy_is_roaming(mors_vif))
 		/* Roaming is in progress, so the chip is already trying to connect
 		 * to the new BSS.
 		 */
 		return;
-
-	if (WARN_ON(!test_and_clear_bit(MORSE_SME_STATE_CONNECTED, &mors_vif->sme_state)))
-		return;
-
-	MORSE_INFO(mors, "disconnected\n");
-
-	netif_carrier_off(ndev);
-
-	/* TODO: get reason, deassoc/deauth IEs */
-	cfg80211_disconnected(ndev, WLAN_REASON_UNSPECIFIED,
-			      /* ie */ NULL, /* ie_len */ 0,
-			      /* locally_generated */ false, GFP_KERNEL);
 
 	queue_work(mors->wiphy_wq, &mors_vif->disconnected_work);
 }

@@ -22,6 +22,9 @@
 #include "firmware.h"
 #include "of.h"
 #include "crc16_xmodem.h"
+#include "mem_access.h"
+#include "ps.h"
+#include "sysfs.h"
 
 #ifdef CONFIG_MORSE_USER_ACCESS
 #include "uaccess.h"
@@ -127,9 +130,9 @@ struct uaccess *morse_spi_uaccess;
  * during write operations. This will clock the SDIO/SPI hardware for a longer duration,
  * giving the chip more time to process and respond to CMDs.
  *
- * Derived using a 50MHz bus speed, and 32KHz external crystal oscillator.
+ * Derived using a 50 MHz bus speed, and 32 kHz external crystal oscillator.
  */
-#define XTAL_TRANSFER_DELAY_BYTES	(2 * 1024U)
+#define XTAL_TRANSFER_DELAY_BYTES	(4 * 1024U)
 
 /* SW-5611:
  *
@@ -145,7 +148,7 @@ struct uaccess *morse_spi_uaccess;
 #define MAX_SUPPORTED_SPI_CLK_SPEED	(50000000)
 #define SPI_CLK_PERIOD_NANO_S(clk_mhz)	(1000000000 / (clk_mhz))
 
-#define SPI_DEFAULT_MAX_INTER_BLOCK_DELAY_BYTES	250
+#define SPI_DEFAULT_INTER_BLOCK_DELAY_NANO_S	(40000)
 
 /* Value to indicate that the base address for bulk/register read/writes has yet to be set */
 #define MORSE_SPI_BASE_ADDR_UNSET 0xFFFFFFFF
@@ -165,6 +168,15 @@ MODULE_PARM_DESC(spi_clock_speed, "SPI clock speed in Hz");
 static uint spi_inter_block_delay_bytes;
 module_param(spi_inter_block_delay_bytes, uint, 0644);
 MODULE_PARM_DESC(spi_inter_block_delay_bytes, "SPI inter block delay in number of bytes");
+
+/*
+ * Status bytes appended to CMD53 writes to the chip, to give the chip enough clock cycles to
+ * emit the response token. May need to be increased when using old (4.x) kernels.
+ */
+static uint spi_post_write_status_bytes = 4;
+module_param(spi_post_write_status_bytes, uint, 0644);
+MODULE_PARM_DESC(spi_post_write_status_bytes,
+		 "Status bytes appended after a byte-mode CMD53 write");
 
 /* SPI bus edge IRQ compatibility mode */
 static bool spi_use_edge_irq;
@@ -187,6 +199,8 @@ static const struct of_device_id morse_spi_of_match[] = {
 
 MODULE_DEVICE_TABLE(of, morse_spi_of_match);
 
+static int morse_spi_probe(struct spi_device *spi);
+
 static int morse_spi_setup(struct spi_device *spi, u32 max_speed_hz)
 {
 	int ret;
@@ -208,7 +222,7 @@ static int morse_spi_setup(struct spi_device *spi, u32 max_speed_hz)
 
 	ret = spi_setup(spi);
 	if (ret < 0) {
-		dev_dbg(&spi->dev, "needs SPI mode %02x, %d KHz; %d\n",
+		dev_dbg(&spi->dev, "needs SPI mode %02x, %d kHz; %d\n",
 			spi->mode, spi->max_speed_hz / 1000, ret);
 		return ret;
 	}
@@ -694,7 +708,10 @@ static int morse_spi_cmd53_write(struct morse_spi *mspi, u8 fn, u32 address, u8 
 		cp += sizeof(crc);
 
 		/* Allow more bytes for status and chip processing (depends on CLK) */
-		cp += block ? mspi->inter_block_delay_bytes : 4;
+		if (block)
+			cp += mspi->inter_block_delay_bytes;
+		else
+			cp += spi_post_write_status_bytes;
 	}
 
 	if (enable_ext_xtal_init) {
@@ -1116,6 +1133,27 @@ static int morse_spi_reg32_read(struct morse *mors, u32 address, u32 *value)
 	return -EIO;
 }
 
+static void morse_spi_set_inter_block_delay(struct morse *mors, bool burst_enabled)
+{
+	struct morse_spi *mspi = (struct morse_spi *)mors->drv_priv;
+
+	if (spi_inter_block_delay_bytes)
+		mspi->inter_block_delay_bytes = spi_inter_block_delay_bytes;
+	else
+		mspi->inter_block_delay_bytes =
+			mors->cfg->get_spi_inter_block_delay_ns(burst_enabled) /
+			((SPI_CLK_PERIOD_NANO_S(mspi->spi->max_speed_hz) * 8));
+
+	mspi->max_block_count =
+		SPI_MAX_TRANSACTION_SIZE /
+		(MMC_SPI_BLOCKSIZE + mspi->inter_block_delay_bytes);
+}
+
+static int morse_spi_request_mem_access(struct morse *mors, u32 address, int len)
+{
+	return mem_access_request(mors, morse_spi_set_inter_block_delay, address, len);
+}
+
 static irqreturn_t morse_spi_irq_handler(int irq, struct morse_spi *mspi)
 {
 	int ret = 0;
@@ -1130,7 +1168,7 @@ static irqreturn_t morse_spi_irq_handler(int irq, struct morse_spi *mspi)
 		morse_claim_bus(mors);
 		ret = morse_hw_irq_handle(mors);
 		morse_release_bus(mors);
-	} while (spi_use_edge_irq && ret && !gpio_get_value(mors->cfg->mm_spi_irq_gpio));
+	} while (spi_use_edge_irq && ret && !gpio_get_value(mors->cfg->gpios.spi_irq));
 
 	return IRQ_HANDLED;
 }
@@ -1140,7 +1178,7 @@ static void morse_spi_enable_irq(struct morse_spi *mspi)
 	struct spi_device *spi = mspi->spi;
 	struct morse *mors = spi_get_drvdata(spi);
 
-	if (spi->irq == gpio_to_irq(mors->cfg->mm_spi_irq_gpio))
+	if (spi->irq == gpio_to_irq(mors->cfg->gpios.spi_irq))
 		enable_irq(spi->irq);
 }
 
@@ -1149,7 +1187,7 @@ static void morse_spi_disable_irq(struct morse_spi *mspi)
 	struct spi_device *spi = mspi->spi;
 	struct morse *mors = spi_get_drvdata(spi);
 
-	if (spi->irq == gpio_to_irq(mors->cfg->mm_spi_irq_gpio))
+	if (spi->irq == gpio_to_irq(mors->cfg->gpios.spi_irq))
 		disable_irq(spi->irq);
 }
 
@@ -1160,15 +1198,15 @@ static int morse_spi_setup_irq(struct morse_spi *mspi)
 	struct morse *mors = spi_get_drvdata(spi);
 
 	/* Register GPIO IRQ */
-	ret = gpio_request(mors->cfg->mm_spi_irq_gpio, "mm610x_spi_irq_gpio");
+	ret = gpio_request(mors->cfg->gpios.spi_irq, "mm610x_spi_irq_gpio");
 	if (ret < 0) {
 		MORSE_PR_ERR(FEATURE_ID_SPI, "Failed to acquire spi irq gpio.\n");
 		return ret;
 	}
 
 	/* Setup pull-down */
-	gpio_direction_input(mors->cfg->mm_spi_irq_gpio);
-	spi->irq = gpio_to_irq(mors->cfg->mm_spi_irq_gpio);
+	gpio_direction_input(mors->cfg->gpios.spi_irq);
+	spi->irq = gpio_to_irq(mors->cfg->gpios.spi_irq);
 
 	/* Enable interrupts from Chip */
 	ret = morse_spi_cmd52(mspi, SPI_SDIO_FUNC_0,
@@ -1194,7 +1232,7 @@ static void morse_spi_remove_irq(struct morse_spi *mspi)
 
 	free_irq(spi->irq, mspi);
 	spi->irq = 0;
-	gpio_free(mors->cfg->mm_spi_irq_gpio);
+	gpio_free(mors->cfg->gpios.spi_irq);
 }
 
 static void morse_spi_set_irq(struct morse *mors, bool enable)
@@ -1209,10 +1247,15 @@ static void morse_spi_set_irq(struct morse *mors, bool enable)
 
 static void morse_spi_reset(int reset_pin, struct spi_device *spi)
 {
+	unsigned int delay_ms = 80;
+
+	if (enable_ext_xtal_init)
+		delay_ms = 100;
+
 	morse_hw_reset(reset_pin);
 
 	/* Introduce a short delay to make sure the chip/SPI controller is fully reset */
-	mdelay(50);
+	mdelay(delay_ms);
 }
 
 #if KERNEL_VERSION(5, 18, 0) > LINUX_VERSION_CODE
@@ -1223,14 +1266,20 @@ static void morse_spi_remove(struct spi_device *spi)
 {
 	struct morse *mors;
 	int ret;
-	bool reattach_hw = morse_hw_should_reattach();
-	bool is_hw_detached = reattach_hw;
+	int reset_gpio = -1;
+	bool detach_hw;
+	bool is_hw_detached = false;
 
 	mors = spi_get_drvdata(spi);
 	if (mors) {
 		struct morse_spi *mspi = (struct morse_spi *)mors->drv_priv;
 
+		reset_gpio = mors->cfg->gpios.reset;
+		detach_hw = morse_hw_can_detach(mors);
+		is_hw_detached = detach_hw;
+
 		if (morse_test_mode_is_interactive(test_mode)) {
+			morse_mac_health_check_finish(mors);
 			morse_mac_unregister(mors);
 			morse_spi_disable_irq(mspi);
 			mors->cfg->ops->finish(mors);
@@ -1238,7 +1287,7 @@ static void morse_spi_remove(struct spi_device *spi)
 			destroy_workqueue(mors->chip_wq);
 			flush_workqueue(mors->net_wq);
 			destroy_workqueue(mors->net_wq);
-			if (reattach_hw) {
+			if (detach_hw) {
 				/* Trigger detach interrupt but don't wait for it since
 				 * we are removing the driver anyway
 				 */
@@ -1263,13 +1312,14 @@ static void morse_spi_remove(struct spi_device *spi)
 		uaccess_cleanup(morse_spi_uaccess);
 		morse_spi_uaccess = NULL;
 #endif
+		morse_sysfs_finish(mors);
 		morse_mac_destroy(mors);
 		dev_set_drvdata(&spi->dev, NULL);
 	}
 
 	dev_info(&spi->dev, "Morse SPI device removed\n");
-	if (!is_hw_detached)
-		morse_spi_reset(mors->cfg->mm_reset_gpio, spi);
+	if (!is_hw_detached && reset_gpio >= 0)
+		morse_spi_reset(reset_gpio, spi);
 #if KERNEL_VERSION(5, 18, 0) > LINUX_VERSION_CODE
 	return 0;
 #endif
@@ -1293,13 +1343,13 @@ static void morse_spi_release_bus(struct morse *mors)
 
 static int morse_spi_bus_reset(struct morse *mors)
 {
-	int ret = 0;
 	struct morse_spi *mspi = (struct morse_spi *)mors->drv_priv;
 	struct spi_device *spi = mspi->spi;
 
+	mors->recovery.ignore_detach = true;
 	morse_spi_remove(spi);
 
-	return ret;
+	return morse_spi_probe(spi);
 }
 
 static void morse_spi_bus_enable(struct morse *mors, bool enable)
@@ -1320,34 +1370,10 @@ static void morse_spi_bus_enable(struct morse *mors, bool enable)
 
 static void morse_spi_config_burst_mode(struct morse *mors, bool enable_burst)
 {
-	s32 inter_block_delay_nano_s;
-	struct morse_spi *mspi = (struct morse_spi *)mors->drv_priv;
-	u8 burst_mode = (enable_burst) ? SDIO_WORD_BURST_SIZE_16 : SDIO_WORD_BURST_DISABLE;
+	if (mors->cfg->enable_sdio_burst_mode)
+		mors->cfg->enable_sdio_burst_mode(mors, enable_burst);
 
-	if (!mors->cfg->enable_sdio_burst_mode)
-		return;
-
-	inter_block_delay_nano_s = mors->cfg->enable_sdio_burst_mode(mors, burst_mode);
-
-	if (spi_inter_block_delay_bytes) {
-		/*
-		 * Set the inter block delay bytes based on
-		 * the mod param specified value
-		 */
-		mspi->inter_block_delay_bytes = spi_inter_block_delay_bytes;
-	} else if (inter_block_delay_nano_s > 0) {
-		/*
-		 * No Errors detected, therefore, the value returned
-		 * can be used to set the inter block delay
-		 */
-		mspi->inter_block_delay_bytes =
-			inter_block_delay_nano_s /
-			((SPI_CLK_PERIOD_NANO_S(mspi->spi->max_speed_hz) * 8));
-	}
-
-	mspi->max_block_count =
-		SPI_MAX_TRANSACTION_SIZE /
-		(MMC_SPI_BLOCKSIZE + mspi->inter_block_delay_bytes);
+	morse_spi_set_inter_block_delay(mors, enable_burst);
 }
 
 static const struct morse_bus_ops morse_spi_ops = {
@@ -1355,6 +1381,7 @@ static const struct morse_bus_ops morse_spi_ops = {
 	.dm_write = morse_spi_dm_write,
 	.reg32_read = morse_spi_reg32_read,
 	.reg32_write = morse_spi_reg32_write,
+	.request_mem_access = morse_spi_request_mem_access,
 	.set_bus_enable = morse_spi_bus_enable,
 	.claim = morse_spi_claim_bus,
 	.release = morse_spi_release_bus,
@@ -1367,17 +1394,23 @@ static const struct morse_bus_ops morse_spi_ops = {
 static int morse_spi_probe(struct spi_device *spi)
 {
 	int i, ret = 0;
+	int reset_gpio = -1;
 	struct morse *mors = NULL;
 	struct morse_spi *mspi;
+	struct morse_gpios gpios;
 	const struct of_device_id *match;
 	struct morse_chip_series *mors_chip_series;
+	bool health_check_init_done = false;
+	bool ps_initiated = false;
 	bool irq_enabled = false;
 	bool if_initiated = false;
 	bool mspi_data_allocated = false;
 	bool uaccess_allocated = false;
 	bool uaccess_registered = false;
+	bool sysfs_init = false;
 	const bool reset_hw = false;
 	bool attach = false;
+	bool attach_failed = false;
 
 	match = of_match_device(of_match_ptr(morse_spi_of_match), &spi->dev);
 	if (match)
@@ -1398,6 +1431,13 @@ static int morse_spi_probe(struct spi_device *spi)
 		return -ENOMEM;
 	}
 
+	ret = morse_sysfs_init(mors);
+	if (ret) {
+		dev_err(&spi->dev, "morse_sysfs_init failed: %d\n", ret);
+		goto err_exit;
+	}
+	sysfs_init = true;
+
 	morse_hw_headless_init(mors);
 
 	/* update chip configuration */
@@ -1416,13 +1456,11 @@ static int morse_spi_probe(struct spi_device *spi)
 	mspi_data_allocated = true;
 
 	mspi->spi = spi;
+	mspi->inter_block_delay_bytes =
+		SPI_DEFAULT_INTER_BLOCK_DELAY_NANO_S /
+		((SPI_CLK_PERIOD_NANO_S(mspi->spi->max_speed_hz) * 8));
 
 	morse_spi_reset_base_address(mspi);
-
-	/* let's first assign the default value, before enabling burst mode */
-	mspi->inter_block_delay_bytes = SPI_DEFAULT_MAX_INTER_BLOCK_DELAY_BYTES;
-	mspi->max_block_count =
-	    SPI_MAX_TRANSACTION_SIZE / (MMC_SPI_BLOCKSIZE + mspi->inter_block_delay_bytes);
 
 	mutex_init(&mspi->lock);
 	mutex_init(&mspi->bus_lock);
@@ -1430,7 +1468,8 @@ static int morse_spi_probe(struct spi_device *spi)
 
 	if (enable_ext_xtal_init) {
 		/* Under usual init the morse chip series for a SPI device is derived
-		 * by reading the chip id address as part of `morse_chip_cfg_detect_and_init()`.
+		 * from the compatible string and the config is set and validated
+		 * as part of `morse_chip_cfg_set_and_validate()`.
 		 *
 		 * When the chip requires external XTAL init, reading registers will not be
 		 * possible until the XTAL init process has completed. Due to this, assume the
@@ -1439,10 +1478,32 @@ static int morse_spi_probe(struct spi_device *spi)
 		 * External XTAL delays must be enabled prior to attempting SDIO to SPI
 		 * (CMD63) init sequence.
 		 */
-		morse_chip_cfg_init(mors, MM6108A2_ID);
+		ret = morse_chip_cfg_init(mors, MM6108A2_ID);
+		if (ret) {
+			MORSE_SPI_ERR(mors, "morse_chip_cfg_init failed: %d\n", ret);
+			goto err_exit;
+		}
 		if (mors->cfg->enable_ext_xtal_delay)
 			mors->cfg->enable_ext_xtal_delay(mors, true);
 	}
+
+	/* setting gpio pin configs from device tree */
+	if (morse_of_probe(&spi->dev, &gpios, morse_spi_of_match) < 0)
+		goto err_exit;
+
+	if (gpios.reset < 0) {
+		MORSE_SPI_ERR(mors, "Required property reset-gpios not found in device tree\n");
+		goto err_exit;
+	}
+
+	if (gpios.spi_irq < 0) {
+		MORSE_SPI_ERR(mors, "Required property spi-irq-gpios not found in device tree\n");
+		goto err_exit;
+	}
+	reset_gpio = gpios.reset;
+
+	if (!morse_hw_should_reattach())
+		morse_spi_reset(reset_gpio, spi);
 
 	/* spi init */
 #if KERNEL_VERSION(6, 1, 21) <= LINUX_VERSION_CODE
@@ -1487,21 +1548,16 @@ static int morse_spi_probe(struct spi_device *spi)
 		mors->cfg->digital_reset(mors);
 	}
 
-	ret = morse_chip_cfg_detect_and_init(mors, mors_chip_series);
+	ret = morse_chip_cfg_set_and_validate(mors, mors_chip_series);
 	if (ret) {
-		MORSE_SPI_ERR(mors, "morse_chip_cfg_detect_and_init failed: %d\n", ret);
+		MORSE_SPI_ERR(mors, "morse_chip_cfg_set_and_validate failed: %d\n", ret);
 		goto err_exit;
 	}
 	MORSE_SPI_INFO(mors, "Morse Micro SPI device found, chip ID=0x%04x\n", mors->chip_id);
 
-	/* setting gpio pin configs from device tree */
-	if (morse_of_probe(&spi->dev, mors->cfg, morse_spi_of_match) < 0)
-		goto err_exit;
+	mors->cfg->gpios = gpios;
 
-	if (mors->cfg->mm_spi_irq_gpio < 0) {
-		MORSE_SPI_ERR(mors, "Required property spi-irq-gpios not found in device tree\n");
-		goto err_exit;
-	}
+	morse_spi_config_burst_mode(mors, false);
 
 	mors->board_serial = serial;
 	MORSE_SPI_INFO(mors, "Board serial: %s\n", mors->board_serial);
@@ -1535,7 +1591,10 @@ static int morse_spi_probe(struct spi_device *spi)
 	}
 #endif
 
+	mutex_lock(&mors->lock);
 	ret = morse_firmware_prepare(mors, reset_hw, morse_hw_should_reattach());
+	mutex_unlock(&mors->lock);
+
 	if (ret == -EALREADY)
 		attach = true;
 	else if (ret)
@@ -1584,6 +1643,13 @@ static int morse_spi_probe(struct spi_device *spi)
 		}
 	}
 
+	ret = morse_ps_init(mors);
+	if (ret) {
+		MORSE_SPI_ERR(mors, "morse_ps_init failed: %d\n", ret);
+		goto err_exit;
+	}
+	ps_initiated = true;
+
 	/* Enable SPI interrupts before callng ieee80211_register_hw() or morse_wiphy_register */
 	ret = morse_spi_setup_irq(mspi);
 	irq_enabled = true;
@@ -1592,13 +1658,24 @@ static int morse_spi_probe(struct spi_device *spi)
 		goto err_exit;
 	}
 
-	if (attach) {
-		ret = morse_hw_attach(mors, 0);
-		if (ret)
-			goto err_exit;
-	}
-
 	if (morse_test_mode_is_interactive(test_mode)) {
+		ret = morse_mac_health_check_init(mors);
+		if (ret) {
+			MORSE_SPI_ERR(mors, "morse_mac_health_check_init failed %d\n", ret);
+			goto err_exit;
+		}
+		health_check_init_done = true;
+
+		if (attach) {
+			u32 attach_cfg = morse_mac_get_attach_config();
+
+			ret = morse_hw_attach(mors, attach_cfg);
+			if (ret) {
+				attach_failed = true;
+				goto err_exit;
+			}
+		}
+
 		ret = morse_mac_register(mors);
 		if (ret) {
 			MORSE_SPI_ERR(mors, "morse_mac_register failed: %d\n", ret);
@@ -1616,11 +1693,19 @@ static int morse_spi_probe(struct spi_device *spi)
 	}
 #endif
 
+	/* Report an error if boot completed successfully but the firmware is in failsafe mode */
+	if (mors->firmware_flags & MORSE_FW_FLAGS_FAILSAFE_MODE)
+		dev_err(&spi->dev, "Chip started in failsafe mode\n");
+
 	return ret;
 
 err_exit:
+	if (health_check_init_done)
+		morse_mac_health_check_finish(mors);
 	if (irq_enabled)
 		morse_spi_remove_irq(mspi);
+	if (ps_initiated)
+		morse_ps_finish(mors);
 	if (if_initiated)
 		mors->cfg->ops->finish(mors);
 	if (mors && mors->net_wq) {
@@ -1642,9 +1727,17 @@ err_exit:
 #endif
 	if (mspi_data_allocated)
 		kfree(mspi->data);
+	if (sysfs_init)
+		morse_sysfs_finish(mors);
 	if (mors)
 		morse_mac_destroy(mors);
-	pr_err("%s failed. The driver has not been loaded!\n", __func__);
+
+	if (attach_failed) {
+		pr_err("%s: Reattach failed - resetting chip\n", __func__);
+		morse_spi_reset(reset_gpio, spi);
+	}
+
+	pr_err("%s: probe failed (ret:%d)\n", __func__, ret);
 	return ret;
 }
 

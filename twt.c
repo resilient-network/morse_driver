@@ -12,6 +12,7 @@
 #include "utils.h"
 #include "mac.h"
 #include "debug.h"
+#include "ps.h"
 
 #define TWT_IE_MIN_LENGTH	(10)
 #define TWT_IE_MAX_LENGTH	(20)
@@ -2030,7 +2031,6 @@ static void morse_twt_handle_cmd_work(struct work_struct *work)
 
 void morse_twt_init_vif(struct morse *mors, struct morse_vif *mors_vif,
 			bool enable_twt, bool is_ap, bool is_sta,
-			bool ps_is_enabled, bool ps_is_offloaded,
 			bool connection_monitor_is_enabled)
 {
 	struct morse_twt *twt = &mors_vif->twt;
@@ -2063,13 +2063,13 @@ void morse_twt_init_vif(struct morse *mors, struct morse_vif *mors_vif,
 			return;
 		}
 
-		if (!ps_is_enabled) {
+		if (morse_ps_is_disabled()) {
 			MORSE_TWT_INFO(mors,
 				"TWT requester mode disabled - power save is not enabled\n");
 			return;
 		}
 
-		if (!ps_is_offloaded) {
+		if (!morse_ps_is_dynamic_offload_enabled()) {
 			MORSE_TWT_INFO(mors,
 				"TWT requester mode disabled - dynamic ps offload not enabled\n");
 			return;

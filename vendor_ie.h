@@ -34,7 +34,7 @@ struct vendor_ie_list_item {
 	/** Management type bitmask which this vendor IE should be inserted into */
 	u16 mgmt_type_mask;
 	/** The vendor information element to insert */
-	struct ieee80211_vendor_ie ie;
+	u8 element[];
 };
 
 /**

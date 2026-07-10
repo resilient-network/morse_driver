@@ -43,38 +43,66 @@ static int beacon_offload_get_cmd_size(int ie_len, struct dot11ah_ies_mask *ies_
 	return size;
 }
 
-static inline u16 beacon_get_next_dtim_count(u16 current_dtim_count, u16 dtim_period)
+/**
+ * beacon_get_next_dtim_count - Return the DTIM count @count beacons in the future
+ *
+ * The DTIM count decrements each beacon interval, wrapping from 0 to (dtim_period - 1).
+ *
+ * @current_dtim_count: DTIM count in the current beacon
+ * @dtim_period: DTIM period configured for the BSS
+ * @count: Number of beacon intervals to advance
+ *
+ * Return: DTIM count @count beacons later.
+ */
+static inline u8 beacon_get_next_dtim_count(u16 current_dtim_count, u16 dtim_period,
+					     unsigned int count)
 {
-	return dtim_period ? (current_dtim_count + dtim_period - 1) % dtim_period : 0;
+	return dtim_period ? (current_dtim_count + dtim_period - count) % dtim_period : 0;
 }
 
-static inline u16 beacon_get_previous_dtim_count(u16 current_dtim_count, u16 dtim_period)
+/**
+ * beacon_get_previous_dtim_count - Return the DTIM count @count beacons in the past
+ *
+ * The DTIM count decrements each beacon interval, wrapping from 0 to (dtim_period - 1).
+ *
+ * @current_dtim_count: DTIM count in the current beacon
+ * @dtim_period: DTIM period configured for the BSS
+ * @count: Number of beacon intervals to go back
+ *
+ * Return: DTIM count @count beacons earlier.
+ */
+static inline u8 beacon_get_previous_dtim_count(u16 current_dtim_count, u16 dtim_period,
+						 unsigned int count)
 {
-	return dtim_period ? (current_dtim_count + 1) % dtim_period : 0;
+	return dtim_period ? (current_dtim_count + count) % dtim_period : 0;
 }
 
-void morse_hw_beacon_update_mac80211_dtim_count(struct morse_vif *mors_vif, u16 dtim_count)
+/**
+ * increment_mac80211_dtim_count - Advance mac80211's DTIM count to @expected_dtim
+ *
+ * Repeatedly fetches beacons from mac80211 (which decrements its internal DTIM
+ * counter each call) until the DTIM count in the beacon matches @expected_dtim.
+ *
+ * @mors: Morse device
+ * @vif: Virtual interface
+ * @expected_dtim: Target DTIM count to synchronise to
+ *
+ * Return: true on success, false if a beacon could not be retrieved from mac80211.
+ */
+static bool increment_mac80211_dtim_count(struct morse *mors, struct ieee80211_vif *vif,
+					    u8 expected_dtim)
 {
-	struct morse *mors;
-	struct ieee80211_vif *vif;
 	struct sk_buff *beacon;
 	struct ieee80211_mgmt *beacon_mgmt;
 	const u8 *tim_ie;
 	u8 current_dtim;
-	u16 expected_dtim;
 
-	vif = morse_vif_to_ieee80211_vif(mors_vif);
-	mors = morse_vif_to_morse(mors_vif);
-
-	/* Set mac80211 dtim count to the value before our expected count */
-	expected_dtim = beacon_get_previous_dtim_count(dtim_count, vif->bss_conf.dtim_period);
-	MORSE_BEACON_DBG(mors, "%s: updating the dtim count: %u", __func__, dtim_count);
 	do {
 		beacon = MORSE_IEEE_BEACON_GET(mors, vif);
 
 		if (!beacon) {
 			MORSE_BEACON_ERR(mors, "%s: ieee80211_beacon_get failed\n", __func__);
-			return;
+			return false;
 		}
 		beacon_mgmt = (struct ieee80211_mgmt *)beacon->data;
 		tim_ie = cfg80211_find_ie(WLAN_EID_TIM, beacon_mgmt->u.beacon.variable,
@@ -82,7 +110,42 @@ void morse_hw_beacon_update_mac80211_dtim_count(struct morse_vif *mors_vif, u16 
 				+ 12));
 		current_dtim = tim_ie[2];
 		kfree_skb(beacon);
-	} while (current_dtim != (u8)expected_dtim);
+
+	} while (current_dtim != expected_dtim);
+
+	return true;
+}
+
+void morse_hw_beacon_update_mac80211_dtim_count(struct morse_vif *mors_vif, u16 dtim_count)
+{
+	struct morse *mors;
+	struct ieee80211_vif *vif;
+	unsigned int skipped_tasklet_events;
+	u8 dtim_period;
+	u8 expected_dtim;
+
+	vif = morse_vif_to_ieee80211_vif(mors_vif);
+	mors = morse_vif_to_morse(mors_vif);
+
+	lockdep_assert_held(&mors_vif->beacon_offload.lock);
+
+	dtim_period = vif->bss_conf.dtim_period;
+	/* Set mac80211 dtim count to the value before our expected count */
+	expected_dtim = beacon_get_previous_dtim_count(dtim_count, dtim_period, 1);
+	MORSE_BEACON_DBG(mors, "%s: updating the dtim count: %u", __func__, expected_dtim);
+	skipped_tasklet_events = mors_vif->beacon_offload.skipped_tasklet_events;
+	mors_vif->beacon_offload.skipped_tasklet_events = 0;
+
+	/* Account for any skipped beacons during the beacon offload stop command */
+	if (skipped_tasklet_events) {
+		expected_dtim = beacon_get_next_dtim_count(expected_dtim, dtim_period,
+							   skipped_tasklet_events);
+		MORSE_BEACON_DBG(mors,
+				"%s: decremented expected dtim by %d due to skipped beacon tasklet(s). New expected dtim %d\n",
+				__func__, skipped_tasklet_events, expected_dtim);
+	}
+
+	increment_mac80211_dtim_count(mors, vif, (u8)expected_dtim);
 
 	mors_vif->dtim_count = dtim_count;
 }
@@ -437,14 +500,12 @@ int morse_hw_beacon_offload_insert_tlvs(struct morse_vif *mors_vif,
 	struct morse_cmd_req_beacon_offload **preq, size_t *cmd_size)
 {
 	struct morse *mors;
-	struct ieee80211_vif *vif;
 	struct sk_buff *beacon_template = NULL;
 	struct ieee80211_ext *s1g_beacon;
 	struct ieee80211_tim_ie *tim_ie;
 	u8 *buf;
 	u8 *beacon_ies;
 	u8 tx_bw_mhz;
-	u16 target_dtim;
 	u32 cssid;
 	int size;
 	int ies_length;
@@ -456,7 +517,6 @@ int morse_hw_beacon_offload_insert_tlvs(struct morse_vif *mors_vif,
 		return -EINVAL;
 
 	mors = morse_vif_to_morse(mors_vif);
-	vif = morse_vif_to_ieee80211_vif(mors_vif);
 
 	ret = morse_beacon_generate_template(mors_vif, &beacon_template);
 	if (!beacon_template || ret) {
@@ -496,10 +556,6 @@ int morse_hw_beacon_offload_insert_tlvs(struct morse_vif *mors_vif,
 		ies_mask->ies[WLAN_EID_TIM].len = 2;
 	}
 
-	/* decrement the dtim count */
-	target_dtim = beacon_get_next_dtim_count(tim_ie->dtim_count, vif->bss_conf.dtim_period);
-	tim_ie->dtim_count = target_dtim;
-
 	/* remove any ies from the beacon template that are not supported by offload beacons */
 	morse_beacon_set_compatible_offload_ies(mors, ies_mask);
 	morse_beacon_insert_offload_ies(beacon_ies, &ies_length, ies_mask);
@@ -525,9 +581,11 @@ int morse_hw_beacon_offload_insert_tlvs(struct morse_vif *mors_vif,
 	buf = beacon_offload_add_frame_ctrl_tlv(mors, buf, s1g_beacon->frame_control);
 	buf = beacon_offload_add_change_seq_tlv(mors, buf,
 						s1g_beacon->u.s1g_beacon.change_seq);
-	buf = beacon_offload_add_dtim_count_tlv(mors, buf, target_dtim);
 	buf = beacon_offload_add_tx_info_tlv(mors, buf, tx_bw_mhz);
 	buf = beacon_offload_add_ies_tlv(mors, buf, beacon_ies, ies_length);
+
+	/* DTIM count handled by chip during beacon offload */
+	buf = beacon_offload_add_dtim_count_tlv(mors, buf, 0);
 
 	if (ies_mask->ies[WLAN_EID_SSID].len != 0) {
 		cssid = morse_generate_cssid(ies_mask->ies[WLAN_EID_SSID].ptr,

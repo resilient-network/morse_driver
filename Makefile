@@ -8,7 +8,7 @@ else
 endif
 
 # Set 0 to a version number. This is done to match the Linux expectations
-override MORSE_VERSION = "0-rel_1_17_9_2026_Apr_20"
+override MORSE_VERSION = "0-rel_mm6108_2_0_1_2026_Jun_11"
 
 USING_CLANG := $(shell $(CC) -v 2>&1 | grep -c "clang version")
 
@@ -31,6 +31,7 @@ ccflags-$(CONFIG_MORSE_DEBUG_IRQ) += "-DCONFIG_MORSE_DEBUG_IRQ"
 ccflags-$(CONFIG_MORSE_DEBUG_TXSTATUS) += "-DCONFIG_MORSE_DEBUG_TXSTATUS"
 ccflags-$(CONFIG_MORSE_IPMON) += "-DCONFIG_MORSE_IPMON"
 ccflags-$(CONFIG_MORSE_MONITOR) += "-DCONFIG_MORSE_MONITOR"
+ccflags-$(CONFIG_MORSE_HW_BOOT_TIMEBASE) += "-DCONFIG_MORSE_HW_BOOT_TIMEBASE"
 ccflags-$(CONFIG_MORSE_TRACE_LOG_MSG) += -D"CONFIG_MORSE_TRACE_LOG_MSG"
 ccflags-$(CONFIG_MORSE_TRACE_BUS) += "-DCONFIG_MORSE_TRACE_BUS"
 ccflags-$(CONFIG_MORSE_TRACE_HW_IRQ) += "-DCONFIG_MORSE_TRACE_HW_IRQ"
@@ -67,6 +68,18 @@ ccflags-y += "-DCONFIG_MORSE_POWERSAVE_MODE=$(CONFIG_MORSE_POWERSAVE_MODE)"
 
 CONFIG_MORSE_SDIO_ALIGNMENT ?= 2
 ccflags-y += "-DCONFIG_MORSE_SDIO_ALIGNMENT=$(CONFIG_MORSE_SDIO_ALIGNMENT)"
+
+# Default enable_wiphy to ENABLE_WIPHY
+CONFIG_MORSE_ENABLE_WIPHY ?= 0
+ccflags-y += "-DCONFIG_MORSE_ENABLE_WIPHY=$(CONFIG_MORSE_ENABLE_WIPHY)"
+
+# Default reattach_hw to REATACH_HW
+CONFIG_MORSE_REATTACH_HW ?= 0
+ccflags-y += "-DCONFIG_MORSE_REATTACH_HW=$(CONFIG_MORSE_REATTACH_HW)"
+
+# Default dhcpc_lease_update_script to DHCPC_LEASE_UPDATE_SCRIPT
+CONFIG_MORSE_DHCPC_LEASE_UPDATE_SCRIPT ?= "/morse/scripts/dhcpc_update.sh"
+ccflags-y += "-DCONFIG_MORSE_DHCPC_LEASE_UPDATE_SCRIPT=\"$(CONFIG_MORSE_DHCPC_LEASE_UPDATE_SCRIPT)\""
 
 ifneq ($(CONFIG_DISABLE_MORSE_FULLMAC),y)
 	ccflags-y += "-DCONFIG_MORSE_FULLMAC"
@@ -146,6 +159,7 @@ morse-y += vendor_ie.o
 morse-y += bus_test.o
 morse-y += ocs.o
 morse-y += mbssid.o
+morse-y += mem_access.o
 morse-y += mesh.o
 morse-y += page_slicing.o
 morse-y += pv1.o
@@ -155,6 +169,8 @@ morse-y += peer.o
 morse-y += led.o
 morse-y += bss_stats.o
 morse-y += hw_beacon.o
+morse-y += sysfs.o
+morse-y += scan_result_cache.o
 morse-$(CONFIG_PM) += wowlan.o
 morse-$(CONFIG_MORSE_MONITOR) += monitor.o
 morse-$(CONFIG_MORSE_SDIO) += sdio.o

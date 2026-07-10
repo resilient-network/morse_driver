@@ -45,7 +45,7 @@
 #define MM6108_REG_XTAL_INIT_SEQ_ADDR_3		0x1005805C /* Digpll en address */
 #define MM6108_REG_XTAL_INIT_SEQ_ADDR_4		0x10054000 /* System clk control  address */
 
-#define MM6108_REG_XTAL_INIT_SEQ_AON_CLK_VAL	0x19	   /* Aon clk switch to 32KHz val */
+#define MM6108_REG_XTAL_INIT_SEQ_AON_CLK_VAL	0x19	   /* Aon clk switch to 32 kHz val */
 #define MM6108_REG_XTAL_INIT_SEQ_ADDR_1_VAL	0x2	   /* Gpio 1 output_en val */
 #define MM6108_REG_XTAL_INIT_SEQ_ADDR_2_VAL	0x2	   /* Gpio 1 output_val val */
 #define MM6108_REG_XTAL_INIT_SEQ_ADDR_3_VAL	0x21D	   /* Digpll enable val */
@@ -119,12 +119,16 @@ static u8 mm610x_get_warm_boot_time_ms(u32 chip_id)
 
 static u32 mm610x_get_cold_boot_time_ms(u32 chip_id)
 {
-	return 1000;
+	return 500;
 }
 
-static int mm610x_enable_burst_mode(struct morse *mors, const u8 burst_mode)
+static u32 mm610x_get_firmware_trigger_delay_ms(u32 chip_id)
 {
-	(void)burst_mode;
+	return 1;
+}
+
+static u32 mm610x_get_spi_inter_block_delay_ns(bool burst_enabled)
+{
 	return MM6108_SPI_INTER_BLOCK_DELAY_NANO_S;
 }
 
@@ -137,7 +141,7 @@ static void mm610x_enable_ext_xtal_delay(struct morse *mors, bool enable)
 
 static int mm610x_ext_xtal_init(struct morse *mors)
 {
-	/* switch aon-clk to 32KHz and latch it */
+	/* switch aon-clk to 32 kHz and latch it */
 	morse_reg32_write(mors, MM6108_REG_AON_LATCH_ADDR,
 			MM6108_REG_XTAL_INIT_SEQ_AON_CLK_VAL);
 	msleep(mors->cfg->xtal_init_bus_trans_delay_ms);
@@ -279,6 +283,13 @@ exit:
 	return ret;
 }
 
+static bool mm610x_chip_id_matches(u32 chip_id)
+{
+	return chip_id == MM6108A0_ID ||
+	       chip_id == MM6108A1_ID ||
+	       chip_id == MM6108A2_ID;
+}
+
 static const struct morse_hw_regs mm6108_regs = {
 	/* Register address maps */
 	.irq_base_address = MM6108_REG_INT_BASE,
@@ -327,7 +338,9 @@ struct morse_hw_cfg mm6108_cfg = {
 	.ops = &morse_pageset_ops,
 	.get_warm_boot_time_ms = mm610x_get_warm_boot_time_ms,
 	.get_cold_boot_time_ms = mm610x_get_cold_boot_time_ms,
-	.enable_sdio_burst_mode = mm610x_enable_burst_mode,
+	.get_firmware_trigger_delay_ms = mm610x_get_firmware_trigger_delay_ms,
+	.enable_sdio_burst_mode = NULL,
+	.get_spi_inter_block_delay_ns = mm610x_get_spi_inter_block_delay_ns,
 	.get_board_type = mm610x_read_board_type,
 	.get_encoded_country = mm610x_read_encoded_country,
 	.get_hw_version = mm610x_get_hw_version,
@@ -337,13 +350,22 @@ struct morse_hw_cfg mm6108_cfg = {
 	.post_coredump_hook = NULL,
 	.board_type_max_value = MM610X_BOARD_TYPE_MAX_VALUE,
 	.bus_double_read = true,
+	.mem_access_cfg = NULL,
 	.enable_short_bcn_as_dtim = false,
 	.led_group.enable_led_support = false,
 	.enable_ext_xtal_delay = mm610x_enable_ext_xtal_delay,
+	.set_security_manifest_ptr = NULL,
+	.get_secureboot_status = NULL,
+	.enable_amsdu_support = false,
+	.gpios.busy = -ENOENT,
+	.gpios.reset = -ENOENT,
+	.gpios.spi_irq = -ENOENT,
+	.gpios.wake = -ENOENT,
 };
 
 struct morse_chip_series mm61xx_chip_series = {
-	.chip_id_address = MM6108_REG_CHIP_ID
+	.cfg = &mm6108_cfg,
+	.chip_id_matches = mm610x_chip_id_matches,
 };
 
 MODULE_FIRMWARE(MORSE_FW_DIR "/" MM6108_FW_BASE MORSE_FW_EXT);

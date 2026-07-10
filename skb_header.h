@@ -127,6 +127,22 @@ enum morse_rx_status_flags {
 #define MORSE_RX_STATUS_FLAGS_NDP_TYPE_GET(x) \
 	(((x) & MORSE_RX_STATUS_FLAGS_NDP_TYPE) >> 11)
 
+#define MORSE_RX_STATUS_CHAN_INFO_OP_BW_MASK (0x7)
+/** Operating channel bandwidth (dot11_bandwidth) bits 0-2 */
+#define MORSE_RX_STATUS_CHAN_INFO_OP_BW_INDEX_SET(bw) \
+	(((bw) & MORSE_RX_STATUS_CHAN_INFO_OP_BW_MASK) << 0)
+#define MORSE_RX_STATUS_CHAN_INFO_OP_BW_INDEX_GET(chan_info) \
+	((chan_info) & MORSE_RX_STATUS_CHAN_INFO_OP_BW_MASK)
+
+/** Primary 1 MHz index (0-7) bits 3-5 */
+#define MORSE_RX_STATUS_CHAN_INFO_PRIMARY_1MHZ_INDEX_MASK (0x7)
+#define MORSE_RX_STATUS_CHAN_INFO_PRIMARY_1MHZ_INDEX_SHIFT 3
+#define MORSE_RX_STATUS_CHAN_INFO_PRIMARY_1MHZ_INDEX_SET(idx) \
+	(((idx) & MORSE_RX_STATUS_CHAN_INFO_PRIMARY_1MHZ_INDEX_MASK) \
+		<< MORSE_RX_STATUS_CHAN_INFO_PRIMARY_1MHZ_INDEX_SHIFT)
+#define MORSE_RX_STATUS_CHAN_INFO_PRIMARY_1MHZ_INDEX_GET(chan_info) \
+	(((chan_info) >> 3) & MORSE_RX_STATUS_CHAN_INFO_PRIMARY_1MHZ_INDEX_MASK)
+
 /**
  * enum morse_skb_channel - SKB header channel mapping
  * @MORSE_SKB_CHAN_DATA: Payload is normal data
@@ -281,6 +297,8 @@ struct morse_skb_tx_info {
  * @morse_ratecode: The morse rate code at which this MPDU was received.
  * @rssi: The RSSI of the received frame
  * @freq_100khz: The frequency the frame was received on in 100kHz
+ * @channel_info: Contains operating channel bandwidth index (BITS:0-2) and Primary 1MHz index
+ *		   (BITS:3-5)
  * @rx_timestamp_us: When STA or AP, this is the value of the TSF timer.
  *                   In monitor mode this is the value of the chip's local timer
  *                   when the frame was first detected.
@@ -296,8 +314,8 @@ struct morse_skb_rx_status {
 	__le16 freq_100khz;
 	u8 bss_color;
 	s8 noise_dbm;
-	/** Padding for word alignment */
-	u8 padding[2];
+	u8 channel_info;
+	u8 padding;
 	__le64 rx_timestamp_us;
 } __packed;
 

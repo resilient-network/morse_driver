@@ -12,6 +12,9 @@
 #include "mac.h"
 #include "debug.h"
 #include "bus.h"
+#include "ps.h"
+#include "sysfs.h"
+#include "mem_access.h"
 
 #define MORSE_USB_INTERRUPT_INTERVAL	4	/* High speed USB 2^(4-1) * 125usec = 1msec */
 #define USB_MAX_TRANSFER_SIZE		(16 * 1024)	/* Max bytes per USB read/write */
@@ -288,8 +291,12 @@ static int morse_usb_cmd(struct morse_usb *musb, const char *user_buffer, size_t
 	struct morse *mors = usb_get_intfdata(musb->interface);
 	struct morse_usb_endpoint *ep = &musb->endpoints[MORSE_EP_CMD];
 
+	lockdep_assert_held(&musb->lock);
+
 	if (!test_bit(MORSE_USB_FLAG_ATTACHED, &musb->flags))
 		return -ENODEV;
+
+	morse_usb_buff_log(mors, user_buffer, writesize, "CMDBUF: ");
 
 	memcpy(ep->buffer, user_buffer, writesize);
 
@@ -334,6 +341,13 @@ int morse_usb_ndr_reset(struct morse *mors)
 	int ret;
 	struct morse_usb *musb = (struct morse_usb *)mors->drv_priv;
 	struct morse_usb_command cmd;
+
+	lockdep_assert_held(&musb->bus_lock);
+
+	if (!test_bit(MORSE_USB_FLAG_ATTACHED, &musb->flags))
+		return -ENODEV;
+	if (test_bit(MORSE_USB_FLAG_SUSPENDED, &musb->flags))
+		return -EBUSY;
 
 	mutex_lock(&musb->lock);
 
@@ -383,8 +397,12 @@ static int morse_usb_mem_read(struct morse_usb *musb, u32 address, u8 *data, ssi
 	struct morse_usb_command cmd;
 	struct morse *mors = usb_get_intfdata(musb->interface);
 
+	lockdep_assert_held(&musb->bus_lock);
+
 	if (!test_bit(MORSE_USB_FLAG_ATTACHED, &musb->flags))
 		return -ENODEV;
+	if (test_bit(MORSE_USB_FLAG_SUSPENDED, &musb->flags))
+		return -EBUSY;
 
 	mutex_lock(&musb->lock);
 
@@ -395,9 +413,6 @@ static int morse_usb_mem_read(struct morse_usb *musb, u32 address, u8 *data, ssi
 	cmd.dir = cpu_to_le32(MORSE_USB_READ);
 	cmd.address = cpu_to_le32(address);
 	cmd.length = cpu_to_le32(size);
-
-	morse_usb_buff_log(mors, (const char *)&cmd, sizeof(cmd), "CMDBUF: ");
-
 	ret = morse_usb_cmd(musb, (const char *)&cmd, sizeof(cmd));
 	if (ret < 0) {
 		MORSE_USB_ERR(mors, "morse_usb_cmd error %d\n", ret);
@@ -455,8 +470,12 @@ static int morse_usb_mem_write(struct morse_usb *musb, u32 address, u8 *data, ss
 	struct morse_usb_command cmd;
 	struct morse *mors = usb_get_intfdata(musb->interface);
 
+	lockdep_assert_held(&musb->bus_lock);
+
 	if (!test_bit(MORSE_USB_FLAG_ATTACHED, &musb->flags))
 		return -ENODEV;
+	if (test_bit(MORSE_USB_FLAG_SUSPENDED, &musb->flags))
+		return -EBUSY;
 
 	mutex_lock(&musb->lock);
 
@@ -596,6 +615,11 @@ static int morse_usb_reg32_write(struct morse *mors, u32 address, u32 val)
 	return ret;
 }
 
+static int morse_usb_request_mem_access(struct morse *mors, u32 address, int len)
+{
+	return mem_access_request(mors, NULL, address, len);
+}
+
 static void morse_usb_claim_bus(struct morse *mors)
 {
 	struct morse_usb *musb;
@@ -614,6 +638,7 @@ static void morse_usb_release_bus(struct morse *mors)
 
 static int morse_usb_reset_bus(struct morse *mors)
 {
+	mors->recovery.ignore_detach = true;
 	return 0;
 }
 
@@ -640,6 +665,7 @@ static const struct morse_bus_ops morse_usb_ops = {
 	.dm_write = morse_usb_dm_write,
 	.reg32_read = morse_usb_reg32_read,
 	.reg32_write = morse_usb_reg32_write,
+	.request_mem_access = morse_usb_request_mem_access,
 	.set_bus_enable = morse_usb_bus_enable,
 	.claim = morse_usb_claim_bus,
 	.release = morse_usb_release_bus,
@@ -782,7 +808,10 @@ static int morse_usb_probe(struct usb_interface *interface, const struct usb_dev
 	struct morse_usb *musb;
 	struct morse_chip_series *mors_chip_series = (struct morse_chip_series *)id->driver_info;
 	const bool reset_hw = false;
+	bool health_check_init_done = false;
+	bool sysfs_init = false;
 	bool attach = false;
+	bool attach_failed = false;
 
 	/* let the user know what node this device is now attached to */
 	dev_info(&interface->dev,
@@ -793,6 +822,13 @@ static int morse_usb_probe(struct usb_interface *interface, const struct usb_dev
 		dev_err(&interface->dev, "morse_mac_create failed\n");
 		return -ENOMEM;
 	}
+
+	ret = morse_sysfs_init(mors);
+	if (ret) {
+		dev_err(&interface->dev, "morse_sysfs_init failed: %d\n", ret);
+		goto err_ep;
+	}
+	sysfs_init = true;
 
 	morse_hw_headless_init(mors);
 
@@ -817,14 +853,12 @@ static int morse_usb_probe(struct usb_interface *interface, const struct usb_dev
 
 	set_bit(MORSE_USB_FLAG_ATTACHED, &musb->flags);
 
-	ret = morse_chip_cfg_detect_and_init(mors, mors_chip_series);
+	ret = morse_chip_cfg_set_and_validate(mors, mors_chip_series);
 	if (ret < 0) {
-		MORSE_USB_ERR(mors, "morse_chip_cfg_detect_and_init failed: %d\n", ret);
+		MORSE_USB_ERR(mors, "morse_chip_cfg_set_and_validate failed: %d\n", ret);
 		goto err_ep;
 	}
 	MORSE_USB_INFO(mors, "Morse Micro USB device found, chip ID=0x%04x\n", mors->chip_id);
-
-	mors->cfg->mm_ps_gpios_supported = false;
 
 #ifdef CONFIG_MORSE_ENABLE_TEST_MODES
 	if (test_mode == MORSE_CONFIG_TEST_MODE_BUS) {
@@ -836,7 +870,10 @@ static int morse_usb_probe(struct usb_interface *interface, const struct usb_dev
 	mors->board_serial = serial;
 	MORSE_USB_INFO(mors, "Board serial: %s", mors->board_serial);
 
+	mutex_lock(&mors->lock);
 	ret = morse_firmware_prepare(mors, reset_hw, morse_hw_should_reattach());
+	mutex_unlock(&mors->lock);
+
 	if (ret == -EALREADY)
 		attach = true;
 	else if (ret)
@@ -873,17 +910,34 @@ static int morse_usb_probe(struct usb_interface *interface, const struct usb_dev
 			goto err_host_table;
 		}
 
+		ret = morse_ps_init(mors);
+		if (ret) {
+			MORSE_USB_ERR(mors, "morse_ps_init failed: %d\n", ret);
+			goto err_ps;
+		}
+
 		INIT_WORK(&mors->usb_irq_work, morse_usb_irq_work);
 		morse_usb_enable_int(mors);
 	}
 
-	if (attach) {
-		ret = morse_hw_attach(mors, 0);
-		if (ret)
-			goto err_mac;
-	}
-
 	if (morse_test_mode_is_interactive(test_mode)) {
+		ret = morse_mac_health_check_init(mors);
+		if (ret) {
+			MORSE_USB_ERR(mors, "mmorse_mac_health_check_init failed %d\n", ret);
+			goto err_mac;
+		}
+		health_check_init_done = true;
+
+		if (attach) {
+			u32 attach_cfg =  morse_mac_get_attach_config();
+
+			ret = morse_hw_attach(mors, attach_cfg);
+			if (ret) {
+				attach_failed = true;
+				goto err_mac;
+			}
+		}
+
 		ret = morse_mac_register(mors);
 		if (ret) {
 			MORSE_USB_ERR(mors, "morse_mac_register failed: %d\n", ret);
@@ -919,6 +973,11 @@ static int morse_usb_probe(struct usb_interface *interface, const struct usb_dev
 	pm_runtime_set_autosuspend_delay(&musb->udev->dev, PM_RUNTIME_AUTOSUSPEND_DELAY_MS);
 
 	usb_autopm_get_interface(interface);
+
+	/* Report an error if boot completed successfully but the firmware is in failsafe mode */
+	if (mors->firmware_flags & MORSE_FW_FLAGS_FAILSAFE_MODE)
+		dev_info(&interface->dev, "Chip started in failsafe mode\n");
+
 #ifdef CONFIG_MORSE_ENABLE_TEST_MODES
 usb_test_fin:
 #endif
@@ -936,6 +995,9 @@ err_uaccess:
 err_mac:
 	if (morse_test_mode_is_interactive(test_mode))
 		morse_usb_int_stop(mors);
+err_ps:
+	if (morse_test_mode_is_interactive(test_mode))
+		morse_ps_finish(mors);
 err_host_table:
 	if (morse_test_mode_is_interactive(test_mode))
 		mors->cfg->ops->finish(mors);
@@ -950,7 +1012,20 @@ err_net_wq:
 		destroy_workqueue(mors->chip_wq);
 	}
 err_ep:
+	if (health_check_init_done)
+		morse_mac_health_check_finish(mors);
+	if (sysfs_init)
+		morse_sysfs_finish(mors);
 	morse_mac_destroy(mors);
+
+	if (attach_failed) {
+		pr_err("%s: Reattach failed - resetting chip\n", __func__);
+		morse_usb_claim_bus(mors);
+		morse_usb_ndr_reset(mors);
+		morse_usb_release_bus(mors);
+	}
+
+	pr_err("%s: probe failed (ret:%d)\n", __func__, ret);
 	return ret;
 }
 
@@ -983,71 +1058,6 @@ static void morse_urb_cleanup(struct morse *mors)
 	usb_free_urb(cmd_ep->urb);
 }
 
-static void morse_usb_disconnect(struct usb_interface *interface)
-{
-	struct morse *mors = usb_get_intfdata(interface);
-	struct morse_usb *musb = (struct morse_usb *)mors->drv_priv;
-	int minor = interface->minor;
-	struct usb_device *udev = interface_to_usbdev(interface);
-	bool reattach_hw = morse_hw_should_reattach();
-	int ret;
-
-	if (udev->state == USB_STATE_NOTATTACHED) {
-		clear_bit(MORSE_USB_FLAG_ATTACHED, &musb->flags);
-		morse_hw_set_state(mors, MORSE_HW_STATE_OFF);
-		MORSE_USB_INFO(mors, "USB suddenly unplugged\n");
-	}
-
-	usb_disable_autosuspend(usb_get_dev(udev));
-
-	if (test_bit(MORSE_USB_FLAG_SUSPENDED, &musb->flags)) {
-		MORSE_USB_INFO(mors, "USB was suspended: release locks\n");
-		morse_usb_release_bus(mors);
-		mutex_unlock(&musb->lock);
-	}
-
-	clear_bit(MORSE_USB_FLAG_SUSPENDED, &musb->flags);
-
-#ifdef CONFIG_MORSE_USER_ACCESS
-	uaccess_device_unregister(mors);
-	uaccess_cleanup(morse_usb_uaccess);
-#endif
-
-	if (morse_test_mode_is_interactive(test_mode)) {
-		morse_mac_unregister(mors);
-		morse_usb_int_stop(mors);
-		mors->cfg->ops->finish(mors);
-		flush_workqueue(mors->chip_wq);
-		destroy_workqueue(mors->chip_wq);
-		flush_workqueue(mors->net_wq);
-		destroy_workqueue(mors->net_wq);
-		if (reattach_hw) {
-			/* Trigger detach interrupt but don't wait for it since
-			 * we are removing the driver anyway
-			 */
-			ret = morse_hw_trigger_detach(mors);
-			if (ret) {
-				MORSE_USB_ERR(mors,
-					"%s: failed to detach from hardware (ret:%d)\n",
-					__func__, ret);
-			} else {
-				MORSE_USB_INFO(mors, "%s: Detached from hardware\n", __func__);
-			}
-		}
-	}
-
-	/* No USB communication after this point */
-	morse_urb_cleanup(mors);
-
-	if (mors)
-		morse_mac_destroy(mors);
-
-	usb_autopm_put_interface(interface);
-	usb_set_intfdata(interface, NULL);
-	dev_info(&interface->dev, "USB Morse #%d now disconnected", minor);
-	usb_put_dev(udev);
-}
-
 static int morse_usb_suspend(struct usb_interface *intf, pm_message_t message)
 {
 	struct morse *mors = usb_get_intfdata(intf);
@@ -1064,10 +1074,6 @@ static int morse_usb_suspend(struct usb_interface *intf, pm_message_t message)
 	usb_kill_urb(rd_ep->urb);
 	usb_kill_urb(wr_ep->urb);
 	usb_kill_urb(cmd_ep->urb);
-
-	/* Locking the bus. No USB communication after this point */
-	morse_usb_claim_bus(mors);
-	mutex_lock(&musb->lock);
 
 	set_bit(MORSE_USB_FLAG_SUSPENDED, &musb->flags);
 
@@ -1089,9 +1095,6 @@ static int morse_usb_resume(struct usb_interface *intf)
 	ret = usb_submit_urb(int_ep->urb, GFP_KERNEL);
 	if (ret)
 		MORSE_USB_ERR(mors, "Couldn't submit urb. Error number %d\n", ret);
-
-	morse_usb_release_bus(mors);
-	mutex_unlock(&musb->lock);
 
 	clear_bit(MORSE_USB_FLAG_SUSPENDED, &musb->flags);
 
@@ -1132,6 +1135,77 @@ static int morse_usb_pre_reset(struct usb_interface *intf)
 static int morse_usb_post_reset(struct usb_interface *intf)
 {
 	return 0;
+}
+
+static void morse_usb_disconnect(struct usb_interface *interface)
+{
+	struct morse *mors = usb_get_intfdata(interface);
+	struct morse_usb *musb = (struct morse_usb *)mors->drv_priv;
+	int minor = interface->minor;
+	struct usb_device *udev = interface_to_usbdev(interface);
+	bool detach_hw = morse_hw_can_detach(mors);
+	int ret;
+
+	if (udev->state == USB_STATE_NOTATTACHED) {
+		clear_bit(MORSE_USB_FLAG_ATTACHED, &musb->flags);
+		morse_hw_set_state(mors, MORSE_HW_STATE_OFF);
+		MORSE_USB_INFO(mors, "USB suddenly unplugged\n");
+	}
+
+	usb_disable_autosuspend(udev);
+
+	if (test_bit(MORSE_USB_FLAG_SUSPENDED, &musb->flags))
+		/* The kernel guarantees that the device is resumed before calling disconnect.
+		 * However, if the kernel suspends the device just as we enter disconnect,
+		 * we do not reach morse_usb_resume() despite the device itself being resumed.
+		 * Manually call morse_usb_resume() here if the driver thinks that we're still
+		 * suspended so that we can do extra book keeping for disconnect. Doing the correct
+		 * book keeping is important when performing hardware reattach.
+		 */
+		morse_usb_resume(interface);
+
+#ifdef CONFIG_MORSE_USER_ACCESS
+	uaccess_device_unregister(mors);
+	uaccess_cleanup(morse_usb_uaccess);
+	morse_usb_uaccess = NULL;
+#endif
+
+	if (morse_test_mode_is_interactive(test_mode)) {
+		morse_mac_health_check_finish(mors);
+		morse_mac_unregister(mors);
+		morse_usb_int_stop(mors);
+		mors->cfg->ops->finish(mors);
+		flush_workqueue(mors->chip_wq);
+		destroy_workqueue(mors->chip_wq);
+		flush_workqueue(mors->net_wq);
+		destroy_workqueue(mors->net_wq);
+		if (detach_hw) {
+			/* Trigger detach interrupt but don't wait for it since
+			 * we are removing the driver anyway
+			 */
+			ret = morse_hw_trigger_detach(mors);
+			if (ret) {
+				MORSE_USB_ERR(mors,
+					"%s: failed to detach from hardware (ret:%d)\n",
+					__func__, ret);
+			} else {
+				MORSE_USB_INFO(mors, "%s: Detached from hardware\n", __func__);
+			}
+		}
+	}
+
+	/* No USB communication after this point */
+	morse_urb_cleanup(mors);
+
+	if (mors) {
+		morse_sysfs_finish(mors);
+		morse_mac_destroy(mors);
+	}
+
+	usb_autopm_put_interface(interface);
+	usb_set_intfdata(interface, NULL);
+	dev_info(&interface->dev, "USB Morse #%d now disconnected", minor);
+	usb_put_dev(udev);
 }
 
 static struct usb_driver morse_usb_driver = {

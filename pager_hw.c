@@ -170,7 +170,9 @@ static int pager_hw_pop(struct morse_pager *pager, struct morse_page *page)
 	int ret = 0;
 	u32 pop_val;
 
+	morse_claim_bus(pager->mors);
 	ret = morse_reg32_read(pager->mors, aux_data->pop_addr, &pop_val);
+	morse_release_bus(pager->mors);
 
 	if (!ret) {
 		/* Pager has no pages left */
@@ -195,7 +197,9 @@ static int pager_hw_put(struct morse_pager *pager, struct morse_page *page)
 	int ret;
 
 	trace_pager_hw_put(pager, page->addr);
+	morse_claim_bus(pager->mors);
 	ret = morse_reg32_write(pager->mors, aux_data->put_addr, page->addr);
+	morse_release_bus(pager->mors);
 
 	if (!ret) {
 		page->addr = 0;
@@ -227,6 +231,7 @@ static void pager_hw_notify_pager(const struct morse_pager *pager)
 
 int morse_pager_hw_notify(const struct morse_pager *pager)
 {
+	lockdep_assert_held(&pager->parent->lock);
 	/* Put the cached pages to to_host free HW pager */
 	if (pager->parent->mors->chip_if->pkt_memory.num &&
 	    (pager->flags & (MORSE_PAGER_FLAGS_DIR_TO_HOST | MORSE_PAGER_FLAGS_FREE)))
@@ -253,6 +258,7 @@ int morse_pager_hw_pop(struct morse_pager *pager, struct morse_page *page)
 {
 	int ret;
 
+	lockdep_assert_held(&pager->parent->lock);
 	if (!(pager->flags & MORSE_PAGER_FLAGS_FREE) ||
 	    !pager->parent->mors->chip_if->pkt_memory.num)
 		return pager_hw_pop(pager, page);
@@ -283,6 +289,7 @@ int morse_pager_hw_put(struct morse_pager *pager, struct morse_page *page)
 	u8 index;
 	u32 block;
 
+	lockdep_assert_held(&pager->parent->lock);
 	if (!(pager->flags & MORSE_PAGER_FLAGS_FREE) ||
 	    !pager->parent->mors->chip_if->pkt_memory.num)
 		return pager_hw_put(pager, page);
@@ -304,6 +311,9 @@ int morse_pager_hw_page_write(struct morse_pager *pager,
 			      const char *buff,
 			      int num_bytes)
 {
+	int ret;
+
+	lockdep_assert_held(&pager->parent->lock);
 	if (offset < 0)
 		return -EINVAL;
 
@@ -314,7 +324,11 @@ int morse_pager_hw_page_write(struct morse_pager *pager,
 		return -EFAULT;
 
 	trace_pager_hw_write_page(pager, page->addr + offset);
-	return morse_dm_write(pager->mors, page->addr + offset, buff, num_bytes);
+	morse_claim_bus(pager->mors);
+	ret = morse_dm_write(pager->mors, page->addr + offset, buff, num_bytes);
+	morse_release_bus(pager->mors);
+
+	return ret;
 }
 
 int morse_pager_hw_page_read(struct morse_pager *pager,
@@ -323,6 +337,9 @@ int morse_pager_hw_page_read(struct morse_pager *pager,
 			     char *buff,
 			     int num_bytes)
 {
+	int ret;
+
+	lockdep_assert_held(&pager->parent->lock);
 	if (offset < 0)
 		return -EINVAL;
 
@@ -333,7 +350,11 @@ int morse_pager_hw_page_read(struct morse_pager *pager,
 		return -EFAULT;
 
 	trace_pager_hw_read_page(pager, page->addr + offset);
-	return morse_dm_read(pager->mors, page->addr + offset, buff, num_bytes);
+	morse_claim_bus(pager->mors);
+	ret = morse_dm_read(pager->mors, page->addr + offset, buff, num_bytes);
+	morse_release_bus(pager->mors);
+
+	return ret;
 }
 
 void morse_pager_hw_flush_cache(struct morse_pager *pager)
@@ -341,6 +362,7 @@ void morse_pager_hw_flush_cache(struct morse_pager *pager)
 	struct morse_pager_hw_aux_data *aux_data =
 		(struct morse_pager_hw_aux_data *)pager->aux_data;
 
+	lockdep_assert_held(&pager->parent->lock);
 	memset(&aux_data->cache.bitmap, 0, sizeof(aux_data->cache.bitmap));
 }
 

@@ -11,6 +11,7 @@
 #include "command.h"
 #include "misc.h"
 #include "hw_scan.h"
+#include "scan_result_cache.h"
 
 /* These values were derived from mac80211 scan.c */
 /** Default time to dwell on a scan channel */
@@ -57,6 +58,8 @@ struct hw_scan_tlv_hdr {
 #define MORSE_HWSCAN_INFO(_m, _f, _a...)	morse_info(FEATURE_ID_HWSCAN, _m, _f, ##_a)
 #define MORSE_HWSCAN_WARN(_m, _f, _a...)	morse_warn(FEATURE_ID_HWSCAN, _m, _f, ##_a)
 #define MORSE_HWSCAN_ERR(_m, _f, _a...)		morse_err(FEATURE_ID_HWSCAN, _m, _f, ##_a)
+#define MORSE_HWSCAN_WARN_RATELIMITED(_m, _f, _a...) \
+	morse_warn_ratelimited(FEATURE_ID_HWSCAN, _m, _f, ##_a)
 
 /**
  * HW scan TLV for scan channels.
@@ -160,7 +163,12 @@ struct hw_scan_tlv_scheduled_scan_info {
 static uint hw_scan_prim_deconstruct __read_mostly;
 module_param(hw_scan_prim_deconstruct, uint, 0444);
 MODULE_PARM_DESC(hw_scan_prim_deconstruct,
-	"Limit HW scan channel deconstruction to primary width (0 for both, 1, or 2)");
+		 "Limit HW scan channel deconstruction to primary width (0 for both, 1, or 2)");
+
+static uint hw_scan_replay_limit __read_mostly;
+module_param(hw_scan_replay_limit, uint, 0644);
+MODULE_PARM_DESC(hw_scan_replay_limit,
+		 "Number of initial hardware scans that replay cached results (decrements to zero)");
 
 /**
  * morse_hw_scan_pack_tlv_hdr - Generate a TLV header from a given tag and length
@@ -645,7 +653,7 @@ static int deconstruct_scan_channel_into_scan_list(struct morse_hw_scan_params *
 		return -EINVAL;
 	}
 
-	MORSE_HWSCAN_DBG(mors, "Deconstructing ch %d (%d KHz, %d MHz) into primaries",
+	MORSE_HWSCAN_DBG(mors, "Deconstructing ch %d (%d kHz, %d MHz) into primaries",
 			 chan->ch.hw_value, morse_dot11ah_channel_to_freq_khz(chan->ch.hw_value),
 			 op_bw);
 
@@ -673,12 +681,12 @@ static int deconstruct_scan_channel_into_scan_list(struct morse_hw_scan_params *
 			s1g_chan = morse_dot11ah_s1g_freq_to_s1g(KHZ_TO_HZ(prim_freq_khz), prim_bw);
 			if (!s1g_chan) {
 				MORSE_HWSCAN_ERR(mors,
-						 "   ch %d (%d KHz, %d MHz) Error - undefined",
+						 "   ch %d (%d kHz, %d MHz) Error - undefined",
 						 prim_chan, prim_freq_khz, prim_bw);
 				continue;
 			}
 
-			MORSE_HWSCAN_DBG(mors, "   ch %d (%d KHz, %d MHz)",
+			MORSE_HWSCAN_DBG(mors, "   ch %d (%d kHz, %d MHz)",
 					 prim_chan, prim_freq_khz, prim_bw);
 
 			ret = insert_channel_into_hw_scan_list(params, s1g_chan);
@@ -1117,6 +1125,47 @@ static int morse_init_hw_scan_params(struct morse *mors, struct ieee80211_hw *hw
 	return 0;
 }
 
+/* Start a replay scan (replay cached probes and beacons) */
+static bool replay_scan_start(struct morse *mors)
+{
+	/* Some time must be given to the RX path to receive the replayed scan results
+	 * before declaring scan end.
+	 */
+	static const int replay_scan_end_ms = 10;
+	int ret;
+	int results;
+
+	if (scan_result_cache_is_empty(mors)) {
+		ret = -ENOENT;
+		goto exit;
+	}
+
+	if (hw_scan_replay_limit <= 0) {
+		ret = -EPERM;
+		goto exit;
+	}
+
+	ret = 0;
+	hw_scan_replay_limit--;
+	results = scan_result_cache_replay(mors);
+	ieee80211_queue_delayed_work(mors->hw,
+				     &mors->hw_scan.replay_end,
+				     msecs_to_jiffies(replay_scan_end_ms));
+	MORSE_HWSCAN_DBG(mors, "hw scan: replay scan start - %d result(s)\n", results);
+exit:
+	if (ret) {
+		/* Upon any failure to start a replay scan immediately flush
+		 * the cache and set replay limit to 0 to prevent
+		 * any further use of the scan result cache on
+		 * subsequent scans.
+		 */
+		scan_result_cache_flush(mors);
+		hw_scan_replay_limit = 0;
+	}
+
+	return (ret == 0);
+}
+
 int morse_ops_hw_scan(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
 			struct ieee80211_scan_request *hw_req)
 {
@@ -1131,8 +1180,8 @@ int morse_ops_hw_scan(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
 
 	MORSE_HWSCAN_DBG(mors, "%s: state %d\n", __func__, mors->hw_scan.state);
 
-	if (!morse_mlme_is_started(mors) || morse_mlme_in_reconfig(mors)) {
-		MORSE_HWSCAN_WARN(mors, "%s: device not ready\n", __func__);
+	if (!morse_mlme_is_started(mors) || morse_mlme_in_reconfig(mors) || !morse_hw_is_on(mors)) {
+		MORSE_HWSCAN_WARN_RATELIMITED(mors, "%s: device not ready\n", __func__);
 		ret = -ENODEV;
 		goto exit;
 	}
@@ -1194,7 +1243,13 @@ int morse_ops_hw_scan(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
 			MORSE_HWSCAN_ERR(mors, "Failed to init probe req %d\n", ret);
 	}
 
-	ret = morse_cmd_hw_scan(mors, params, false, NULL);
+	if (replay_scan_start(mors)) {
+		ret = 0;
+		mors->hw_scan.is_replay_scan = true;
+	} else {
+		ret = morse_cmd_hw_scan(mors, params, false, NULL);
+		mors->hw_scan.is_replay_scan = false;
+	}
 
 	if (ret) {
 		mors->hw_scan.state = HW_SCAN_STATE_IDLE;
@@ -1245,7 +1300,10 @@ static void cancel_hw_scan(struct morse *mors)
 
 	params.operation = MORSE_HW_SCAN_OP_STOP;
 
-	ret = morse_cmd_hw_scan(mors, &params, false, NULL);
+	if (mors->hw_scan.is_replay_scan)
+		ret = -EPERM; /* HW does not know about replay scans, immediately signal complete */
+	else
+		ret = morse_cmd_hw_scan(mors, &params, false, NULL);
 
 	mutex_unlock(&mors->lock);
 
@@ -1275,6 +1333,7 @@ void morse_ops_cancel_hw_scan(struct ieee80211_hw *hw, struct ieee80211_vif *vif
 
 	MORSE_HWSCAN_INFO(mors, "hw scan: cancel\n");
 	cancel_delayed_work_sync(&mors->hw_scan.timeout);
+	cancel_delayed_work_sync(&mors->hw_scan.replay_end);
 	cancel_hw_scan(mors);
 }
 
@@ -1320,7 +1379,16 @@ static void morse_hw_scan_timeout_work(struct work_struct *work)
 	struct morse *mors = container_of(work, struct morse, hw_scan.timeout.work);
 
 	MORSE_HWSCAN_ERR(mors, "hw scan: timed out, aborting\n");
+	cancel_delayed_work_sync(&mors->hw_scan.replay_end);
 	cancel_hw_scan(mors);
+}
+
+static void morse_hw_scan_replay_scan_end(struct work_struct *work)
+{
+	struct morse *mors = container_of(work, struct morse, hw_scan.replay_end.work);
+
+	MORSE_HWSCAN_DBG(mors, "hw scan: replay scan end\n");
+	morse_hw_scan_done_event(mors->hw);
 }
 
 void morse_hw_scan_init(struct morse *mors)
@@ -1332,10 +1400,12 @@ void morse_hw_scan_init(struct morse *mors)
 
 	init_completion(&mors->hw_scan.scan_done);
 	INIT_DELAYED_WORK(&mors->hw_scan.timeout, morse_hw_scan_timeout_work);
+	INIT_DELAYED_WORK(&mors->hw_scan.replay_end, morse_hw_scan_replay_scan_end);
 }
 
 void morse_hw_scan_destroy(struct morse *mors)
 {
+	cancel_delayed_work_sync(&mors->hw_scan.replay_end);
 	cancel_delayed_work_sync(&mors->hw_scan.timeout);
 	if (mors->hw_scan.params)
 		hw_scan_clean_up_params(mors->hw_scan.params);
@@ -1360,7 +1430,10 @@ void morse_hw_scan_finish(struct morse *mors)
 
 	complete(&mors->hw_scan.scan_done);
 	mors->hw_scan.state = HW_SCAN_STATE_IDLE;
-	cancel_delayed_work_sync(&mors->hw_scan.timeout);
+
+	/* Not using cancel_delayed_work_sync due to lock constraints */
+	cancel_delayed_work(&mors->hw_scan.timeout);
+	cancel_delayed_work(&mors->hw_scan.replay_end);
 }
 
 void morse_sched_scan_results_evt(struct ieee80211_hw *hw)
@@ -1384,8 +1457,8 @@ int morse_ops_sched_scan_start(struct ieee80211_hw *hw, struct ieee80211_vif *vi
 
 	MORSE_HWSCAN_DBG(mors, "%s: state %d\n", __func__, mors->hw_scan.state);
 
-	if (!morse_mlme_is_started(mors) || morse_mlme_in_reconfig(mors)) {
-		MORSE_HWSCAN_WARN(mors, "%s: device not ready\n", __func__);
+	if (!morse_mlme_is_started(mors) || morse_mlme_in_reconfig(mors) || !morse_hw_is_on(mors)) {
+		MORSE_HWSCAN_WARN_RATELIMITED(mors, "%s: device not ready\n", __func__);
 		ret = -ENODEV;
 		goto exit;
 	}
@@ -1437,6 +1510,11 @@ int morse_ops_sched_scan_start(struct ieee80211_hw *hw, struct ieee80211_vif *vi
 		if (ret)
 			MORSE_HWSCAN_ERR(mors, "Failed to init probe req %d\n", ret);
 	}
+
+	/* Replay scans are not supported under scheduled scan. Prevent future use of the cache */
+	mors->hw_scan.is_replay_scan = false;
+	hw_scan_replay_limit = 0;
+	scan_result_cache_flush(mors);
 
 	ret = morse_cmd_hw_scan(mors, params, true, req);
 
@@ -1509,4 +1587,25 @@ int morse_ops_sched_scan_stop(struct ieee80211_hw *hw, struct ieee80211_vif *vif
 	MORSE_HWSCAN_INFO(mors, "sched scan stopped\n");
 	morse_hw_stop_sched_scan(mors, true);
 	return 0;
+}
+
+void morse_hw_scan_rx_result(struct morse *mors,
+			     const struct sk_buff *rx,
+			     const struct morse_skb_rx_status *rx_status)
+{
+	unsigned int tmp;
+	enum morse_hw_scan_state state;
+
+	if (!mors->scan_res_cache.is_enabled)
+		return;
+
+	/* Prevent ambiguous read of enum */
+	tmp = READ_ONCE(mors->hw_scan.state);
+	state = (enum morse_hw_scan_state)tmp;
+
+	/* Only cache results during a scan */
+	if (state != HW_SCAN_STATE_RUNNING && state != HW_SCAN_STATE_SCHED)
+		return;
+
+	scan_result_cache(mors, rx, rx_status);
 }

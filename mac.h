@@ -13,9 +13,11 @@
 #include "command.h"
 #include "skb_header.h"
 
-/* The maximum number of frames to send after a DTIM to firmware */
-#define MORSE_MAX_MC_FRAMES_AFTER_DTIM (10)
+/* The maximum number of frames to send after a DTIM to firmware (per 100 TUs for low rate) */
+#define MORSE_MAX_MC_FRAMES_AFTER_DTIM_FIXED_RATE (4)
 
+/* The maximum number of frames to send after a DTIM to firmware (per 100 TUs for high rate) */
+#define MORSE_MAX_MC_FRAMES_AFTER_DTIM_AUTO_RATE (10)
 /**
  * struct morse_queue_params - QoS parameters
  *
@@ -62,21 +64,14 @@ int morse_mac_pkt_to_s1g(struct morse *mors, const struct ieee80211_sta *sta,
 			 struct sk_buff **skb, int *tx_bw_mhz);
 
 /**
- * morse_mac_ps_enabled() - Check whether powersave can be enabled.
- * @mors: Global Morse structure
- *
- * Return: true if powersave can be enabled.
- */
-bool morse_mac_ps_enabled(struct morse *mors);
-
-/**
  * Get slow clock mode
  *
  * Return: Slow clock mode. It will be a value from @ref enum morse_cmd_slow_clock_mode
  */
 enum morse_cmd_slow_clock_mode morse_mac_slow_clock_mode(void);
 
-void morse_mac_watchdog_create(struct morse *mors);
+int morse_mac_health_check_init(struct morse *mors);
+void morse_mac_health_check_finish(struct morse *mors);
 void morse_mac_mcs0_10_stats_dump(struct morse *mors, struct seq_file *file);
 void morse_mac_fill_tx_info(struct morse *mors, struct morse_skb_tx_info *tx_info,
 				   struct sk_buff *skb, struct ieee80211_vif *vif,
@@ -457,6 +452,8 @@ u8 morse_mac_get_mcs10_mode(void);
 u16 morse_mac_get_mcs_mask(void);
 bool morse_mac_is_rts_8mhz_enabled(void);
 bool morse_mac_is_cts_to_self_enabled(void);
+bool morse_mac_is_amsdu_enabled(struct morse *mors);
+bool morse_mac_is_airtime_fairness_enabled(void);
 
 /**
  * morse_mac_update_vif_bss_color - Update BSS color in Morse persistent vif config.
@@ -469,5 +466,10 @@ bool morse_mac_is_cts_to_self_enabled(void);
  */
 int morse_mac_update_vif_bss_color(struct morse *mors, struct ieee80211_vif *vif,
 								u8 bss_color);
+
+static inline int morse_mac_get_attach_config(void)
+{
+	return is_fullmac_mode() ? MORSE_CMD_HEADLESS_CFG_OPTION_KEEP_IFACES : 0;
+}
 
 #endif /* !_MORSE_MAC_H_ */

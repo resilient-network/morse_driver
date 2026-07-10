@@ -138,9 +138,9 @@ static inline int ieee80211_is_s1g_beacon(__le16 fc)
 }
 
 /**
- * ieee80211_channel_to_khz - convert ieee80211_channel to frequency in KHz
+ * ieee80211_channel_to_khz - convert ieee80211_channel to frequency in kHz
  * @chan: struct ieee80211_channel to convert
- * Return: The corresponding frequency (in KHz)
+ * Return: The corresponding frequency (in kHz)
  */
 static inline u32
 ieee80211_channel_to_khz(const struct ieee80211_channel_s1g *chan)
@@ -159,7 +159,8 @@ struct ieee80211_s1g_cap {
 #endif
 
 /* These structures are already in K5.10, lets use them */
-#if KERNEL_VERSION(5, 10, 11) > MAC80211_VERSION_CODE
+#if KERNEL_VERSION(5, 10, 11) > MAC80211_VERSION_CODE || \
+	KERNEL_VERSION(6, 18, 0) <= MAC80211_VERSION_CODE
 
 #define ieee80211_ext mm_ieee80211_ext
 struct mm_ieee80211_ext {
@@ -256,7 +257,7 @@ struct ieee80211_mgmt_s1g {
 
 /**
  * ieee80211_freq_khz_to_channel - convert frequency to channel number
- * @freq: center frequency in KHz
+ * @freq: center frequency in kHz
  * Return: The corresponding channel, or 0 if the conversion failed.
  */
 int __ieee80211_freq_khz_to_channel(u32 freq);

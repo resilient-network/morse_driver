@@ -38,6 +38,9 @@
 /* Number of HOST->CHIP pages to reserve exclusively for commands to avoid starvation */
 #define CMD_RSVED_CMD_PAGES_MAX 1
 
+/* Number of HOST->CHIP pages to reserve exclusively for beacons to avoid starvation */
+#define CMD_RSVED_BEACON_PAGES_MAX 1
+
 /**
  * Number of CHIP->HOST returned pages to cache in the host to speed up TX
  *
@@ -72,15 +75,14 @@ struct morse_pager_pkt_memory {
 
 struct morse_pageset {
 	struct morse *mors;
-
 	struct morse_skbq data_qs[PAGESET_TX_SKBQ_MAX];
 	struct morse_skbq beacon_q;
 	struct morse_skbq mgmt_q;
 	struct morse_skbq cmd_q;
-	unsigned long access_lock;
-
 	u8 flags;
 
+	/* @lock: Protects access to the populated and return pagers that make up this pageset */
+	struct mutex lock;
 	struct morse_pager *populated_pager;
 	struct morse_pager *return_pager;
 

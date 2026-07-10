@@ -236,7 +236,6 @@ struct morse_raw_periodic_t {
 
 /**
  * morse_raw_build_aid_list() - Generate an ordered AID array from a station bitmap.
- *
  * @aid_bitmap: Pointer to bitmap where bit position indicates an AID
  * @num_aids: The number of AIDs
  * @max_aid: the largest AID in the bitmap
@@ -490,18 +489,20 @@ static u8 *morse_raw_generate_assignment_with_aid_range(struct morse_vif *mors_v
 /**
  * morse_raw_generate_assignment() - Generate a single RAW assignment.
  *
- * @mors		Morse chip struct
+ * @mors_vif:		Morse VIF structure
+ * @ap:			AP structure
  * @config		RAW configuration
  * @rps_ie_start	A pointer to the start of this assignment in the RPS IE
  *
  * Return: the end of the RAW assignment in the RPS IE that was just written
  */
 static u8 *morse_raw_generate_assignment(struct morse_vif *mors_vif,
+					 struct morse_ap *ap,
 					 struct morse_raw_config *config, u8 *rps_ie_start)
 {
 	struct morse *mors = morse_vif_to_morse(mors_vif);
 	/* Pages aren't used yet so always use zero. */
-	struct morse_aid_list *aid_list = mors_vif->ap->raw.aid_list;
+	struct morse_aid_list *aid_list = ap->raw.aid_list;
 	u16 num_stas;
 	int current_beacon_start_aid_idx = INVALID_AID_IDX_VALUE;
 	int current_beacon_end_aid_idx = INVALID_AID_IDX_VALUE;
@@ -607,21 +608,23 @@ static u8 *morse_raw_generate_assignment(struct morse_vif *mors_vif,
  * morse_raw_generate_rps_ie() - Generate and update the RPS IE depending on RAW configurations.
  * Note: Caller should hold the RAW lock
  *
- * @mors:		Morse chip struct
+ * @mors_vif:		Morse VIF structure
+ * @ap:			AP structure
  * @config_list		List of RAW configurations
  * @num_configs		Number of RAW configurations in the list.
  *
  * Return 0 on success otherwise -EINVAL if a RAW configuration is invalid.
  */
 static int morse_raw_generate_rps_ie(struct morse_vif *mors_vif,
-					struct morse_raw_config *const *config_list,
-					u8 num_configs)
+				     struct morse_ap *ap,
+				     struct morse_raw_config *const *config_list,
+				     u8 num_configs)
 {
 	int i;
 	u8 *head;
 	u8 old_rps_ie_len;
 	struct morse *mors = morse_vif_to_morse(mors_vif);
-	struct morse_raw *raw = &mors_vif->ap->raw;
+	struct morse_raw *raw = &ap->raw;
 
 	/* Calculate the size so we can allocate memory */
 	int size =
@@ -660,7 +663,7 @@ static int morse_raw_generate_rps_ie(struct morse_vif *mors_vif,
 
 	/* Populate RPS IE using config settings. */
 	for (i = 0; i < num_configs; i++) {
-		head = morse_raw_generate_assignment(mors_vif, config_list[i], head);
+		head = morse_raw_generate_assignment(mors_vif, ap, config_list[i], head);
 		WARN_ON(head > (raw->rps_ie + size));
 	}
 
@@ -673,15 +676,16 @@ static int morse_raw_generate_rps_ie(struct morse_vif *mors_vif,
 
 /**
  * morse_raw_debug_print_aid_idx() - Print the end AID indices and values for RAWs
- *
- * @mors:	Morse chip struct
- * @aid_list:	Current AID list
+ * @mors_vif:		Morse VIF structure
+ * @ap:			AP structure
+ * @aid_list:		Current AID list
  */
 static void morse_raw_debug_print_aid_idx(struct morse_vif *mors_vif,
+					  struct morse_ap *ap,
 					  struct morse_aid_list *aid_list)
 {
 	struct morse *mors = morse_vif_to_morse(mors_vif);
-	struct morse_raw *raw = &mors_vif->ap->raw;
+	struct morse_raw *raw = &ap->raw;
 	struct morse_raw_config *config_ptr;
 
 	if (!raw->config_list)
@@ -925,9 +929,14 @@ static void morse_raw_do_update(struct morse_vif *mors_vif)
 	struct morse_raw_config *config_ptr;
 	u8 count = 0;
 	struct morse_ap *ap = mors_vif->ap;
-	struct morse_raw *raw = &ap->raw;
+	struct morse_raw *raw;
 	struct morse *mors = morse_vif_to_morse(mors_vif);
 	bool include_praws = false;
+
+	if (!ap)
+		return;
+
+	raw = &ap->raw;
 
 	/* RPS IE should only be regenerated if RAW is enabled. */
 	if (!test_bit(RAW_STATE_ENABLED, &raw->flags)) {
@@ -942,7 +951,7 @@ static void morse_raw_do_update(struct morse_vif *mors_vif)
 		morse_raw_refresh_aids(ap, raw);
 		/* Print the AID indices and values if debug logging is enabled. */
 		if (debug_mask & MORSE_MSG_DEBUG)
-			morse_raw_debug_print_aid_idx(mors_vif, raw->aid_list);
+			morse_raw_debug_print_aid_idx(mors_vif, ap, raw->aid_list);
 
 		/* Start broadcasting PRAWs for the new STAs */
 		morse_raw_start_praw_transmission(raw, false);
@@ -1017,7 +1026,7 @@ static void morse_raw_do_update(struct morse_vif *mors_vif)
 
 	if (count) {
 		/* This cast looks strange but adds some protection. */
-		morse_raw_generate_rps_ie(mors_vif,
+		morse_raw_generate_rps_ie(mors_vif, ap,
 			(struct morse_raw_config * const *)configs_list, count);
 		mutex_unlock(&raw->lock);
 
@@ -1558,21 +1567,19 @@ static int morse_raw_process_static_cmd(struct morse_vif *mors_vif, struct morse
 
 int morse_raw_process_cmd(struct morse_vif *mors_vif, struct morse_cmd_req_config_raw *req)
 {
+	struct morse_ap *ap = mors_vif->ap;
 	struct morse_raw *raw;
 	int ret = 0;
 	struct ieee80211_vif *vif = morse_vif_to_ieee80211_vif(mors_vif);
 	struct morse *mors = morse_vif_to_morse(mors_vif);
 	bool is_dynamic_req = ((le32_to_cpu(req->flags) & MORSE_CMD_CFG_RAW_FLAG_DYNAMIC) != 0);
 
-	if (vif->type != NL80211_IFTYPE_AP) {
+	if (vif->type != NL80211_IFTYPE_AP || !ap) {
 		MORSE_RAW_INFO(mors, "RAW not supported on non-AP interfaces\n");
 		return -ENOTSUPP;
 	}
 
-	if (!mors_vif->ap)
-		return -ENOTSUPP;
-
-	raw = &mors_vif->ap->raw;
+	raw = &ap->raw;
 
 	if (is_dynamic_req)
 		ret = morse_raw_process_dynamic_cmd(mors_vif, raw, req);
@@ -1584,8 +1591,13 @@ int morse_raw_process_cmd(struct morse_vif *mors_vif, struct morse_cmd_req_confi
 
 void morse_raw_beacon_sent(struct morse_vif *mors_vif)
 {
-	/* Ok to assume this is an AP interface, considering its sending beacons */
-	struct morse_raw *raw = &mors_vif->ap->raw;
+	struct morse_ap *ap = mors_vif->ap;
+	struct morse_raw *raw;
+
+	if (!ap)
+		return;
+
+	raw = &ap->raw;
 
 	if (morse_raw_is_enabled(mors_vif) && test_bit(RAW_STATE_UPDATE_EACH_BEACON, &raw->flags)) {
 		/* If we were too slow updating, validity may be out of sync for PRAWs */
@@ -1714,7 +1726,8 @@ void morse_raw_config_list_delete(void *conf, struct ieee80211_vif *vif)
 void morse_raw_finish(struct morse_vif *mors_vif, bool is_restarting)
 {
 	struct morse_raw *raw;
-	struct morse_raw_config *config, *tmp;
+	struct morse_raw_config *config;
+	struct morse_raw_config *tmp;
 
 	if (!mors_vif || !mors_vif->ap)
 		return;

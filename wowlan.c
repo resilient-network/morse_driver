@@ -238,17 +238,23 @@ int morse_wowlan_op_resume(struct ieee80211_hw *hw)
 	}
 
 exit:
-	mutex_unlock(&mors->lock);
 	trace_wowlan_resume_return(ret);
 
 	if (ret) {
 		/* Unconditionally clear suspend system flag on failure */
 		clear_bit(MORSE_STATE_FLAG_SYSTEM_IN_SUSPEND, &mors->state_flags);
+
+		if (!morse_coredump_new(mors, MORSE_COREDUMP_REASON_FAILED_TO_RESUME))
+			set_bit(MORSE_STATE_FLAG_DO_COREDUMP, &mors->state_flags);
+
+		mutex_unlock(&mors->lock);
+
 		MORSE_WOWLAN_ERR(mors, "%s: failed - requesting HW restart\n", __func__);
 		morse_hw_restart(mors);
 		/* zero ret despite failures above, recovery will occur in restart flow */
 		ret = 0;
 	} else {
+		mutex_unlock(&mors->lock);
 		MORSE_WOWLAN_INFO(mors, "%s: complete\n", __func__);
 	}
 

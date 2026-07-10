@@ -93,6 +93,8 @@
 #define DOT11AH_MAX_EID				(256)
 #endif
 
+#define DOT11AH_MAX_ZERO_LEN_IES_IN_FRAME (IEEE80211_MAX_FRAME_LEN / 2)
+
 #define DOT11AH_VERSION __stringify(MORSE_VERSION)
 /**
  * The Primary Channel Width subfield, located in B0 of this
@@ -238,7 +240,6 @@ enum ieee80211_s1g_protected_actioncode {
 #define CHANNELIZATION_SCHEME_IEEE80211_2024 2
 /** Channelization per IEEE Std 802.11-REVmf */
 #define CHANNELIZATION_SCHEME_IEEE80211_REVMF 3
-#define CHANNELIZATION_SCHEME_DEFAULT CHANNELIZATION_SCHEME_IEEE80211_REVMF
 
 /**
  * enum ieee80211_li_usf - listen interval unified scal factors
@@ -397,6 +398,7 @@ struct morse_dot11ah_cssid_item {
  */
 enum morse_dot11ah_region {
 	MORSE_AU,
+	MORSE_BR,
 	MORSE_CA,
 	MORSE_EU,
 	MORSE_GB,
@@ -755,6 +757,7 @@ struct morse_dot11ah_cssid_item *morse_dot11ah_find_bssid(const u8 bssid[ETH_ALE
  * @s1g_ies_len: length of the S1G information elements.
  * @bssid: identifier of the BSS network.
  * @vals: pointer to the values to be updated in a beacon, NULL for other frames.
+ * @fc: Frame control field of the frame carrying the IEs used to update BSS record.
  *
  * Stores BSS information and S1G IEs for each BSS network, if its not already
  * stored. Each stored item is found by searching the integer value of BSSID,
@@ -762,7 +765,8 @@ struct morse_dot11ah_cssid_item *morse_dot11ah_find_bssid(const u8 bssid[ETH_ALE
  */
 void morse_dot11ah_store_cssid(struct dot11ah_ies_mask *ies_mask, u16 capab_info, u8 *s1g_ies,
 			       int s1g_ies_len, const u8 *bssid,
-			       struct dot11ah_update_rx_beacon_vals *vals);
+			       struct dot11ah_update_rx_beacon_vals *vals,
+			       __le16 fc);
 
 int morse_dot11ah_parse_ies(u8 *start, size_t len, struct dot11ah_ies_mask *ies_mask);
 
@@ -968,7 +972,8 @@ int morse_mac_set_country_info_from_regdom(const struct morse_regdomain *morse_d
  * Return: Channel bandwith.
  */
 
-#if KERNEL_VERSION(5, 10, 11) > MAC80211_VERSION_CODE
+#if KERNEL_VERSION(5, 10, 11) > MAC80211_VERSION_CODE || \
+	KERNEL_VERSION(6, 18, 0) <= MAC80211_VERSION_CODE
 u8 ch_flag_to_chan_bw(enum morse_dot11ah_channel_flags flags);
 #else
 u8 ch_flag_to_chan_bw(enum ieee80211_channel_flags flags);

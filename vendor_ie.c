@@ -40,10 +40,13 @@ static int morse_vendor_ie_add_to_ie_list(struct morse_vif *mors_vif, u16 mgmt_t
 {
 	struct morse_vendor_ie *vie_config;
 	struct vendor_ie_list_item *item;
-	const u8 full_ie_length = data_len + sizeof(item->ie.element_id) + sizeof(item->ie.len);
+	struct ieee80211_vendor_ie *ie;
+	const u8 ie_hdr_len = sizeof(ie->element_id) + sizeof(ie->len);
+	const u16 full_ie_length = ie_hdr_len + data_len;
 
 	/* Make sure we are within bounds. Vendor IEs must have at least an OUI & OUI type. */
-	if (data_len <= sizeof(item->ie.oui) || data_len > MORSE_MAX_VENDOR_IE_SIZE)
+	if (data_len < (sizeof(ie->oui) + sizeof(ie->oui_type)) ||
+	    data_len > MORSE_MAX_VENDOR_IE_SIZE)
 		return -EINVAL;
 
 	if (!mors_vif)
@@ -53,18 +56,20 @@ static int morse_vendor_ie_add_to_ie_list(struct morse_vif *mors_vif, u16 mgmt_t
 	if (!vie_config)
 		return -ENXIO;
 
-	if ((morse_vendor_ie_get_ies_length(mors_vif, mgmt_type_mask) + full_ie_length) >
+	if (morse_vendor_ie_get_ies_length(mors_vif, mgmt_type_mask) + full_ie_length >
 	    max_total_vendor_ie_bytes)
 		return -ENOSPC;
 
-	item = kzalloc(sizeof(*item) + data_len, GFP_KERNEL);
+	item = kzalloc(sizeof(*item) + full_ie_length, GFP_KERNEL);
 	if (!item)
 		return -ENOMEM;
 
 	item->mgmt_type_mask = mgmt_type_mask;
-	item->ie.element_id = WLAN_EID_VENDOR_SPECIFIC;
-	item->ie.len = data_len;
-	memcpy(item->ie.oui, data, data_len);
+	ie = (struct ieee80211_vendor_ie *)item->element;
+	ie->element_id = WLAN_EID_VENDOR_SPECIFIC;
+	ie->len = (u8)data_len;
+
+	memcpy(item->element + ie_hdr_len, data, data_len);
 
 	spin_lock_bh(&mors_vif->vendor_ie.lock);
 	list_add_tail(&item->list, &vie_config->ie_list);
@@ -378,9 +383,14 @@ u16 morse_vendor_ie_get_ies_length(struct morse_vif *mors_vif, u16 mgmt_type_mas
 
 	list_for_each_entry(vendor_ie, &vie_config->ie_list, list) {
 		if (vendor_ie->mgmt_type_mask & mgmt_type_mask) {
-			vendor_ie_length += sizeof(vendor_ie->ie.element_id);
-			vendor_ie_length += sizeof(vendor_ie->ie.len);
-			vendor_ie_length += vendor_ie->ie.len;
+			struct ieee80211_vendor_ie *ie =
+					(struct ieee80211_vendor_ie *)vendor_ie->element;
+			if (!ie)
+				continue;
+
+			vendor_ie_length += sizeof(ie->element_id);
+			vendor_ie_length += sizeof(ie->len);
+			vendor_ie_length += ie->len;
 		}
 	}
 
@@ -403,14 +413,19 @@ int morse_vendor_ie_add_ies(struct morse_vif *mors_vif,
 
 	list_for_each_entry(item, &vie_config->ie_list, list) {
 		if (item->mgmt_type_mask & mgmt_type_mask) {
+			struct ieee80211_vendor_ie *ie =
+					(struct ieee80211_vendor_ie *)item->element;
+			if (!ie)
+				continue;
+
 			element = morse_dot11_ies_create_ie_element(ies_mask,
 								    WLAN_EID_VENDOR_SPECIFIC,
-								    item->ie.len, false, false);
+								    ie->len, false, false);
 
 			if (!element)
 				return -EINVAL;
 
-			element->ptr = (u8 *)item->ie.oui;
+			element->ptr = (u8 *)ie->oui;
 		}
 	}
 

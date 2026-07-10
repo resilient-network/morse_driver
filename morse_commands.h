@@ -1,5 +1,5 @@
 /*
- * Copyright 2024-2025 Morse Micro
+ * Copyright 2024-2026 Morse Micro
  * SPDX-License-Identifier: GPL-2.0-or-later
  *
  * Driver - Host Interface API
@@ -16,8 +16,8 @@
 #define __sle32 __le32
 #define __sle64 __le64
 
-#define MORSE_CMD_SEMVER_MAJOR 56
-#define MORSE_CMD_SEMVER_MINOR 17
+#define MORSE_CMD_SEMVER_MAJOR 57
+#define MORSE_CMD_SEMVER_MINOR 2
 #define MORSE_CMD_SEMVER_PATCH 0
 
 #define MORSE_CMD_TYPE_REQ  BIT(0)
@@ -132,6 +132,7 @@ enum morse_cmd_id {
 	MORSE_CMD_ID_GET_CONNECTION_STATE = 0x0805,
 	MORSE_CMD_ID_SET_RATE_CONTROL	  = 0x0807,
 	MORSE_CMD_ID_CONNECT		  = 0x0808,
+	MORSE_CMD_ID_GET_INTERFACE	  = 0x0809,
 
 	/* Temporary commands starting at 0x1000 */
 	MORSE_CMD_ID_GET_RSSI		       = 0x1002,
@@ -146,17 +147,18 @@ enum morse_cmd_id {
 	MORSE_CMD_ID_TX_POLAR		       = 0x100E,
 
 	/* Events starting at 0x4000 */
-	MORSE_CMD_ID_EVT_STA_STATE	      = 0x4001,
-	MORSE_CMD_ID_EVT_BEACON_LOSS	      = 0x4002,
-	MORSE_CMD_ID_EVT_SIG_FIELD_ERROR      = 0x4003,
-	MORSE_CMD_ID_EVT_UMAC_TRAFFIC_CONTROL = 0x4004,
-	MORSE_CMD_ID_EVT_DHCP_LEASE_UPDATE    = 0x4005,
-	MORSE_CMD_ID_EVT_OCS_DONE	      = 0x4006,
-	MORSE_CMD_ID_EVT_HW_SCAN_DONE	      = 0x4011,
-	MORSE_CMD_ID_EVT_CHANNEL_USAGE	      = 0x4012,
-	MORSE_CMD_ID_EVT_CONNECTION_LOSS      = 0x4013,
-	MORSE_CMD_ID_EVT_SCHED_SCAN_RESULTS   = 0x4014,
-	MORSE_CMD_ID_EVT_CQM_RSSI_NOTIFY      = 0x4015,
+	MORSE_CMD_ID_EVT_STA_STATE		    = 0x4001,
+	MORSE_CMD_ID_EVT_BEACON_LOSS		    = 0x4002,
+	MORSE_CMD_ID_EVT_SIG_FIELD_ERROR	    = 0x4003,
+	MORSE_CMD_ID_EVT_UMAC_TRAFFIC_CONTROL	    = 0x4004,
+	MORSE_CMD_ID_EVT_DHCP_LEASE_UPDATE	    = 0x4005,
+	MORSE_CMD_ID_EVT_OCS_DONE		    = 0x4006,
+	MORSE_CMD_ID_EVT_HW_SCAN_DONE		    = 0x4011,
+	MORSE_CMD_ID_EVT_CHANNEL_USAGE		    = 0x4012,
+	MORSE_CMD_ID_EVT_CONNECTION_LOSS	    = 0x4013,
+	MORSE_CMD_ID_EVT_SCHED_SCAN_RESULTS	    = 0x4014,
+	MORSE_CMD_ID_EVT_CQM_RSSI_NOTIFY	    = 0x4015,
+	MORSE_CMD_ID_EVT_NDP_PROBE_REQUEST_RECEIVED = 0x4017,
 
 	/* Fullmac-specific events */
 	MORSE_CMD_ID_EVT_SCAN_DONE	     = 0x4007,
@@ -180,7 +182,6 @@ enum morse_cmd_id {
 	MORSE_CMD_ID_BLOCKACK		       = 0x0017,
 	MORSE_CMD_ID_TURBO_MODE		       = 0x0018,
 	MORSE_CMD_ID_CFG_ACI_SCAN	       = 0x001F,
-	MORSE_CMD_ID_CONNECT_DEPRECATED	       = 0x0803,
 	MORSE_CMD_ID_SET_MODULATION	       = 0x1000,
 	MORSE_CMD_ID_START_SAMPLE_PLAY	       = 0x8002,
 	MORSE_CMD_ID_STOP_SAMPLE_PLAY	       = 0x8003,
@@ -203,6 +204,22 @@ struct morse_cmd_mac_addr {
 enum morse_cmd_ocs_subcmd {
 	MORSE_CMD_OCS_SUBCMD_CONFIG = 1,
 	MORSE_CMD_OCS_SUBCMD_STATUS = 2,
+};
+
+/**
+ * enum morse_cmd_boot_code - Boot codes - set by firmware and read by the driver
+ */
+enum morse_cmd_boot_code {
+	MORSE_CMD_BOOT_CODE_NONE		    = 0,
+	MORSE_CMD_BOOT_CODE_BCF_INIT		    = 1,
+	MORSE_CMD_BOOT_CODE_VALID_BCF_NOT_FOUND	    = 2,
+	MORSE_CMD_BOOT_CODE_BCF_LEN_INVALID	    = 3,
+	MORSE_CMD_BOOT_CODE_BCF_CRC_INVALID	    = 4,
+	MORSE_CMD_BOOT_CODE_BCF_UNSUPPORTED_VERSION = 5,
+	MORSE_CMD_BOOT_CODE_BCF_REGDOM_LEN_INVALID  = 6,
+	MORSE_CMD_BOOT_CODE_BCF_REGDOM_CRC_INVALID  = 7,
+	MORSE_CMD_BOOT_CODE_BCF_PARSE_FAIL	    = 8,
+	MORSE_CMD_BOOT_CODE_COMPLETE		    = 255,
 };
 
 /**
@@ -276,23 +293,23 @@ enum morse_cmd_dot11_proto_mode {
  * @op_chan_freq_hz: Center frequency of the operating channel
  * @op_bw_mhz: Operating channel bandwidth in MHz
  * @pri_bw_mhz: Primary channel bandwidth in MHz
- * @pri_1mhz_chan_idx: The index of the 1MHz channel within the operating channel. This is a value 0
- *                     for 1MHz channel, 0-1 for 2MHz, 0-3 for 4MHz, 0-7 for 8MHz and 0-15 for
- *                     16MHz.
+ * @pri_1mhz_chan_idx: The index of the 1 MHz channel within the operating channel. This is a value
+ *                     0 for 1 MHz channel, 0-1 for 2 MHz, 0-3 for 4 MHz, 0-7 for 8 MHz and 0-15 for
+ *                     16 MHz.
  * @dot11_mode: enum morse_cmd_dot11_proto_mode
  * @__deprecated_reg_tx_power_set: Deprecated flag (will always be set).
  * @is_off_channel: Indicates that the channel will not be the device's main operating channel.
  *
  * In 802.11ah a BSS supports operating channel widths of 1, 2, 4, 8 and 16 MHz
- * and is required to use a 1MHz or 2MHz primary channel width.
- * Additionally 11ah requires that a 1MHz sub band channel must be available at all
+ * and is required to use a 1 MHz or 2 MHz primary channel width.
+ * Additionally 11ah requires that a 1 MHz sub band channel must be available at all
  * operating channel widths regardless of the primary channel width.
- * The location of the 1MHz channel must be contained within the 1/2MHz primary channel.
- * The location of the 1MHz channel within the operating channel can be defined with
+ * The location of the 1 MHz channel must be contained within the 1/2 MHz primary channel.
+ * The location of the 1 MHz channel within the operating channel can be defined with
  * an integer index.
  *
- * For example, shown is an 8MHz operating channel with a 2MHz primary bandwidth
- * and the 1MHz channel at index 1:
+ * For example, shown is an 8 MHz operating channel with a 2 MHz primary bandwidth
+ * and the 1 MHz channel at index 1:
  *
  * | <--------- 8MHz operating channel ----------> | Operating channel
  * | ----4MHz primary----- | ----4MHz secondary--- | 8MHz packet
@@ -307,7 +324,7 @@ enum morse_cmd_dot11_proto_mode {
  *
  * The index of the next higher sub band can be calculated by
  * floor(primary_1mhz_channel_index / sub_band_width).
- * E.g. if the 1MHz channel index is 3, the 2MHz primary is at floor(3/2) = 1
+ * E.g. if the 1 MHz channel index is 3, the 2 MHz primary is at floor(3/2) = 1
  */
 struct morse_cmd_req_set_channel {
 	struct morse_cmd_header hdr;
@@ -346,9 +363,9 @@ struct morse_cmd_req_get_channel {
  * @op_chan_freq_hz: Centre frequency of the operating channel
  * @op_chan_bw_mhz: Operating channel bandwidth in MHz
  * @pri_chan_bw_mhz: Primary channel bandwidth in MHz
- * @pri_1mhz_chan_idx: The index of the 1MHz channel within the operating channel. This is a value 0
- *                     for 1MHz channel, 0-1 for 2MHz, 0-3 for 4MHz, 0-7 for 8MHz and 0-15 for
- *                     16MHz.
+ * @pri_1mhz_chan_idx: The index of the 1 MHz channel within the operating channel. This is a value
+ *                     0 for 1 MHz channel, 0-1 for 2 MHz, 0-3 for 4 MHz, 0-7 for 8 MHz and 0-15 for
+ *                     16 MHz.
  *
  * Confirm message for get current channel
  */
@@ -1178,14 +1195,16 @@ struct morse_cmd_resp_disable_key {
  * @MORSE_CMD_STANDBY_MODE_EXIT: The external host is indicating that it's now awake
  * @MORSE_CMD_STANDBY_MODE_ENTER: The external host is indicating that it's going into standby mode
  * @MORSE_CMD_STANDBY_MODE_SET_CONFIG_V1: This version of the config command has since been
- *                                        deprecated (see v3 below)
+ *                                        deprecated (see v4 below)
  * @MORSE_CMD_STANDBY_MODE_SET_STATUS_PAYLOAD: The external host provides a payload that gets
  *                                             appended to status frames
  * @MORSE_CMD_STANDBY_MODE_SET_WAKE_FILTER: The external host provides a filter to be applied to
  *                                          incoming standby wake frames
  * @MORSE_CMD_STANDBY_MODE_SET_CONFIG_V2: This version of the config command has since been
- *                                        deprecated (see v3 below)
- * @MORSE_CMD_STANDBY_MODE_SET_CONFIG_V3: The external host sets a number of configuration options
+ *                                        deprecated (see v4 below)
+ * @MORSE_CMD_STANDBY_MODE_SET_CONFIG_V3: This version of the config command has since been
+ *                                        deprecated (see v4 below)
+ * @MORSE_CMD_STANDBY_MODE_SET_CONFIG_V4: The external host sets a number of configuration options
  *                                        for standby mode
  */
 enum morse_cmd_standby_mode {
@@ -1196,6 +1215,7 @@ enum morse_cmd_standby_mode {
 	MORSE_CMD_STANDBY_MODE_SET_WAKE_FILTER	  = 4,
 	MORSE_CMD_STANDBY_MODE_SET_CONFIG_V2	  = 5,
 	MORSE_CMD_STANDBY_MODE_SET_CONFIG_V3	  = 6,
+	MORSE_CMD_STANDBY_MODE_SET_CONFIG_V4	  = 7,
 };
 
 /**
@@ -1203,7 +1223,7 @@ enum morse_cmd_standby_mode {
  * @MORSE_CMD_STANDBY_MODE_EXIT_REASON_NONE: No specific reason for exiting standby mode
  * @MORSE_CMD_STANDBY_MODE_EXIT_REASON_WAKEUP_FRAME: The STA has received the wakeup frame
  * @MORSE_CMD_STANDBY_MODE_EXIT_REASON_ASSOCIATE: The STA needs to (re)associate
- * @MORSE_CMD_STANDBY_MODE_EXIT_REASON_EXT_INPUT: The STA's external input pin has fired
+ * @MORSE_CMD_STANDBY_MODE_EXIT_REASON_EXT_INPUT: The STA has received an external input
  * @MORSE_CMD_STANDBY_MODE_EXIT_REASON_WHITELIST_PKT: Whitelisted packet received
  * @MORSE_CMD_STANDBY_MODE_EXIT_REASON_TCP_CONNECTION_LOST: TCP connection lost
  * @MORSE_CMD_STANDBY_MODE_EXIT_REASON_HW_SCAN_NOT_ENABLED: HW scan is not enabled
@@ -1245,6 +1265,8 @@ enum morse_cmd_ieee80211_sta_state {
  * @dst_ip: Destination IP address
  * @dst_port: Destination UDP port
  * @pad: Padding for word aligned access in config. (It may grow in future)
+ * @disassoc_on_wake: Send a protected disassoc (best effort) to the AP upon a 'wake host' event.
+ *                    This will prevent an SA query from the AP upon reconnection to the BSS.
  * @deep_sleep_increment_s: Time in seconds to increment each successive deep sleep
  * @deep_sleep_max_s: Max time to deep sleep for
  * @deep_sleep_scan_iterations: Number of deep sleeps iterations between scans
@@ -1256,7 +1278,8 @@ struct morse_cmd_standby_set_config {
 	__le32 src_ip;
 	__le32 dst_ip;
 	__le16 dst_port;
-	u8 pad[2];
+	u8 pad[1];
+	u8 disassoc_on_wake;
 	__le32 deep_sleep_increment_s;
 	__le32 deep_sleep_max_s;
 	__le32 deep_sleep_scan_iterations;
@@ -1298,10 +1321,13 @@ struct morse_cmd_standby_set_wake_filter {
  * Standby mode exit response structure
  * @reason: Reason for exiting Standby mode, see @ref morse_cmd_standby_mode_exit_reason
  * @sta_state: Current connection state
+ * @gpio_num: When the reason is EXT_INPUT, this field is set to the GPIO number of the GPIO that
+ *            received the external input.
  */
 struct morse_cmd_standby_mode_exit {
 	u8 reason;
 	u8 sta_state;
+	u8 gpio_num;
 } __packed;
 
 /**
@@ -2421,7 +2447,7 @@ struct morse_cmd_req_mbssid {
 #define MORSE_CMD_MESH_BEACONLESS_MODE_DISABLE 0
 #define MORSE_CMD_MESH_BEACONLESS_MODE_ENABLE  1
 #define MORSE_CMD_MESH_PEER_LINKS_MIN	       0
-#define MORSE_CMD_MESH_PEER_LINKS_MAX	       10
+#define MORSE_CMD_MESH_PEER_LINKS_MAX	       20
 
 /**
  * struct morse_cmd_req_set_mesh_config - request message for SET_MESH_CONFIG
@@ -2739,7 +2765,7 @@ struct morse_cmd_req_get_connection_state {
  * @dtim_period: DTIM period
  * @rssi: Signal strength of the most recently received beacon in dBm
  * @connected_time_s: Time since connection was established in seconds
- * @bssid: BSSID of the connected AP
+ * @bssid: BSSID of the AP to which the STA is associated
  *
  * Connection state response (fullmac only)
  */
@@ -2774,6 +2800,25 @@ struct morse_cmd_req_set_rate_control {
 	__le16 mcs_mask;
 	u8 mcs10_mode;
 	u8 enable_sgi_rc;
+} __packed;
+
+/**
+ * struct morse_cmd_req_get_interface - request message for GET_INTERFACE
+ */
+struct morse_cmd_req_get_interface {
+	struct morse_cmd_header hdr;
+} __packed;
+
+/**
+ * struct morse_cmd_resp_get_interface - response message for GET_INTERFACE
+ * @vif_type: Type of the interface, see @ref{enum morse_cmd_interface_type}
+ * @mac_addr: MAC address of the found interface
+ */
+struct morse_cmd_resp_get_interface {
+	struct morse_cmd_header hdr;
+	__le32 status;
+	__le16 vif_type;
+	u8 mac_addr[MORSE_CMD_MAC_ADDR_LEN];
 } __packed;
 
 /**
@@ -2864,7 +2909,7 @@ struct morse_cmd_resp_set_txop {
  *             we must adjust our ack timeouts appropriately.
  * @control_response_1mhz_en: Sets the control response mode. 0  : Control frames that are a
  *                            response are sent at the BW of the original packet 1  : Control frames
- *                            that are a response are sent at 1MHz
+ *                            that are a response are sent at 1 MHz
  */
 struct morse_cmd_req_set_control_response {
 	struct morse_cmd_header hdr;
@@ -3086,6 +3131,17 @@ struct morse_cmd_evt_cqm_rssi_notify {
 } __packed;
 
 /**
+ * struct morse_cmd_evt_ndp_probe_request_received - event message for NDP_PROBE_REQUEST_RECEIVED
+ * @rx_bw_mhz: Bandwidth the probe was received on
+ * @is_pv1: Whether the RX'd probe request is pv1
+ */
+struct morse_cmd_evt_ndp_probe_request_received {
+	struct morse_cmd_header hdr;
+	u8 rx_bw_mhz;
+	u8 is_pv1;
+} __packed;
+
+/**
  * struct morse_cmd_evt_scan_done - event message for SCAN_DONE
  * @aborted: Whether the scan terminated before all channels were scanned
  *
@@ -3222,10 +3278,12 @@ enum morse_cmd_hart_id {
 /**
  * struct morse_cmd_req_force_assert - request message for FORCE_ASSERT
  * @hart_id: Target hart to crash with an intended assert @ref morse_cmd_hart_id
+ * @delay: Delay until a forced assertion is triggered on chip (milliseconds).
  */
 struct morse_cmd_req_force_assert {
 	struct morse_cmd_header hdr;
 	__le32 hart_id;
+	__le32 delay;
 } __packed;
 
 #define MORSE_CMD_HOST_BLOCK_TX_FRAMES BIT(0)
@@ -3252,6 +3310,7 @@ enum morse_cmd_slow_clock_mode {
 
 /**
  * enum morse_cmd_param_id - Subcommand IDs for generic get / set command
+ * @MORSE_CMD_PARAM_ID_AUTOCONNECT: Automatically reconnect if connection is lost (FullMAC only).
  */
 enum morse_cmd_param_id {
 	MORSE_CMD_PARAM_ID_MAX_TRAFFIC_DELIVERY_WAIT_US	  = 0,
@@ -3282,7 +3341,11 @@ enum morse_cmd_param_id {
 	MORSE_CMD_PARAM_ID_DEFAULT_ACTIVE_SCAN_DWELL_MS = 27,
 	MORSE_CMD_PARAM_ID_CTS_TO_SELF			= 28,
 	MORSE_CMD_PARAM_ID_CHANNELIZATION		= 29,
-	MORSE_CMD_PARAM_ID_LAST				= 30,
+	MORSE_CMD_PARAM_ID_CRYPTO_IN_HOST		= 30,
+	MORSE_CMD_PARAM_ID_AUTOCONNECT			= 31,
+	MORSE_CMD_PARAM_ID_HOST_PWR_OFF_GPIO		= 32,
+	MORSE_CMD_PARAM_ID_HOST_PWR_OFF_GPIO_PULSE_MS	= 33,
+	MORSE_CMD_PARAM_ID_LAST				= 34,
 };
 
 /**
@@ -3353,31 +3416,6 @@ struct morse_cmd_req_set_modulation {
 struct morse_cmd_resp_set_modulation {
 	struct morse_cmd_header hdr;
 	__le32 status;
-} __packed;
-
-/**
- * struct morse_cmd_req_connect_deprecated - request message for CONNECT_DEPRECATED
- * @auth_type: Authentication type to use when connecting. See @ref enum morse_cmd_connect_auth_type
- * @ssid_len: Length of @ref ssid
- * @ssid: SSID to connect to
- * @sae_pwd_len: Length of @ref sae_pwd
- * @sae_pwd: Password to use for authentication, if @ref auth_type is @c CONNECT_AUTH_TYPE_SAE
- * @extra_assoc_ies_len: Length of @ref extra_assoc_ies
- * @extra_assoc_ies: Association IEs from host supplicant
- *
- * Deprecated. Use CONNECT.
- */
-struct morse_cmd_req_connect_deprecated {
-	struct morse_cmd_header hdr;
-	u8 auth_type;
-	u8 ssid_len;
-	u8 ssid[MORSE_CMD_SSID_MAX_LEN];
-	u8 __padding_0[3];
-	u8 sae_pwd_len;
-	u8 sae_pwd[MORSE_CMD_SAE_PASSWORD_MAX_LEN];
-	u8 __padding_1[6];
-	__le16 extra_assoc_ies_len;
-	u8 extra_assoc_ies[];
 } __packed;
 
 #endif //_MORSE_COMMANDS_H_

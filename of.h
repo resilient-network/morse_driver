@@ -20,7 +20,7 @@
  * * 0 - if device tree parsed successfully
  * * -ENOENT - required item in device tree was missing
  */
-int morse_of_probe(struct device *dev, struct morse_hw_cfg *cfg,
+int morse_of_probe(struct device *dev, struct morse_gpios *gpios,
 		   const struct of_device_id *match_table);
 
 #endif /* !_MORSE_OF_H_ */

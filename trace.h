@@ -67,6 +67,23 @@ DECLARE_EVENT_CLASS(morse_bus_error,
 		  __entry->reg_bulk, __entry->ret)
 );
 
+DECLARE_EVENT_CLASS(morse_state_change,
+	TP_PROTO(const char *old, const char *new),
+	TP_ARGS(old, new),
+	TP_STRUCT__entry(__string(old, old)
+			 __string(new, new)
+	),
+#if KERNEL_VERSION(6, 10, 0) > LINUX_VERSION_CODE
+	TP_fast_assign(__assign_str(old, old);
+		       __assign_str(new, new);
+#else
+	TP_fast_assign(__assign_str(old);
+		       __assign_str(new);
+#endif
+	),
+	TP_printk("%s -> %s", __get_str(old), __get_str(new))
+);
+
 DEFINE_EVENT(morse_bus_error, sdio_err,
 	TP_PROTO(const char *op, uint fn, u32 address, uint len, u32 reg_base, u32 reg_bulk,
 		 int ret),
@@ -79,6 +96,14 @@ DEFINE_EVENT(morse_u32_evt, beacon_tasklet_enter,
 
 DEFINE_EVENT(morse_u32_hex_evt, beacon_tasklet_exit,
 	TP_PROTO(u32 value), TP_ARGS(value)
+);
+
+DEFINE_EVENT(morse_u32_evt, hw_stop,
+	TP_PROTO(u32 value), TP_ARGS(value)
+);
+
+DEFINE_EVENT(morse_state_change, hw_state,
+	TP_PROTO(const char *old, const char *new), TP_ARGS(old, new)
 );
 
 #ifdef CONFIG_MORSE_TRACE_LOG_MSG
@@ -226,12 +251,6 @@ DEFINE_EVENT(morse_u32_evt, ps_to_host_busy_irq,
 DEFINE_EVENT(morse_u32_evt, ps_chip_wake_error,
 	TP_PROTO(u32 timeout), TP_ARGS(timeout)
 );
-DEFINE_EVENT(morse_u32_evt, ps_suspend_enter,
-	TP_PROTO(u32 value), TP_ARGS(value)
-);
-DEFINE_EVENT(morse_u32_evt, ps_suspend_exit,
-	TP_PROTO(u32 value), TP_ARGS(value)
-);
 #else
 #define trace_ps_wake_start(...)
 #define trace_ps_wake_end(...)
@@ -239,8 +258,6 @@ DEFINE_EVENT(morse_u32_evt, ps_suspend_exit,
 #define trace_ps_wake_gpio(...)
 #define trace_ps_to_host_busy_irq(...)
 #define trace_ps_chip_wake_error(...)
-#define trace_ps_suspend_enter(...)
-#define trace_ps_suspend_exit(...)
 #endif /* CONFIG_MORSE_TRACE_PS */
 
 #ifdef CONFIG_MORSE_TRACE_PAGER_HW
@@ -335,6 +352,9 @@ DEFINE_EVENT(morse_pagesets_channel, pagesets_tx_remaining,
 DEFINE_EVENT(morse_u32_evt, pagesets_tx_buffers_avail,
 	TP_PROTO(u32 value), TP_ARGS(value)
 );
+DEFINE_EVENT(morse_pagesets_channel, pagesets_rx_skbq_enqueue_fail,
+	TP_PROTO(enum morse_skb_channel channel, uint count), TP_ARGS(channel, count)
+);
 #else
 #define trace_pagesets_work_enter(...)
 #define trace_pagesets_work_exit(...)
@@ -344,6 +364,7 @@ DEFINE_EVENT(morse_u32_evt, pagesets_tx_buffers_avail,
 #define trace_pagesets_tx(...)
 #define trace_pagesets_tx_remaining(...)
 #define trace_pagesets_tx_buffers_avail(...)
+#define trace_pagesets_rx_skbq_enqueue_fail(...)
 #endif /* CONFIG_MORSE_TRACE_PAGESET */
 
 #ifdef CONFIG_MORSE_TRACE_HW_IRQ
@@ -370,23 +391,6 @@ DEFINE_EVENT(morse_rx, rx_processed,
 #endif /* CONFIG_MORSE_TRACE_RX */
 
 #ifdef CONFIG_MORSE_TRACE_HEADLESS
-DECLARE_EVENT_CLASS(morse_state_change,
-	TP_PROTO(const char *old, const char *new),
-	TP_ARGS(old, new),
-	TP_STRUCT__entry(__string(old, old)
-			 __string(new, new)
-	),
-#if KERNEL_VERSION(6, 10, 0) > LINUX_VERSION_CODE
-	TP_fast_assign(__assign_str(old, old);
-		       __assign_str(new, new);
-#else
-	TP_fast_assign(__assign_str(old);
-		       __assign_str(new);
-#endif
-	),
-	TP_printk("%s -> %s", __get_str(old), __get_str(new))
-);
-
 DEFINE_EVENT(morse_state_change, headless_work,
 	TP_PROTO(const char *old, const char *new), TP_ARGS(old, new)
 );

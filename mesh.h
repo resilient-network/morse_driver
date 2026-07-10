@@ -165,6 +165,17 @@ static inline void morse_enable_mbca_capability(u8 *mesh_config_ie)
 	mesh_config_ie[MESH_CONF_IE_CAPABILITY_FLAG_BYTE_OFFSET] |= MESH_CAP_MBCA_ENABLED;
 }
 
+/** Returns true if the probe request has valid Mesh ID, which implies mesh node generated */
+static inline bool morse_is_mesh_probe_req(__le16 fc, struct dot11ah_ies_mask *ies_mask)
+{
+	struct ie_element *mesh_id_ie;
+
+	if (!ies_mask)
+		return false;
+	mesh_id_ie = &ies_mask->ies[WLAN_EID_MESH_ID];
+	return (ieee80211_is_probe_req(fc) && mesh_id_ie->ptr && mesh_id_ie->len);
+}
+
 /**
  * morse_dot11_get_mpm_ampe_len() - Finds length of AMPE element (Authenticated
  *	Mesh Peering Exchange) in Mesh Peer management (MPM) frames
@@ -304,6 +315,18 @@ int morse_cmd_process_dynamic_peering_conf(struct morse_vif *mors_vif,
 int morse_mac_process_mesh_tx_mgmt(struct morse_vif *mors_vif,
 				   struct sk_buff *skb, struct dot11ah_ies_mask *ies_mask);
 
+/**
+ * morse_mesh_bcnless_delay_probe_resp() - Delay probe resp frame on mesh interface
+ * in beaconless mode to introduce random delay to avoid burst of probe responses,
+ * when new node sends out a probe request in beaconless mode.
+ *
+ * @mors_vif: pointer to morse interface
+ * @skb: pointer to the packet buffer
+ *
+ * Return: 0 on success and error code on failure
+ */
+int morse_mesh_bcnless_delay_probe_resp(struct morse_vif *mors_vif,
+				   struct sk_buff *skb);
 /**
  * morse_mesh_deinit() - Mesh de-initialization
  *

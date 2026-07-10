@@ -8,6 +8,7 @@
 #define _CHANNEL_ALPHAS_H_
 
 #define CHANNEL_ALPHA_AU "AU"
+#define CHANNEL_ALPHA_BR "BR"
 #define CHANNEL_ALPHA_CA "CA"
 #define CHANNEL_ALPHA_EU "EU"
 #define CHANNEL_ALPHA_GB "GB"
