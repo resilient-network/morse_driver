@@ -195,6 +195,4 @@ void morse_skbq_data_traffic_resume(struct morse *mors);
  */
 bool morse_validate_skb_checksum(u8 *data);
 
-u32 morse_skbq_tx_status_lifetime_ms(void);
-
 #endif /* !_MORSE_SKBQ_H_ */

@@ -9,7 +9,6 @@
 #include "debug.h"
 #include "pageset.h"
 #include "skb_header.h"
-#include "skbq.h"
 #include "ps.h"
 #include "hw.h"
 #include "bus.h"
@@ -944,17 +943,6 @@ static void morse_pagesets_stale_tx_work(struct work_struct *work)
 			/* Evaluate ps to check if it was gated on a stale tx status */
 			morse_ps_queue_eval(mors);
 		}
-	}
-
-	/* Re-arm if frames still pending - the timer was not re-armed by tx_complete because it
-	 * was already running when those frames arrived, so we must schedule the next check here.
-	 */
-	if (mors->cfg->ops->skbq_get_tx_status_pending_count(mors) > 0) {
-		spin_lock_bh(&mors->stale_status.lock);
-		if (mors->stale_status.enabled)
-			mod_timer(&mors->stale_status.timer,
-				  jiffies + msecs_to_jiffies(morse_skbq_tx_status_lifetime_ms()));
-		spin_unlock_bh(&mors->stale_status.lock);
 	}
 }
 

@@ -1061,8 +1061,7 @@ int morse_cmd_install_key(struct morse *mors, struct morse_vif *mors_vif,
 	    MORSE_CMD_TEMPORAL_KEY_TYPE_PTK : MORSE_CMD_TEMPORAL_KEY_TYPE_GTK;
 
 	req.key_idx = key->keyidx;
-	memset(&req.key[0], 0, sizeof(req.key));
-	memcpy(&req.key[0], &key->key[0], key->keylen);
+	memcpy(&req.key[0], &key->key[0], sizeof(req.key));
 
 	ret = morse_cmd_tx(mors, (struct morse_cmd_resp *)&resp,
 			   (struct morse_cmd_req *)&req, sizeof(resp), 0, __func__);

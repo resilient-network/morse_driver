@@ -132,7 +132,7 @@ struct uaccess *morse_spi_uaccess;
  *
  * Derived using a 50 MHz bus speed, and 32 kHz external crystal oscillator.
  */
-#define XTAL_TRANSFER_DELAY_BYTES	(4 * 1024U)
+#define XTAL_TRANSFER_DELAY_BYTES	(2 * 1024U)
 
 /* SW-5611:
  *
@@ -1247,15 +1247,10 @@ static void morse_spi_set_irq(struct morse *mors, bool enable)
 
 static void morse_spi_reset(int reset_pin, struct spi_device *spi)
 {
-	unsigned int delay_ms = 80;
-
-	if (enable_ext_xtal_init)
-		delay_ms = 100;
-
 	morse_hw_reset(reset_pin);
 
 	/* Introduce a short delay to make sure the chip/SPI controller is fully reset */
-	mdelay(delay_ms);
+	mdelay(80);
 }
 
 #if KERNEL_VERSION(5, 18, 0) > LINUX_VERSION_CODE

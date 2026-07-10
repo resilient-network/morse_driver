@@ -259,6 +259,15 @@ module_param(max_mc_frames, int, 0644);
 MODULE_PARM_DESC(max_mc_frames,
 	"Maximum multicast frames after DTIM (-1 for auto/dynamic and 0 for unlimited)");
 
+/*
+ * Override AMSDU support to force enable/disable
+ * Note: AMSDU support is still dependant on airtime fairness (pull interface) to be enabled
+ */
+static int enable_amsdu_override = -1;
+module_param(enable_amsdu_override, int, 0644);
+MODULE_PARM_DESC(enable_amsdu_override,
+	"Override the AMSDU support (-1: default/chip-dependant, 0: disable, 1: enable");
+
 /* Enable CAC (Centralized Authentication Control) (AP mode only) */
 static bool enable_cac __read_mostly;
 module_param(enable_cac, bool, 0644);
@@ -952,12 +961,12 @@ bool morse_mac_is_airtime_fairness_enabled(void)
 	if (enable_wiphy)
 		return false;
 
-#if KERNEL_VERSION(5, 10, 0) <= MAC80211_VERSION_CODE
+#if KERNEL_VERSION(6, 2, 0) <= MAC80211_VERSION_CODE
 	/*
-	 * For kernels >= 6.2, mac80211 has fully switched to iTXQ and no longer
-	 * supports the push path. For kernels >= 5.10 that still support the push
-	 * path, we intentionally opt for the pull path (iTXQ) to take advantage of
-	 * ATF (Airtime Fairness).
+	 * mac80211 has dropped support for TX push path and has fully switched to the internal TX
+	 * queue (iTXQ) implementation. Performance is sub-optimal when using
+	 * ieee80211_handle_wake_tx_queue(), so use our own implmentation of wake_tx_queue()
+	 * (through setting airtime fairness).
 	 */
 	return ((enable_airtime_fairness == 0) || (enable_airtime_fairness == 1));
 #else
@@ -967,7 +976,25 @@ bool morse_mac_is_airtime_fairness_enabled(void)
 
 bool morse_mac_is_amsdu_enabled(struct morse *mors)
 {
-	return (morse_mac_is_airtime_fairness_enabled() && mors->cfg->enable_amsdu_support);
+	/* AMSDU support is dependant on airtime fairness (pull interface) */
+	if (morse_mac_is_airtime_fairness_enabled()) {
+		if (enable_amsdu_override >= 0) {
+			MORSE_INFO(mors, "%s: overriding default AMSDU support: %s to %s\n",
+				__func__,
+				mors->cfg->enable_amsdu_support ? "true" : "false",
+				enable_amsdu_override ? "true" : "false");
+
+			return enable_amsdu_override;
+		}
+
+		MORSE_INFO(mors, "%s: AMSDU support: %s\n",
+			__func__,
+			mors->cfg->enable_amsdu_support ? "true" : "false");
+
+		return mors->cfg->enable_amsdu_support;
+	}
+
+	return false;
 }
 
 #ifdef CONFIG_MORSE_RC
@@ -1094,8 +1121,6 @@ void morse_mac_fill_tx_info(struct morse *mors,
 
 		MORSE_WARN_ON_ONCE(FEATURE_ID_DEFAULT, tx_info->tid != frame_tid);
 		tx_info->tid = frame_tid;
-	} else if (ieee80211_is_mgmt(fc)) {
-		tx_info->tid = MORSE_QOS_TID_UP_HIGHEST;
 	}
 
 	if (mors_sta) {
@@ -4377,9 +4402,6 @@ morse_mac_ops_bss_info_changed(struct ieee80211_hw *hw,
 				info->cqm_rssi_thold, info->cqm_rssi_hyst);
 	}
 
-	if (changed & BSS_CHANGED_TXPOWER)
-		morse_mac_set_txpower(mors, DBM_TO_MBM(info->txpower));
-
 	mutex_unlock(&mors->lock);
 }
 
@@ -5281,7 +5303,26 @@ morse_mac_ops_sta_state(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
 static bool
 morse_mac_can_aggregate_in_amsdu(struct ieee80211_hw *hw, struct sk_buff *head, struct sk_buff *skb)
 {
-	return true;
+	struct ieee80211_tx_info *info = IEEE80211_SKB_CB(head);
+	struct ieee80211_vif *vif = info->control.vif;
+	struct ieee80211_hdr *hdr = (struct ieee80211_hdr *)head->data;
+	u8 tid = MORSE_IEEE80211_GET_TID(hdr);
+	struct ieee80211_sta *sta;
+	bool ok = false;
+
+	if (!vif || tid >= IEEE80211_NUM_TIDS)
+		return false;
+
+	rcu_read_lock();
+	sta = ieee80211_find_sta(vif, ieee80211_get_DA(hdr));
+	if (sta) {
+		struct morse_sta *mors_sta = (struct morse_sta *)sta->drv_priv;
+
+		ok = !!(mors_sta->tid_params[tid] & TX_INFO_TID_PARAMS_AMSDU_SUPPORTED);
+	}
+	rcu_read_unlock();
+
+	return ok;
 }
 #endif
 

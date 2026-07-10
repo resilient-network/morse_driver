@@ -1448,7 +1448,11 @@ static void morse_wiphy_connected_work(struct work_struct *work)
 
 	mutex_lock(&mors->lock);
 
-	if (morse_wiphy_is_roaming(mors_vif)) {
+	if (morse_wiphy_is_idle(mors_vif)) {
+		/* The connection request was cancelled while the connected event was in flight. */
+		MORSE_INFO(mors, "ignoring connection to BSS %pM\n", bssid);
+		goto exit;
+	} else if (morse_wiphy_is_roaming(mors_vif)) {
 		roamed = true;
 		MORSE_INFO(mors, "roamed to BSS %pM\n", bssid);
 	} else {
@@ -1543,6 +1547,7 @@ static void morse_wiphy_connected_work(struct work_struct *work)
 	kfree(mors_vif->connected_params);
 	mors_vif->connected_params = NULL;
 
+exit:
 	mutex_unlock(&mors->lock);
 }
 
@@ -1571,10 +1576,13 @@ void morse_wiphy_disconnected_work_nolock(struct morse *mors,
 
 	lockdep_assert_held(&mors->lock);
 
+	if (morse_wiphy_is_idle(mors_vif))
+		return;
+
 	if (morse_wiphy_is_disconnecting(mors_vif))
 		autoconnect = false;
-	if (!morse_wiphy_set_state(mors_vif, MORSE_SME_STATE_IDLE, __func__))
-		return;
+
+	morse_wiphy_set_state(mors_vif, MORSE_SME_STATE_IDLE, __func__);
 
 	MORSE_INFO(mors, "disconnected\n");
 

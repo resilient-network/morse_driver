@@ -29,10 +29,6 @@ static uint max_txq_len __read_mostly = 32;
 module_param(max_txq_len, uint, 0644);
 MODULE_PARM_DESC(max_txq_len, "Maximum number of queued TX packets");
 
-static uint skbq_refill_margin __read_mostly = 8;
-module_param(skbq_refill_margin, uint, 0644);
-MODULE_PARM_DESC(skbq_refill_margin, "Refill margin below max_txq_len");
-
 static u32 tx_queued_lifetime_ms __read_mostly = (1000);
 module_param(tx_queued_lifetime_ms, uint, 0644);
 MODULE_PARM_DESC(tx_queued_lifetime_ms,
@@ -42,11 +38,6 @@ static u32 tx_status_lifetime_ms __read_mostly = (15 * 1000);
 module_param(tx_status_lifetime_ms, uint, 0644);
 MODULE_PARM_DESC(tx_status_lifetime_ms,
 		 "Maximum lifetime (ms) for pending Tx packets before considered dropped");
-
-u32 morse_skbq_tx_status_lifetime_ms(void)
-{
-	return tx_status_lifetime_ms;
-}
 
 #define MORSE_SKB_DBG(_m, _f, _a...)		morse_dbg(FEATURE_ID_SKB, _m, _f, ##_a)
 #define MORSE_SKB_INFO(_m, _f, _a...)		morse_info(FEATURE_ID_SKB, _m, _f, ##_a)
@@ -204,11 +195,8 @@ static inline bool __morse_skbq_over_threshold(struct morse_skbq *mq)
 
 static inline bool __morse_skbq_under_threshold(struct morse_skbq *mq)
 {
-	WARN_ON_ONCE(max_txq_len && skbq_refill_margin >= max_txq_len);
-
 	return max_txq_len ?
-	    (mq->skbq.qlen < (max_txq_len - skbq_refill_margin)) :
-	    (__morse_skbq_space(mq) >= (5 * 1024));
+	    (mq->skbq.qlen < (max_txq_len - 2)) : (__morse_skbq_space(mq) >= (5 * 1024));
 }
 
 static bool morse_tx_channel_reports_to_mac80211(enum morse_skb_channel channel)
@@ -1007,10 +995,7 @@ int morse_skbq_tx_complete(struct morse_skbq *mq, struct sk_buff_head *skbq)
 	if (skb_awaits_tx_status) {
 		spin_lock_bh(&mors->stale_status.lock);
 
-		/* Only arm if not already pending - prevent continuous TX (e.g. beacons) from
-		 * perpetually deferring the deadline for older stuck frames.
-		 */
-		if (mors->stale_status.enabled && !timer_pending(&mors->stale_status.timer))
+		if (mors->stale_status.enabled)
 			mod_timer(&mors->stale_status.timer, jiffies +
 				  msecs_to_jiffies(tx_status_lifetime_ms));
 
