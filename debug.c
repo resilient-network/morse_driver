@@ -145,6 +145,10 @@ static int read_page_stats(struct seq_file *file, void *data)
 	print_stat(file, "Management Tx", mors->debug.page_stats.mgmt_tx);
 	print_stat(file, "Data Tx", mors->debug.page_stats.data_tx);
 	print_stat(file, "Page write fail", mors->debug.page_stats.write_fail);
+	print_stat(file, "TX oversize rejected", mors->debug.page_stats.tx_oversize_rejected);
+	print_stat(file, "TX tailroom rejected", mors->debug.page_stats.tx_tailroom_rejected);
+	print_stat(file, "TX page restored", mors->debug.page_stats.tx_page_restored);
+	print_stat(file, "TX page restore fail", mors->debug.page_stats.tx_page_restore_fail);
 	print_stat(file, "No page", mors->debug.page_stats.no_page);
 	print_stat(file, "No command page", mors->debug.page_stats.cmd_no_page);
 	print_stat(file, "No beacon page", mors->debug.page_stats.bcn_no_page);

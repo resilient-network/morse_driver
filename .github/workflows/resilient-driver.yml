@@ -1,0 +1,26 @@
+name: Resilient driver checks
+
+on:
+  pull_request:
+  push:
+    branches:
+      - "resilient/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  source-contract:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Verify page recovery and diagnostic contract
+        run: python3 tests/test_pageset_recovery.py
+      - name: Reject whitespace errors
+        run: git diff --check HEAD^ HEAD

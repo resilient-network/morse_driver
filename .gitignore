@@ -6,8 +6,12 @@
 cscope*
 *.ko
 .*
+!/.github/
+!/.github/workflows/
+!/.github/workflows/resilient-driver.yml
 output
 *.orig
 *.diff
 *.patch
+__pycache__/
 coverity/
