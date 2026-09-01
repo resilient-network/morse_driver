@@ -171,6 +171,9 @@ PY
 package="$output_dir/morse-mm6108-resilient-r1-6.12.21-v8plus-arm64.tar.gz"
 tar -C "$package_root" --sort=name --mtime='UTC 2026-09-01' \
   --owner=0 --group=0 --numeric-owner -czf "$package" .
-sha256sum "$package" >"$package.sha256"
+(
+  cd "$output_dir"
+  sha256sum "$(basename "$package")" >"$(basename "$package").sha256"
+)
 chmod -R a+rX "$output_dir"
 echo "Canary module package ready: $package"
