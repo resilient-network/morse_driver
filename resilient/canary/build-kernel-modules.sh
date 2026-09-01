@@ -24,6 +24,12 @@ apt-get install -y --no-install-recommends \
   bc bison build-essential ca-certificates flex git kmod libelf-dev libssl-dev \
   python3 rsync xz-utils
 
+git config --global --add safe.directory "$driver_source"
+while IFS= read -r submodule_path; do
+  [[ -n "$submodule_path" ]] || continue
+  git config --global --add safe.directory "$driver_source/$submodule_path"
+done < <(git -C "$driver_source" config --file .gitmodules --get-regexp path | awk '{print $2}')
+
 [[ -d "$driver_source/.git" || -f "$driver_source/.git" ]] || {
   echo "Driver source is not a Git worktree" >&2
   exit 1
