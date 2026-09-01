@@ -1,0 +1,76 @@
+name: Resilient MM6108 canary build
+
+on:
+  push:
+    branches:
+      - resilient/mm6108-2.0.1-r1-canary-build
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: resilient-mm6108-r1-canary
+  cancel-in-progress: false
+
+jobs:
+  build-arm64-modules:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 75
+    env:
+      DRIVER_SOURCE_COMMIT: 4ecf7acf354abd877d5048bc793ca7e568e80313
+      KERNEL_SOURCE_COMMIT: 3ff412d726801d26f9392d7969154d4ebf0316f5
+      KERNEL_RELEASE: 6.12.21-v8+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Verify canary source boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = aarch64
+          test "$(git rev-parse "${DRIVER_SOURCE_COMMIT}^{commit}")" = "$DRIVER_SOURCE_COMMIT"
+          git diff --quiet "$DRIVER_SOURCE_COMMIT" -- . \
+            ':(exclude).github/workflows/resilient-canary-build.yml' \
+            ':(exclude)resilient/canary/build-kernel-modules.sh'
+          git clone --no-checkout "$GITHUB_WORKSPACE" "$RUNNER_TEMP/driver-source"
+          git -C "$RUNNER_TEMP/driver-source" checkout --detach "$DRIVER_SOURCE_COMMIT"
+          git -C "$RUNNER_TEMP/driver-source" submodule update --init --recursive --depth 1
+          test -z "$(git -C "$RUNNER_TEMP/driver-source" status --short)"
+          python3 "$RUNNER_TEMP/driver-source/tests/test_pageset_recovery.py"
+
+      - name: Build ABI-bound canary modules
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm --platform linux/arm64 \
+            -e DRIVER_SOURCE_COMMIT \
+            -e KERNEL_SOURCE_COMMIT \
+            -e KERNEL_RELEASE \
+            -v "$GITHUB_WORKSPACE:/work:ro" \
+            -v "$RUNNER_TEMP:/build" \
+            debian:bookworm-slim \
+            /bin/bash /work/resilient/canary/build-kernel-modules.sh \
+              /build/driver-source /build/output
+
+      - name: Verify artifact inventory
+        shell: bash
+        run: |
+          set -euo pipefail
+          package="$RUNNER_TEMP/output/morse-mm6108-resilient-r1-6.12.21-v8plus-arm64.tar.gz"
+          test -s "$package"
+          test -s "$package.sha256"
+          sha256sum --check "$package.sha256"
+          tar -tzf "$package" | LC_ALL=C sort
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: morse-mm6108-resilient-r1-6.12.21-v8plus-arm64
+          path: |
+            ${{ runner.temp }}/output/morse-mm6108-resilient-r1-6.12.21-v8plus-arm64.tar.gz
+            ${{ runner.temp }}/output/morse-mm6108-resilient-r1-6.12.21-v8plus-arm64.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 14
