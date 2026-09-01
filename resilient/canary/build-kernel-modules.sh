@@ -89,10 +89,14 @@ make -C "$driver_source" \
   CONFIG_MORSE_COUNTRY=US DEBUG=n \
   INSTALL_MOD_PATH="$stage" INSTALL_MOD_DIR=updates modules_install
 
-morse_module="$(find "$stage/lib/modules/$KERNEL_RELEASE" -type f -name morse.ko -print -quit)"
-dot11ah_module="$(find "$stage/lib/modules/$KERNEL_RELEASE" -type f -name dot11ah.ko -print -quit)"
+morse_module="$(find "$stage/lib/modules/$KERNEL_RELEASE" -type f -name 'morse.ko*' -print -quit)"
+dot11ah_module="$(find "$stage/lib/modules/$KERNEL_RELEASE" -type f -name 'dot11ah.ko*' -print -quit)"
 [[ -s "$morse_module" && -s "$dot11ah_module" ]] || {
   echo "Module installation was incomplete" >&2
+  exit 1
+}
+[[ "$morse_module" = *.ko.xz && "$dot11ah_module" = *.ko.xz ]] || {
+  echo "Kernel module compression contract changed" >&2
   exit 1
 }
 
@@ -116,12 +120,10 @@ modinfo -p "$morse_module" | grep -q '^spi_post_write_status_bytes:' || {
   exit 1
 }
 
-install -m 0644 "$morse_module" "$package_root/modules/morse.ko"
-install -m 0644 "$dot11ah_module" "$package_root/modules/dot11ah.ko"
-modinfo "$package_root/modules/morse.ko" >"$package_root/morse.modinfo.txt"
-modinfo "$package_root/modules/dot11ah.ko" >"$package_root/dot11ah.modinfo.txt"
-xz -9e "$package_root/modules/morse.ko"
-xz -9e "$package_root/modules/dot11ah.ko"
+install -m 0644 "$morse_module" "$package_root/modules/morse.ko.xz"
+install -m 0644 "$dot11ah_module" "$package_root/modules/dot11ah.ko.xz"
+modinfo "$package_root/modules/morse.ko.xz" >"$package_root/morse.modinfo.txt"
+modinfo "$package_root/modules/dot11ah.ko.xz" >"$package_root/dot11ah.modinfo.txt"
 
 python3 - "$package_root" <<'PY'
 import hashlib
