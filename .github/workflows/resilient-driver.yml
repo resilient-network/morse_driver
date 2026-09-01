@@ -23,4 +23,4 @@ jobs:
       - name: Verify page recovery and diagnostic contract
         run: python3 tests/test_pageset_recovery.py
       - name: Reject whitespace errors
-        run: git diff --check HEAD^ HEAD
+        run: git show --check --format= HEAD
