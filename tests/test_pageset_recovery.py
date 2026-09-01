@@ -52,6 +52,7 @@ morse_h = (ROOT / "morse.h").read_text(encoding="utf-8")
 debug_c = (ROOT / "debug.c").read_text(encoding="utf-8")
 makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
 dot11ah_makefile = (ROOT / "dot11ah" / "Makefile").read_text(encoding="utf-8")
+gitmodules = (ROOT / ".gitmodules").read_text(encoding="utf-8")
 
 get_page = function_body(pageset, "tx_page_get_for_channel")
 restore_page = function_body(pageset, "tx_page_restore")
@@ -99,5 +100,6 @@ assert "%pM" not in write_page
 downstream_version = "0-rel_mm6108_2_0_1_resilient_r1_2026_Sep_01"
 assert downstream_version in makefile
 assert downstream_version in dot11ah_makefile
+assert "url = https://github.com/MorseMicro/mm_rate_control.git" in gitmodules
 
 print("Resilient Morse TX-page recovery source contract passed")

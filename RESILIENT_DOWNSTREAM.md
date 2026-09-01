@@ -5,11 +5,15 @@ driver. The first downstream line is based on the immutable upstream release:
 
 - driver tag: `mm6108-2.0.1`
 - driver commit: `98e1936c04ef9a62212c1c64b970218ecf08d15d`
+- MMRC submodule commit: `da1425580bd5caa1a8fc926596f366bdd8d841d2`
 - downstream line: `resilient/mm6108-2.0.1-r1`
 
 Firmware and HaLow userspace are not forked by this change. Production builds
 must continue to use the matching upstream `mm6108-2.0.1` firmware and hostap
 release until an independently qualified compatibility change is approved.
+The fork uses an absolute official Morse Micro URL for the MMRC submodule so a
+GitHub fork cannot silently reinterpret the relative upstream URL as a
+Resilient-owned dependency.
 
 ## Why this downstream exists
 
