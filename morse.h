@@ -919,6 +919,10 @@ struct morse_debug {
 		unsigned int mgmt_tx;
 		unsigned int data_tx;
 		unsigned int write_fail;
+		unsigned int tx_oversize_rejected;
+		unsigned int tx_tailroom_rejected;
+		unsigned int tx_page_restored;
+		unsigned int tx_page_restore_fail;
 		unsigned int no_page;
 		unsigned int cmd_no_page;
 		unsigned int bcn_no_page;

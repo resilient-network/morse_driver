@@ -329,20 +329,56 @@ static void tx_page_unavailable_for_channel(struct morse_pageset *pageset,
 	}
 }
 
+enum tx_page_pool {
+	TX_PAGE_POOL_CACHED,
+	TX_PAGE_POOL_RESERVED,
+};
+
+static void tx_page_restore(struct morse_pageset *pageset,
+			    const struct morse_page *page,
+			    enum tx_page_pool pool)
+{
+	struct morse *mors = pageset->mors;
+	unsigned int restored;
+
+	lockdep_assert_held(&pageset->lock);
+
+	if (pool == TX_PAGE_POOL_RESERVED)
+		restored = kfifo_put(&pageset->reserved_pages, *page);
+	else
+		restored = kfifo_put(&pageset->cached_pages, *page);
+
+	if (restored) {
+		mors->debug.page_stats.tx_page_restored++;
+		return;
+	}
+
+	mors->debug.page_stats.tx_page_restore_fail++;
+	MORSE_ERR_RATELIMITED(mors,
+				 "%s: failed to restore tx page addr=0x%08x size=%u pool=%u\n",
+				 __func__, page->addr, page->size_bytes,
+				 (unsigned int)pool);
+}
+
 static int tx_page_get_for_channel(struct morse_pageset *pageset,
 				   enum morse_skb_channel channel,
-				   struct morse_page *page)
+				   struct morse_page *page,
+				   enum tx_page_pool *pool)
 {
 	int ret;
 
 	lockdep_assert_held(&pageset->lock);
 
 	if (channel == MORSE_SKB_CHAN_BEACON || channel == MORSE_SKB_CHAN_COMMAND) {
-		if (kfifo_get(&pageset->reserved_pages, page) > 0)
+		if (kfifo_get(&pageset->reserved_pages, page) > 0) {
+			*pool = TX_PAGE_POOL_RESERVED;
 			return 0;
+		}
 	}
 
 	ret = kfifo_get(&pageset->cached_pages, page);
+	if (ret > 0)
+		*pool = TX_PAGE_POOL_CACHED;
 
 	return ret == 0 ? -ENOMEM : 0;
 }
@@ -355,26 +391,45 @@ static int morse_pageset_write(struct morse_pageset *pageset,
 	struct morse *mors = pageset->mors;
 	struct morse_pager *populated_pager = pageset->populated_pager;
 	struct morse_page page;
+	enum tx_page_pool pool = TX_PAGE_POOL_CACHED;
 	struct morse_buff_skb_header *hdr = (struct morse_buff_skb_header *)skb->data;
 	size_t end_of_skb_pad = (skb->len & 0x03) ? (4 - (unsigned long)(skb->len & 3)) : 0;
 	size_t write_len = skb->len + end_of_skb_pad;
 
 	lockdep_assert_held(&pageset->lock);
 
-	if (tx_page_get_for_channel(pageset, channel, &page)) {
+	if (tx_page_get_for_channel(pageset, channel, &page, &pool)) {
 		MORSE_ERR(mors, "%s no pages available\n", __func__);
 		return -ENOSPC;
 	}
 
 	if (write_len > page.size_bytes) {
-		MORSE_ERR(mors, "%s Data larger than pagesize: [%d:%d]\n",
-			  __func__, skb->len, page.size_bytes);
+		mors->debug.page_stats.tx_oversize_rejected++;
+		MORSE_ERR_RATELIMITED(mors,
+				 "%s: oversize tx rejected channel=%u payload_len=%u "
+				 "skb_len=%u write_len=%zu page_size=%u offset=%u "
+				 "gso_type=0x%x gso_size=%u gso_segs=%u\n",
+				 __func__, (unsigned int)channel,
+				 (unsigned int)le16_to_cpu(hdr->len), skb->len,
+				 write_len, page.size_bytes, hdr->offset,
+				 (unsigned int)skb_shinfo(skb)->gso_type,
+				 (unsigned int)skb_shinfo(skb)->gso_size,
+				 (unsigned int)skb_shinfo(skb)->gso_segs);
+		tx_page_restore(pageset, &page, pool);
 		return -ENOSPC;
 	}
 
 	if (write_len > (skb->len + skb_tailroom(skb))) {
 		/* SKB should be big enough to copy from */
+		mors->debug.page_stats.tx_tailroom_rejected++;
+		MORSE_ERR_RATELIMITED(mors,
+				 "%s: tx tailroom rejected channel=%u payload_len=%u "
+				 "skb_len=%u write_len=%zu tailroom=%u\n",
+				 __func__, (unsigned int)channel,
+				 (unsigned int)le16_to_cpu(hdr->len), skb->len,
+				 write_len, (unsigned int)skb_tailroom(skb));
 		MORSE_WARN_ON(FEATURE_ID_SKB, 1);
+		tx_page_restore(pageset, &page, pool);
 		return -ENOSPC;
 	}
 
@@ -383,8 +438,8 @@ static int morse_pageset_write(struct morse_pageset *pageset,
 	ret = morse_pager_hw_page_write(populated_pager, &page, 0, skb->data, write_len);
 	if (ret) {
 		MORSE_ERR(mors, "%s failed to write page: %d\n", __func__, ret);
-		/* Put the page back into the cache */
-		kfifo_put(&pageset->cached_pages, page);
+		/* Preserve the command/beacon reservation on host write failures. */
+		tx_page_restore(pageset, &page, pool);
 		return ret;
 	}
 
