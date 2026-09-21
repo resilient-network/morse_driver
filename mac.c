@@ -6188,6 +6188,7 @@ morse_mac_rx_status(struct morse *mors,
 	rx_status->antenna = 1;
 
 	mcs_index = morse_ratecode_mcs_index_get(hdr_rx_status->morse_ratecode);
+	morse_resilient_rx_rate(mors, mcs_index, bw_idx, rx_status->signal);
 	/* If MCS10, convert to MCS0 to keep rate control happy. */
 	if (mcs_index == 10) {
 		rx_status->rate_idx = 0;

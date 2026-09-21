@@ -41,6 +41,7 @@
 #include "coredump.h"
 #include "bss_stats.h"
 #include "twt.h"
+#include "resilient_stats.h"
 
 #ifdef CONFIG_MORSE_USER_ACCESS
 #include "uaccess.h"
@@ -1289,6 +1290,8 @@ struct morse {
 	struct work_struct tx_stale_work;
 
 	struct morse_debug debug;
+	/* Downstream, read-only field performance telemetry exposed through debugfs. */
+	struct morse_resilient_stats resilient_stats;
 
 	char *board_serial;
 	int board_id;

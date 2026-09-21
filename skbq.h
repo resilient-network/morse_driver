@@ -56,6 +56,9 @@ struct sk_buff *morse_skbq_alloc_skb(struct morse_skbq *mq, unsigned int length)
  */
 void morse_skbq_set_mac80211_owned(struct sk_buff *skb, bool mac80211_owned);
 
+/* Record queue residence without exposing private mac80211 driver_data layout. */
+void morse_skbq_record_residence(struct morse *mors, struct sk_buff *skb, u8 channel);
+
 /**
  * morse_skbq_skb_tx() - Enqueue a skb to be passed to the chip on the given channel.
  * @mq: The Morse SKBQ.

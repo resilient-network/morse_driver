@@ -58,6 +58,12 @@ struct morse_spi {
 	u16 inter_block_delay_bytes;
 	/* Maximum number of blks to write per SPI transaction */
 	u8 max_block_count;
+
+	/* Resilient downstream diagnostics and opt-in error-only clock fallback. */
+	atomic_t consecutive_xfer_errors;
+	struct work_struct clock_fallback_work;
+	u64 irq_wake_ns;
+	bool clock_fallback_applied;
 };
 
 #ifdef CONFIG_MORSE_USER_ACCESS
@@ -183,6 +189,20 @@ static bool spi_use_edge_irq;
 module_param(spi_use_edge_irq, bool, 0644);
 MODULE_PARM_DESC(spi_use_edge_irq, "Enable compatibility for edge IRQs on SPI");
 
+/*
+ * Disabled unless both values are explicitly supplied. The fallback is one-way,
+ * applies at most once per probe, and is driven only by SPI transport errors.
+ */
+static uint spi_error_fallback_threshold;
+module_param(spi_error_fallback_threshold, uint, 0644);
+MODULE_PARM_DESC(spi_error_fallback_threshold,
+		 "Consecutive SPI errors before lowering the clock (0 disables fallback)");
+
+static uint spi_fallback_clock_speed;
+module_param(spi_fallback_clock_speed, uint, 0644);
+MODULE_PARM_DESC(spi_fallback_clock_speed,
+		 "Lower SPI clock in Hz used by the error fallback (0 disables fallback)");
+
 static const struct spi_device_id morse_device_ids[] = {
 	{ MORSE_SPI_DEVICE("mm610x-spi", mm61xx_chip_series) },
 	{ MORSE_SPI_DEVICE("mm810x-spi", mm81xx_chip_series) },
@@ -248,8 +268,46 @@ static void morse_shift_buffer(u8 *data, unsigned int len, u8 right_shift_bits)
 	}
 }
 
-static int morse_spi_xfer(struct morse_spi *mspi, unsigned int len)
+static void morse_spi_clock_fallback_work(struct work_struct *work)
 {
+	struct morse_spi *mspi = container_of(work, struct morse_spi, clock_fallback_work);
+	struct spi_device *spi = mspi->spi;
+	struct morse *mors = spi_get_drvdata(spi);
+	u32 from_hz;
+	int ret;
+
+	mutex_lock(&mspi->bus_lock);
+	mutex_lock(&mspi->lock);
+	from_hz = spi->max_speed_hz;
+	if (mspi->clock_fallback_applied || !spi_fallback_clock_speed ||
+	    spi_fallback_clock_speed >= from_hz)
+		goto out;
+
+	ret = morse_spi_setup(spi, spi_fallback_clock_speed);
+	if (ret) {
+		MORSE_SPI_ERR(mors, "error-only SPI clock fallback failed: %d\n", ret);
+		/* Restore both the software setting and controller configuration. */
+		morse_spi_setup(spi, from_hz);
+		goto out;
+	}
+
+	mspi->clock_fallback_applied = true;
+	morse_resilient_spi_fallback(mors, from_hz, spi->max_speed_hz);
+	MORSE_SPI_WARN(mors, "SPI transport errors lowered clock from %u to %u Hz\n",
+		       from_hz, spi->max_speed_hz);
+out:
+	mutex_unlock(&mspi->lock);
+	mutex_unlock(&mspi->bus_lock);
+}
+
+static int morse_spi_xfer(struct morse_spi *mspi, unsigned int len,
+			  enum morse_resilient_spi_direction direction,
+			  unsigned int payload_len)
+{
+	struct morse *mors = spi_get_drvdata(mspi->spi);
+	u64 started_ns;
+	u64 duration_ns;
+	bool dma_eligible = false;
 	int ret = 0;
 
 	if (!len)
@@ -261,7 +319,23 @@ static int morse_spi_xfer(struct morse_spi *mspi, unsigned int len)
 	}
 
 	mspi->t.len = len;
+	if (mspi->spi->controller->can_dma)
+		dma_eligible = mspi->spi->controller->can_dma(mspi->spi->controller,
+							      mspi->spi, &mspi->t);
+	started_ns = ktime_get_mono_fast_ns();
 	ret = spi_sync_locked(mspi->spi, &mspi->m);
+	duration_ns = ktime_get_mono_fast_ns() - started_ns;
+	morse_resilient_spi_xfer(mors, direction, mspi->spi->max_speed_hz,
+				  len, payload_len, duration_ns, dma_eligible, ret);
+
+	if (ret) {
+		if (spi_error_fallback_threshold && spi_fallback_clock_speed &&
+		    atomic_inc_return(&mspi->consecutive_xfer_errors) >=
+				spi_error_fallback_threshold)
+			schedule_work(&mspi->clock_fallback_work);
+	} else {
+		atomic_set(&mspi->consecutive_xfer_errors, 0);
+	}
 
 	if (is_rk3288)
 		morse_shift_buffer(mspi->data, len, 1);
@@ -296,7 +370,7 @@ static void morse_spi_initsequence(struct morse_spi *mspi)
 	} else {
 		/* We will send only 0xFF for training */
 		memset(mspi->data, 0xFF, MM610X_BUF_SIZE);
-		morse_spi_xfer(mspi, 18);
+		morse_spi_xfer(mspi, 18, MORSE_RES_SPI_CONTROL, 0);
 
 		spi->mode &= ~SPI_CS_HIGH;
 		if (spi_setup(spi) != 0) {
@@ -401,7 +475,7 @@ static int morse_spi_cmd(struct morse_spi *mspi, u8 cmd, u32 arg)
 
 	cp[6] = crc7_be(0, cp + 1, 5) | 0x01;
 
-	ret = morse_spi_xfer(mspi, buffer_size);
+	ret = morse_spi_xfer(mspi, buffer_size, MORSE_RES_SPI_CONTROL, 0);
 
 	if (ret)
 		return ret;
@@ -560,6 +634,8 @@ static int morse_spi_cmd53_read(struct morse_spi *mspi, u8 fn, u32 address, u8 *
 	u8 *end;
 	u32 data_size;
 	int i;
+	int ret;
+	u32 payload_size = block ? count * MMC_SPI_BLOCKSIZE : count;
 
 	memset(mspi->data, 0xFF, MM610X_BUF_SIZE);
 
@@ -611,7 +687,9 @@ static int morse_spi_cmd53_read(struct morse_spi *mspi, u8 fn, u32 address, u8 *
 	cp += data_size;
 	end = cp;
 
-	morse_spi_xfer(mspi, end - mspi->data);
+	ret = morse_spi_xfer(mspi, end - mspi->data, MORSE_RES_SPI_READ, payload_size);
+	if (ret)
+		return ret;
 
 	/*
 	 * Response will already be stored in the data buffer.  It's
@@ -652,6 +730,8 @@ static int morse_spi_cmd53_write(struct morse_spi *mspi, u8 fn, u32 address, u8 
 	u8 *ack = cp;
 	u32 data_size;
 	int i;
+	int ret;
+	u32 payload_size = block ? count * MMC_SPI_BLOCKSIZE : count;
 
 	memset(mspi->data, 0xFF, MM610X_BUF_SIZE);
 	/* Insert command and argument */
@@ -724,7 +804,9 @@ static int morse_spi_cmd53_write(struct morse_spi *mspi, u8 fn, u32 address, u8 
 	/* Do the actual transfer */
 	end = cp;
 
-	morse_spi_xfer(mspi, end - mspi->data);
+	ret = morse_spi_xfer(mspi, end - mspi->data, MORSE_RES_SPI_WRITE, payload_size);
+	if (ret)
+		return ret;
 
 	/* Time to verify */
 	if (morse_spi_find_response(mspi, resp, end, &cp))
@@ -1154,10 +1236,21 @@ static int morse_spi_request_mem_access(struct morse *mors, u32 address, int len
 	return mem_access_request(mors, morse_spi_set_inter_block_delay, address, len);
 }
 
-static irqreturn_t morse_spi_irq_handler(int irq, struct morse_spi *mspi)
+static irqreturn_t morse_spi_irq_wake(int irq, void *data)
 {
+	struct morse_spi *mspi = data;
+
+	WRITE_ONCE(mspi->irq_wake_ns, ktime_get_mono_fast_ns());
+	return IRQ_WAKE_THREAD;
+}
+
+static irqreturn_t morse_spi_irq_handler(int irq, void *data)
+{
+	struct morse_spi *mspi = data;
 	int ret = 0;
 	struct morse *mors = spi_get_drvdata(mspi->spi);
+	u64 service_started_ns = ktime_get_mono_fast_ns();
+	u64 wake_ns = READ_ONCE(mspi->irq_wake_ns);
 
 	MORSE_WARN_ON(FEATURE_ID_SPI, !mors);
 	/*
@@ -1169,6 +1262,10 @@ static irqreturn_t morse_spi_irq_handler(int irq, struct morse_spi *mspi)
 		ret = morse_hw_irq_handle(mors);
 		morse_release_bus(mors);
 	} while (spi_use_edge_irq && ret && !gpio_get_value(mors->cfg->gpios.spi_irq));
+	morse_resilient_irq(mors,
+			     wake_ns && service_started_ns > wake_ns ?
+				service_started_ns - wake_ns : 0,
+			     ktime_get_mono_fast_ns() - service_started_ns);
 
 	return IRQ_HANDLED;
 }
@@ -1216,8 +1313,8 @@ static int morse_spi_setup_irq(struct morse_spi *mspi)
 				      SDIO_CCCR_BIC_ECSI, SDIO_CCCR_BIC_ADDR);
 
 	if (!ret)
-		ret = request_threaded_irq(spi->irq, NULL,
-					   (irq_handler_t)morse_spi_irq_handler,
+		ret = request_threaded_irq(spi->irq, morse_spi_irq_wake,
+					   morse_spi_irq_handler,
 					   (spi_use_edge_irq ? IRQF_TRIGGER_FALLING :
 					    IRQF_TRIGGER_LOW) | IRQF_ONESHOT, "Morse SPI IRQ",
 					   mspi);
@@ -1305,6 +1402,7 @@ static void morse_spi_remove(struct spi_device *spi)
 			morse_spi_disable_irq(mspi);
 		}
 
+		cancel_work_sync(&mspi->clock_fallback_work);
 		morse_spi_remove_irq(mspi);
 		kfree(mspi->data);
 #ifdef CONFIG_MORSE_USER_ACCESS
@@ -1464,6 +1562,8 @@ static int morse_spi_probe(struct spi_device *spi)
 
 	mutex_init(&mspi->lock);
 	mutex_init(&mspi->bus_lock);
+	atomic_set(&mspi->consecutive_xfer_errors, 0);
+	INIT_WORK(&mspi->clock_fallback_work, morse_spi_clock_fallback_work);
 	spi_set_drvdata(spi, mors);
 
 	if (enable_ext_xtal_init) {

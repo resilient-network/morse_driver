@@ -137,11 +137,66 @@ static struct morse_skbq *skbq_pageset_get_rx_data_q(struct morse *mors)
 	    &mors->chip_if->from_chip_pageset->data_qs[rx_data_queue] : NULL;
 }
 
+u32 morse_pageset_tx_page_size(struct morse *mors)
+{
+	struct morse_pageset *pageset;
+
+	if (!mors->chip_if || mors->chip_if->active_chip_if != MORSE_CHIP_IF_PAGESET)
+		return 0;
+	pageset = READ_ONCE(mors->chip_if->to_chip_pageset);
+	if (!pageset || !READ_ONCE(pageset->return_pager))
+		return 0;
+	/* Cached host-owned TX pages are supplied by the return/free pager. */
+	return READ_ONCE(pageset->return_pager->page_size_bytes);
+}
+
+u32 morse_pageset_tx_cached_pages(struct morse *mors)
+{
+	struct morse_pageset *pageset;
+
+	if (!mors->chip_if || mors->chip_if->active_chip_if != MORSE_CHIP_IF_PAGESET)
+		return 0;
+	pageset = READ_ONCE(mors->chip_if->to_chip_pageset);
+	return pageset ? max(atomic_read(&pageset->cached_page_count), 0) : 0;
+}
+
+u32 morse_pageset_tx_reserved_pages(struct morse *mors)
+{
+	struct morse_pageset *pageset;
+
+	if (!mors->chip_if || mors->chip_if->active_chip_if != MORSE_CHIP_IF_PAGESET)
+		return 0;
+	pageset = READ_ONCE(mors->chip_if->to_chip_pageset);
+	return pageset ? max(atomic_read(&pageset->reserved_page_count), 0) : 0;
+}
+
+bool morse_pageset_tx_should_stop(struct morse *mors)
+{
+	struct morse_pageset *pageset;
+
+	if (!mors->chip_if || mors->chip_if->active_chip_if != MORSE_CHIP_IF_PAGESET)
+		return false;
+	pageset = READ_ONCE(mors->chip_if->to_chip_pageset);
+	return pageset && morse_pageset_tx_cached_pages(mors) <= PAGESET_TX_STOP_PAGES;
+}
+
+bool morse_pageset_tx_can_wake(struct morse *mors)
+{
+	struct morse_pageset *pageset;
+
+	if (!mors->chip_if || mors->chip_if->active_chip_if != MORSE_CHIP_IF_PAGESET)
+		return true;
+	pageset = READ_ONCE(mors->chip_if->to_chip_pageset);
+	return pageset && morse_pageset_tx_cached_pages(mors) >= PAGESET_TX_WAKE_PAGES;
+}
+
 static void morse_pageset_flush_cache(struct morse *mors, struct morse_pageset *pageset)
 {
 	mutex_lock(&pageset->lock);
 	kfifo_reset(&pageset->cached_pages);
 	kfifo_reset(&pageset->reserved_pages);
+	atomic_set(&pageset->cached_page_count, 0);
+	atomic_set(&pageset->reserved_page_count, 0);
 
 	morse_pager_hw_flush_cache(pageset->populated_pager);
 	morse_pager_hw_flush_cache(pageset->return_pager);
@@ -273,6 +328,8 @@ static void morse_pageset_to_chip_return_handler(struct morse *mors, struct mors
 
 		ret = kfifo_put(&pageset->reserved_pages, page);
 		MORSE_WARN_ON(FEATURE_ID_PAGER, !ret);
+		if (ret)
+			atomic_inc(&pageset->reserved_page_count);
 	}
 
 	if (pager_empty)
@@ -288,6 +345,8 @@ static void morse_pageset_to_chip_return_handler(struct morse *mors, struct mors
 
 		ret = kfifo_put(&pageset->cached_pages, page);
 		MORSE_WARN_ON(FEATURE_ID_PAGER, !ret);
+		if (ret)
+			atomic_inc(&pageset->cached_page_count);
 	}
 
 	if (popped >= max_expected_pops)
@@ -340,6 +399,7 @@ static void tx_page_restore(struct morse_pageset *pageset,
 {
 	struct morse *mors = pageset->mors;
 	unsigned int restored;
+	u64 started_ns = ktime_get_mono_fast_ns();
 
 	lockdep_assert_held(&pageset->lock);
 
@@ -347,6 +407,14 @@ static void tx_page_restore(struct morse_pageset *pageset,
 		restored = kfifo_put(&pageset->reserved_pages, *page);
 	else
 		restored = kfifo_put(&pageset->cached_pages, *page);
+	if (restored) {
+		if (pool == TX_PAGE_POOL_RESERVED)
+			atomic_inc(&pageset->reserved_page_count);
+		else
+			atomic_inc(&pageset->cached_page_count);
+	}
+	morse_resilient_page_restore(mors, ktime_get_mono_fast_ns() - started_ns,
+				      restored != 0);
 
 	if (restored) {
 		mors->debug.page_stats.tx_page_restored++;
@@ -372,13 +440,20 @@ static int tx_page_get_for_channel(struct morse_pageset *pageset,
 	if (channel == MORSE_SKB_CHAN_BEACON || channel == MORSE_SKB_CHAN_COMMAND) {
 		if (kfifo_get(&pageset->reserved_pages, page) > 0) {
 			*pool = TX_PAGE_POOL_RESERVED;
+			atomic_dec(&pageset->reserved_page_count);
+			morse_resilient_page_starvation_end(pageset->mors, channel);
 			return 0;
 		}
 	}
 
 	ret = kfifo_get(&pageset->cached_pages, page);
-	if (ret > 0)
+	if (ret > 0) {
 		*pool = TX_PAGE_POOL_CACHED;
+		atomic_dec(&pageset->cached_page_count);
+		morse_resilient_page_starvation_end(pageset->mors, channel);
+	} else {
+		morse_resilient_page_starvation_begin(pageset->mors, channel);
+	}
 
 	return ret == 0 ? -ENOMEM : 0;
 }
@@ -400,11 +475,14 @@ static int morse_pageset_write(struct morse_pageset *pageset,
 
 	if (tx_page_get_for_channel(pageset, channel, &page, &pool)) {
 		MORSE_ERR(mors, "%s no pages available\n", __func__);
+		morse_resilient_drop(mors, channel, MORSE_RES_DROP_NO_PAGE);
 		return -ENOSPC;
 	}
+	morse_skbq_record_residence(mors, skb, channel);
 
 	if (write_len > page.size_bytes) {
 		mors->debug.page_stats.tx_oversize_rejected++;
+		morse_resilient_drop(mors, channel, MORSE_RES_DROP_OVERSIZE);
 		MORSE_ERR_RATELIMITED(mors,
 				 "%s: oversize tx rejected channel=%u payload_len=%u "
 				 "skb_len=%u write_len=%zu page_size=%u offset=%u "
@@ -422,6 +500,7 @@ static int morse_pageset_write(struct morse_pageset *pageset,
 	if (write_len > (skb->len + skb_tailroom(skb))) {
 		/* SKB should be big enough to copy from */
 		mors->debug.page_stats.tx_tailroom_rejected++;
+		morse_resilient_drop(mors, channel, MORSE_RES_DROP_TAILROOM);
 		MORSE_ERR_RATELIMITED(mors,
 				 "%s: tx tailroom rejected channel=%u payload_len=%u "
 				 "skb_len=%u write_len=%zu tailroom=%u\n",
@@ -438,6 +517,7 @@ static int morse_pageset_write(struct morse_pageset *pageset,
 	ret = morse_pager_hw_page_write(populated_pager, &page, 0, skb->data, write_len);
 	if (ret) {
 		MORSE_ERR(mors, "%s failed to write page: %d\n", __func__, ret);
+		morse_resilient_drop(mors, channel, MORSE_RES_DROP_PAGE_WRITE);
 		/* Preserve the command/beacon reservation on host write failures. */
 		tx_page_restore(pageset, &page, pool);
 		return ret;
@@ -447,6 +527,7 @@ static int morse_pageset_write(struct morse_pageset *pageset,
 	ret = morse_pager_hw_put(populated_pager, &page);
 	if (ret) {
 		MORSE_ERR(mors, "%s failed to return page: %d\n", __func__, ret);
+		morse_resilient_drop(mors, channel, MORSE_RES_DROP_PAGE_WRITE);
 		/* Return page to avoid page leak.
 		 * Write sync word as 0 so the chip discards it.
 		 * Don't not putting this in the return pager to avoid
@@ -462,6 +543,8 @@ static int morse_pageset_write(struct morse_pageset *pageset,
 		morse_pager_hw_put(populated_pager, &page);
 		return ret;
 	}
+
+	morse_resilient_driver_tx_payload(mors, le16_to_cpu(hdr->len));
 
 	return ret;
 }
@@ -653,6 +736,7 @@ static int morse_pageset_read(struct morse_pageset *pageset, enum morse_skb_chan
 		ret = -ENOMEM;
 		goto exit;
 	}
+	morse_resilient_driver_rx_payload(mors, le16_to_cpu(hdr->len));
 
 	/* Successful in receiving page/skb. Do not free the page as it now
 	 * is the responsibility of mq.
@@ -728,6 +812,10 @@ static int morse_pageset_tx(struct morse_pageset *pageset, enum morse_skb_channe
 	n_pages_avail = morse_pageset_num_pages(pageset, channel);
 	if (!n_pages_avail) {
 		tx_page_unavailable_for_channel(pageset, channel);
+		morse_resilient_page_starvation_begin(mors, channel);
+		morse_resilient_drop(mors, channel, MORSE_RES_DROP_NO_PAGE);
+		if (channel == MORSE_SKB_CHAN_DATA)
+			morse_skbq_stop_tx_queues(mors);
 		return -ENOMEM; /* No pages to transmit at all! */
 	}
 
@@ -751,6 +839,10 @@ static int morse_pageset_tx(struct morse_pageset *pageset, enum morse_skb_channe
 			ret = morse_pageset_write(pageset, channel, pfirst);
 		} else {
 			mors->debug.page_stats.no_page++;
+			morse_resilient_page_starvation_begin(mors, channel);
+			morse_resilient_drop(mors, channel, MORSE_RES_DROP_NO_PAGE);
+			if (channel == MORSE_SKB_CHAN_DATA)
+				morse_skbq_stop_tx_queues(mors);
 			MORSE_ERR(mors, "%s no pages available\n", __func__);
 			ret = -ENOMEM;
 		}
@@ -1175,6 +1267,8 @@ static int pageset_init(struct morse *mors,
 	mutex_init(&pageset->lock);
 	INIT_KFIFO(pageset->reserved_pages);
 	INIT_KFIFO(pageset->cached_pages);
+	atomic_set(&pageset->reserved_page_count, 0);
+	atomic_set(&pageset->cached_page_count, 0);
 
 	chip_if_direction_flag = pageset->flags & MORSE_PAGER_FLAGS_DIR_TO_HOST ?
 				 MORSE_CHIP_IF_FLAGS_DIR_TO_HOST :
