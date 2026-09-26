@@ -651,6 +651,10 @@ void morse_rc_sta_feedback_rates(struct morse *mors, struct sk_buff *skb,
 	struct ieee80211_vif *vif = NULL;
 	struct morse_vif *mors_vif;
 	bool sent = false;
+	bool acked = !(le32_to_cpu(tx_sts->flags) & MORSE_TX_STATUS_FLAGS_NO_ACK);
+	bool aggregated = !!(le32_to_cpu(tx_sts->flags) & MORSE_TX_STATUS_WAS_AGGREGATED);
+	u8 ampdu_len = MORSE_TXSTS_AMPDU_INFO_GET_LEN(le16_to_cpu(tx_sts->ampdu_info));
+	int last_attempted = -1;
 
 	vif = txi->control.vif ? txi->control.vif : morse_get_vif_from_tx_status(mors, tx_sts);
 
@@ -673,11 +677,23 @@ void morse_rc_sta_feedback_rates(struct morse *mors, struct sk_buff *skb,
 		rates.rates[i].flags = morse_ratecode_rts_get(tx_sts->rates[i].morse_ratecode);
 		rates.rates[i].attempts = tx_sts->rates[i].count;
 		sent |= !!tx_sts->rates[i].count;
+		if (tx_sts->rates[i].count)
+			last_attempted = i;
 	}
 
 	if (!sent)
 		/* Did we really send the packet? */
 		goto exit;
+
+	for (i = 0; i < count; i++) {
+		if (!rates.rates[i].attempts)
+			continue;
+		morse_resilient_tx_rate(mors, rates.rates[i].rate, rates.rates[i].bw,
+					 rates.rates[i].attempts,
+					 acked && i == last_attempted, aggregated,
+					 i == last_attempted ? max_t(u8, ampdu_len, 1) : 0,
+					 msta->avg_rssi);
+	}
 
 	if (msta) {
 		/* Save the rate information. This will be used to update station's tx rate stats */
@@ -702,9 +718,7 @@ void morse_rc_sta_feedback_rates(struct morse *mors, struct sk_buff *skb,
 		}
 	}
 
-	morse_rc_sta_set_rates(mors, msta, &rates,
-			       !!(le32_to_cpu(tx_sts->flags) & MORSE_TX_STATUS_WAS_AGGREGATED),
-			       !(le32_to_cpu(tx_sts->flags) & MORSE_TX_STATUS_FLAGS_NO_ACK));
+	morse_rc_sta_set_rates(mors, msta, &rates, aggregated, acked);
 
 exit:
 	ieee80211_tx_info_clear_status(txi);

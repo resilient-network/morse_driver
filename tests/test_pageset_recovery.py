@@ -97,7 +97,7 @@ for label in (
 assert "skb_shinfo(skb)->gso_type" in write_page
 assert "%pM" not in write_page
 
-downstream_version = "0-rel_mm6108_2_0_1_resilient_r1_2026_Sep_01"
+downstream_version = "0-rel_mm6108_2_0_1_resilient_r2_2026_Sep_21"
 assert downstream_version in makefile
 assert downstream_version in dot11ah_makefile
 assert "url = https://github.com/MorseMicro/mm_rate_control.git" in gitmodules

@@ -8,7 +8,7 @@ else
 endif
 
 # Set 0 to a version number. This is done to match the Linux expectations
-override MORSE_VERSION = "0-rel_mm6108_2_0_1_resilient_r1_2026_Sep_01"
+override MORSE_VERSION = "0-rel_mm6108_2_0_1_resilient_r2_2026_Sep_21"
 
 USING_CLANG := $(shell $(CC) -v 2>&1 | grep -c "clang version")
 
@@ -134,6 +134,7 @@ morse-y = mac.o
 morse-y += init.o
 morse-y += skbq.o
 morse-y += debug.o
+morse-y += resilient_stats.o
 morse-y += trace.o
 morse-y += mm8108.o
 morse-y += mm6108.o

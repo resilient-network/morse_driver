@@ -43,9 +43,11 @@ The diagnostic records only structural metadata: channel, payload/SKB/write
 lengths, page size, offset, and GSO type/size/segment count. It never records
 frame payload, addresses, keys, or application content.
 
-Both loadable modules identify this downstream unambiguously as
-`0-rel_mm6108_2_0_1_resilient_r1_2026_Sep_01`; they must not be published under
-the unchanged upstream module version.
+The qualified field module pair identifies r1 as
+`0-rel_mm6108_2_0_1_resilient_r1_2026_Sep_01`. The in-development performance
+candidate identifies itself as `0-rel_mm6108_2_0_1_resilient_r2_2026_Sep_21`;
+it is not deployment-approved and must not be published under either the
+unchanged upstream version or the qualified r1 version.
 
 ## What is known and unknown
 
@@ -110,6 +112,14 @@ transactional runtime or A/B OS update and a tested rollback.
 - Add per-channel drop reasons and queue residence-time histograms.
 - Add explicit high/low watermarks and hysteresis so mac80211 backpressure is
   driven by usable pages and pending TX status, not only SKB queue length.
+
+R2 implementation now includes early active-page-size admission, cached-page
+and pending-status queue hysteresis, aggregate SPI/IRQ, queue-residence, page
+starvation/restore/drop, per-MCS/per-bandwidth, RSSI-sum, payload-rate, and
+A-MPDU histograms. It also propagates CMD53 transport failures and provides an
+explicitly configured, disabled-by-default, one-way SPI clock fallback after
+consecutive bus errors. See `RESILIENT_PERFORMANCE.md` for the schema and lab
+matrix. The page writer remains the final safety boundary in this candidate.
 
 ### R3: mesh formation and recovery observability
 

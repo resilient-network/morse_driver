@@ -1075,6 +1075,8 @@ int morse_init_debug(struct morse *mors)
 	if (!mors->debug.debugfs_phy)
 		return -ENOMEM;
 
+	morse_resilient_stats_init(mors);
+
 	debugfs_create_devm_seqfile(mors->dev, "page_stats",
 				    mors->debug.debugfs_phy, read_page_stats);
 

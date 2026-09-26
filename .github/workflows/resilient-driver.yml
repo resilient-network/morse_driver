@@ -21,7 +21,66 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Verify page recovery and diagnostic contract
-        run: python3 tests/test_pageset_recovery.py
+      - name: Verify downstream source contracts
+        run: |
+          python3 tests/test_pageset_recovery.py
+          python3 tests/test_resilient_performance.py
       - name: Reject whitespace errors
         run: git diff --check HEAD^ HEAD
+
+  exact-production-kernel-compile:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 75
+    env:
+      KERNEL_SOURCE_COMMIT: 3ff412d726801d26f9392d7969154d4ebf0316f5
+      KERNEL_RELEASE: 6.12.21-v8+
+      EXPECTED_DRIVER_VERSION: 0-rel_mm6108_2_0_1_resilient_r2_2026_Sep_21
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+      - name: Compile both modules against the production ABI
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = aarch64
+          docker run --rm --platform linux/arm64 \
+            -e KERNEL_SOURCE_COMMIT \
+            -e KERNEL_RELEASE \
+            -e EXPECTED_DRIVER_VERSION \
+            -v "$GITHUB_WORKSPACE:/driver" \
+            -v "$RUNNER_TEMP:/build" \
+            debian:bookworm-slim /bin/bash -lc '
+              set -euo pipefail
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update
+              apt-get install -y --no-install-recommends \
+                bc bison build-essential ca-certificates flex git kmod \
+                libelf-dev libssl-dev python3 rsync xz-utils
+              kernel_dir=/build/rpi-linux
+              rm -rf "$kernel_dir"
+              mkdir -p "$kernel_dir"
+              git -C "$kernel_dir" init
+              git -C "$kernel_dir" remote add origin https://github.com/MorseMicro/rpi-linux.git
+              git -C "$kernel_dir" fetch --depth 1 origin "$KERNEL_SOURCE_COMMIT"
+              git -C "$kernel_dir" checkout --detach FETCH_HEAD
+              test "$(git -C "$kernel_dir" rev-parse HEAD)" = "$KERNEL_SOURCE_COMMIT"
+              make -C "$kernel_dir" ARCH=arm64 bcm2711_defconfig
+              make -C "$kernel_dir" ARCH=arm64 olddefconfig
+              make -C "$kernel_dir" -j"$(nproc)" ARCH=arm64 Image.gz modules
+              test "$(make -s -C "$kernel_dir" ARCH=arm64 kernelrelease)" = "$KERNEL_RELEASE"
+              test -s "$kernel_dir/Module.symvers"
+              make -C /driver clean
+              make -C /driver -j"$(nproc)" \
+                ARCH=arm64 CROSS_COMPILE="" KERNEL_SRC="$kernel_dir" \
+                CONFIG_WLAN_VENDOR_MORSE=m CONFIG_MORSE_SPI=y \
+                CONFIG_MORSE_USER_ACCESS=y CONFIG_MORSE_VENDOR_COMMAND=y \
+                CONFIG_MORSE_DEBUGFS=y CONFIG_MORSE_COUNTRY=US DEBUG=n
+              test "$(modinfo -F version /driver/morse.ko)" = "$EXPECTED_DRIVER_VERSION"
+              test "$(modinfo -F version /driver/dot11ah/dot11ah.ko)" = "$EXPECTED_DRIVER_VERSION"
+              modinfo -F vermagic /driver/morse.ko | grep -q "^$KERNEL_RELEASE "
+              modinfo -F vermagic /driver/dot11ah/dot11ah.ko | grep -q "^$KERNEL_RELEASE "
+              modinfo -p /driver/morse.ko | grep -q "^spi_error_fallback_threshold:"
+              modinfo -p /driver/morse.ko | grep -q "^spi_fallback_clock_speed:"
+            '

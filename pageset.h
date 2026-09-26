@@ -11,6 +11,7 @@
 #include <linux/skbuff.h>
 #include <linux/workqueue.h>
 #include <linux/kfifo.h>
+#include <linux/atomic.h>
 #include <linux/types.h>
 
 #include "skbq.h"
@@ -59,6 +60,10 @@
  */
 #define PAGESET_TX_SKBQ_MAX 4
 
+/* Data queues stop at exhaustion and resume only after two pages are cached. */
+#define PAGESET_TX_STOP_PAGES 0
+#define PAGESET_TX_WAKE_PAGES 2
+
 extern const struct chip_if_ops morse_pageset_ops;
 
 struct morse_page {
@@ -88,6 +93,8 @@ struct morse_pageset {
 
 	DECLARE_KFIFO(reserved_pages, struct morse_page, CMD_RSVED_KFIFO_LEN);
 	DECLARE_KFIFO(cached_pages, struct morse_page, CACHED_PAGES_KFIFO_LEN);
+	atomic_t reserved_page_count;
+	atomic_t cached_page_count;
 };
 
 /**
@@ -98,5 +105,10 @@ struct morse_pageset {
  * @file: Pointer to file to print to
  */
 void morse_pageset_show(struct morse *mors, struct morse_pageset *pageset, struct seq_file *file);
+u32 morse_pageset_tx_page_size(struct morse *mors);
+u32 morse_pageset_tx_cached_pages(struct morse *mors);
+u32 morse_pageset_tx_reserved_pages(struct morse *mors);
+bool morse_pageset_tx_should_stop(struct morse *mors);
+bool morse_pageset_tx_can_wake(struct morse *mors);
 
 #endif /* !_MORSE_PAGESET_H_ */
