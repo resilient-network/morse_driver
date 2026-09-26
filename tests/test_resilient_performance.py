@@ -34,6 +34,7 @@ spi_c = read("spi.c")
 pageset_c = read("pageset.c")
 pageset_h = read("pageset.h")
 skbq_c = read("skbq.c")
+mesh_h = read("mesh.h")
 rc_c = read("rc.c")
 mac_c = read("mac.c")
 makefile = read("Makefile")
@@ -101,6 +102,7 @@ enqueue = function_body(skbq_c, "morse_skbq_skb_tx")
 assert enqueue.index("morse_pageset_tx_page_size") < enqueue.index("morse_skbq_tx(mq")
 assert "return -EMSGSIZE" in enqueue
 assert "mq->pending.qlen >= max_txq_len" in skbq_c
+assert re.search(r"#define MORSE_MESH_MAX_TXQ_LENGTH\s+32", mesh_h)
 assert "morse_pageset_tx_should_stop" in skbq_c
 assert "morse_pageset_tx_can_wake" in skbq_c
 assert "PAGESET_TX_STOP_PAGES 0" in pageset_h

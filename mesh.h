@@ -53,9 +53,14 @@
 #define MORSE_MESH_MAX_BEACON_INFO_ENTRIES	20
 
 /**
- * Maximum number of queued TX packets for Mesh
+ * Maximum number of queued TX packets for Mesh.
+ *
+ * Keep the mesh floor aligned with the normal driver default. A 256-packet
+ * floor allowed more than 300 aggregate outstanding frames in a single-peer
+ * field test and added over 300 ms of loaded latency without raising goodput.
+ * Operators can still raise max_txq_len explicitly for a qualified workload.
  */
-#define MORSE_MESH_MAX_TXQ_LENGTH 256
+#define MORSE_MESH_MAX_TXQ_LENGTH 32
 
 /**
  * Neighbor entry validity time in terms of TUs as per standard

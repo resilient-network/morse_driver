@@ -62,7 +62,9 @@ the off-chip queue; the page writer keeps the same final check. Data queues now
 stop when no cached TX page remains and do not wake until two are available.
 The existing SKB high/low watermark also includes frames waiting for firmware
 TX status, preventing an apparently short host queue from hiding firmware-side
-backlog.
+backlog. Mesh no longer raises the normal 32-packet TX threshold to 256 by
+default; the existing `max_txq_len` module parameter remains available for an
+explicit, qualified override.
 
 ## Controlled matrix
 
@@ -105,6 +107,16 @@ false `Unexpected ctr` messages as completions arrived for frames that existed
 before the reader was initialized. The r2 interval-safe accounting above was
 added from this observation. The live nodes remain on r1; these results do not
 qualify r2 for field deployment.
+
+Four parallel TCP flows did not increase goodput: the receivers measured 7.82
+Mbit/s Edge-to-Coordinator and 7.88 Mbit/s Coordinator-to-Edge. Idle ICMP RTT
+averaged 5.6 ms with no loss, while concurrent saturation raised average RTT to
+325.5 ms and 363.1 ms respectively, again with no loss. Both interfaces used
+the driver's `noqueue` qdisc, the mesh initialization had raised
+`max_txq_len` to 256, and the legacy monitor observed 302 to 308 aggregate
+outstanding frames. This is a queueing-delay defect rather than an RF or WAN
+loss condition. The r2 mesh threshold change must demonstrate lower loaded RTT
+without reducing single-flow goodput before promotion.
 
 ## Hardware and higher-layer work
 
