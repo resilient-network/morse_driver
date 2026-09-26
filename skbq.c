@@ -11,6 +11,7 @@
 #include <linux/ktime.h>
 #include <linux/skbuff.h>
 #include <linux/jiffies.h>
+#include <linux/spinlock.h>
 
 #include "morse.h"
 #include "debug.h"
@@ -1199,7 +1200,36 @@ struct morse_skbq_mon_tbl {
 	struct morse_skbq_mon_ent ent_all;
 	struct morse_skbq_mon_ent ent_mcast;
 	struct morse_skbq_mon_ent ent[8];
+	u32 untracked_completions;
 } *morse_skbq_mon;
+
+static DEFINE_SPINLOCK(morse_skbq_mon_lock);
+
+static void morse_skbq_mon_reset_interval(struct morse_skbq_mon_tbl *tbl)
+{
+	struct morse_skbq_mon_ent *ent;
+	int read_idx;
+	int write_idx = 0;
+
+	for (read_idx = 0; read_idx < ARRAY_SIZE(tbl->ent); read_idx++) {
+		ent = &tbl->ent[read_idx];
+		if (!ent->qsize_cur)
+			continue;
+		if (write_idx != read_idx)
+			tbl->ent[write_idx] = *ent;
+		ent = &tbl->ent[write_idx++];
+		ent->tot_sent = 0;
+		ent->qsize_max = ent->qsize_cur;
+	}
+	while (write_idx < ARRAY_SIZE(tbl->ent))
+		memset(&tbl->ent[write_idx++], 0, sizeof(tbl->ent[0]));
+
+	tbl->ent_mcast.tot_sent = 0;
+	tbl->ent_mcast.qsize_max = tbl->ent_mcast.qsize_cur;
+	tbl->ent_all.tot_sent = 0;
+	tbl->ent_all.qsize_max = tbl->ent_all.qsize_cur;
+	tbl->untracked_completions = 0;
+}
 
 /**
  * Dump the Per-station SKB queue monitor table
@@ -1208,35 +1238,54 @@ struct morse_skbq_mon_tbl {
  */
 void morse_skbq_mon_dump(struct morse *mors, struct seq_file *file)
 {
+	struct morse_skbq_mon_tbl snapshot;
+	struct morse_skbq_mon_tbl *new_tbl = NULL;
 	struct morse_skbq_mon_ent *ent;
 	int i;
 
-	if (!morse_skbq_mon) {
-		morse_skbq_mon = kcalloc(1, sizeof(*morse_skbq_mon), GFP_KERNEL);
+	if (!READ_ONCE(morse_skbq_mon)) {
+		new_tbl = kcalloc(1, sizeof(*new_tbl), GFP_KERNEL);
+		if (!new_tbl) {
+			seq_puts(file, "Unable to initialise per-station SKB queue monitoring\n");
+			return;
+		}
+
+		spin_lock_bh(&morse_skbq_mon_lock);
+		if (!morse_skbq_mon) {
+			WRITE_ONCE(morse_skbq_mon, new_tbl);
+			new_tbl = NULL;
+		}
+		spin_unlock_bh(&morse_skbq_mon_lock);
+		kfree(new_tbl);
 		seq_puts(file, "Initialised per-station SKB queue monitoring\n");
 		return;
 	}
 
+	spin_lock_bh(&morse_skbq_mon_lock);
+	memcpy(&snapshot, morse_skbq_mon, sizeof(snapshot));
+	/* Keep identities and current depth for frames still awaiting status. */
+	morse_skbq_mon_reset_interval(morse_skbq_mon);
+	spin_unlock_bh(&morse_skbq_mon_lock);
+
 	seq_puts(file, "Idx Source            Dest              Total    Q Size   Max Size\n");
 
-	for (i = 0; i < ARRAY_SIZE(morse_skbq_mon->ent); i++) {
-		ent = &morse_skbq_mon->ent[i];
+	for (i = 0; i < ARRAY_SIZE(snapshot.ent); i++) {
+		ent = &snapshot.ent[i];
 		if (is_zero_ether_addr(ent->sa))
 			break;
 		seq_printf(file, "%3d %pM %pM %-8d %-8d %-8d\n",
 			   i, ent->sa, ent->da, ent->tot_sent, ent->qsize_cur, ent->qsize_max);
 	}
 
-	ent = &morse_skbq_mon->ent_mcast;
+	ent = &snapshot.ent_mcast;
 	seq_printf(file, "%3s %-35s %-8d %-8d %-8d\n",
 		   "-", "Multicast/Broadcast", ent->tot_sent, ent->qsize_cur, ent->qsize_max);
 
-	ent = &morse_skbq_mon->ent_all;
+	ent = &snapshot.ent_all;
 	seq_printf(file, "%3s %-35s %-8d %-8d %-8d\n",
 		   "-", "All Tx", ent->tot_sent, ent->qsize_cur, ent->qsize_max);
 
-	/* reset the table */
-	memset(morse_skbq_mon, 0, sizeof(*morse_skbq_mon));
+	seq_printf(file, "Untracked completions: %u\n", snapshot.untracked_completions);
 }
 
 /**
@@ -1245,7 +1294,8 @@ void morse_skbq_mon_dump(struct morse *mors, struct seq_file *file)
  * @skb - SKB
  * @add - if true, create a new entry if not found
  */
-static struct morse_skbq_mon_ent *morse_skbq_mon_get(struct morse *mors,
+static struct morse_skbq_mon_ent *morse_skbq_mon_get(struct morse_skbq_mon_tbl *tbl,
+						     struct morse *mors,
 						     struct sk_buff *skb, bool add)
 {
 	struct ieee80211_hdr *hdr = (struct ieee80211_hdr *)(skb->data);
@@ -1265,10 +1315,10 @@ static struct morse_skbq_mon_ent *morse_skbq_mon_get(struct morse *mors,
 		return NULL;
 
 	if (is_multicast_ether_addr(da))
-		return &morse_skbq_mon->ent_mcast;
+		return &tbl->ent_mcast;
 
-	for (i = 0; i < ARRAY_SIZE(morse_skbq_mon->ent); i++) {
-		ent = &morse_skbq_mon->ent[i];
+	for (i = 0; i < ARRAY_SIZE(tbl->ent); i++) {
+		ent = &tbl->ent[i];
 		if (memcmp(sa, ent->sa, ETH_ALEN) == 0 && memcmp(da, ent->da, ETH_ALEN) == 0)
 			return ent;
 		if (is_zero_ether_addr(ent->sa)) {
@@ -1299,15 +1349,22 @@ static struct morse_skbq_mon_ent *morse_skbq_mon_get(struct morse *mors,
 static void morse_skbq_mon_adjust(struct morse *mors, struct sk_buff *skb, bool incr)
 {
 	struct ieee80211_hdr *hdr = (struct ieee80211_hdr *)skb->data;
+	struct morse_skbq_mon_tbl *tbl = READ_ONCE(morse_skbq_mon);
 	struct morse_skbq_mon_ent *ent;
-	struct morse_skbq_mon_ent *ent_all = &morse_skbq_mon->ent_all;
+	struct morse_skbq_mon_ent *ent_all;
 
-	if (!ieee80211_is_data(hdr->frame_control))
+	if (!tbl || !ieee80211_is_data(hdr->frame_control))
 		return;
 
-	ent = morse_skbq_mon_get(mors, skb, incr);
-	if (!ent)
+	spin_lock_bh(&morse_skbq_mon_lock);
+	ent_all = &tbl->ent_all;
+	ent = morse_skbq_mon_get(tbl, mors, skb, incr);
+	if (!ent) {
+		if (!incr)
+			tbl->untracked_completions++;
+		spin_unlock_bh(&morse_skbq_mon_lock);
 		return;
+	}
 
 	if (incr) {
 		ent->tot_sent++;
@@ -1320,17 +1377,19 @@ static void morse_skbq_mon_adjust(struct morse *mors, struct sk_buff *skb, bool 
 			ent_all->qsize_max = ent_all->qsize_cur;
 	} else {
 		if (ent->qsize_cur == 0 || ent_all->qsize_cur == 0) {
-			MORSE_SKB_ERR(mors,
-				      "%s: [%pM %pM] Unexpected ctr %d/%d %d/%d %d/%d\n",
-				      __func__, ent->sa, ent->da,
-				      ent->qsize_cur, ent_all->qsize_cur,
-				      ent->tot_sent, ent_all->tot_sent,
-				      ent->qsize_max, ent_all->qsize_max);
+			/* The monitor can be enabled while older frames are in flight. */
+			tbl->untracked_completions++;
+			if (ent->qsize_cur)
+				ent->qsize_cur--;
+			if (ent_all->qsize_cur)
+				ent_all->qsize_cur--;
+			spin_unlock_bh(&morse_skbq_mon_lock);
 			return;
 		}
 		ent->qsize_cur--;
 		ent_all->qsize_cur--;
 	}
+	spin_unlock_bh(&morse_skbq_mon_lock);
 }
 
 #ifndef CONFIG_MORSE_RC

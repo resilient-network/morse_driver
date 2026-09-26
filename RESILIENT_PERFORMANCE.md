@@ -34,6 +34,11 @@ The record exposes:
 - driver TX/RX payload rates, A-MPDU length histogram, and per-MCS/per-bandwidth
   attempts, successes, failures, aggregation observations, and RSSI sums.
 
+The legacy `skbq_mon` reader is also interval-safe in r2. Reading it no longer
+erases the identities and current depth of frames that are still awaiting TX
+status. Completions for frames that predate monitor activation are reported as
+an aggregate `Untracked completions` count instead of false kernel error logs.
+
 `spi_dma_eligible_xfers` means the controller said the transfer could use DMA;
 it does not claim the controller actually completed it with DMA. Wire rate and
 driver payload rate are separate so framing/padding overhead is visible.
@@ -83,6 +88,23 @@ channel plan, antenna/cable, node role, CPU temperature/throttle state, supply
 voltage/current, loss, latency percentiles, TCP/UDP goodput, wind, dust, and
 enclosure/antenna movement. A result is invalid if bus and RF variables change
 in the same case.
+
+## 2026-09-26 live r1 control
+
+Edge 13 and C001 were retested before any r2 deployment. Both nodes used the
+September 11 r1 module, a 20 MHz SPI clock, and a 4 MHz S1G channel. RSSI was
+-45 to -48 dBm and the driver expected 13.2 to 14.6 Mbit/s. A bounded 15-second
+single-flow TCP test delivered 8.98 Mbit/s Edge-to-Coordinator and 7.81 Mbit/s
+Coordinator-to-Edge at the receivers. TCP reported one retransmission in the
+forward run and none in reverse. MAC retries increased by roughly 5 to 6
+percent of transmitted packets during the two runs, while page-write failures,
+page starvation, aged TX frames, and queue-stop counts did not increase.
+
+Activating the legacy `skbq_mon` reader immediately before the test produced
+false `Unexpected ctr` messages as completions arrived for frames that existed
+before the reader was initialized. The r2 interval-safe accounting above was
+added from this observation. The live nodes remain on r1; these results do not
+qualify r2 for field deployment.
 
 ## Hardware and higher-layer work
 

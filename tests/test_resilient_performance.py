@@ -91,6 +91,12 @@ assert "morse_resilient_page_starvation_end" in pageset_c
 assert "morse_resilient_page_restore" in pageset_c
 assert "morse_skbq_record_residence" in pageset_c
 assert "morse_resilient_queue_enqueue" in skbq_c
+assert "static DEFINE_SPINLOCK(morse_skbq_mon_lock)" in skbq_c
+assert "Untracked completions" in skbq_c
+assert "morse_skbq_mon_reset_interval" in skbq_c
+monitor_adjust = function_body(skbq_c, "morse_skbq_mon_adjust")
+assert monitor_adjust.count("tbl->untracked_completions++") == 2
+assert "Unexpected ctr" not in monitor_adjust
 enqueue = function_body(skbq_c, "morse_skbq_skb_tx")
 assert enqueue.index("morse_pageset_tx_page_size") < enqueue.index("morse_skbq_tx(mq")
 assert "return -EMSGSIZE" in enqueue
